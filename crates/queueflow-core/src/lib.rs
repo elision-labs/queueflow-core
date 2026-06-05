@@ -1,21 +1,19 @@
 //! # queueflow-core
 //!
 //! The core engine for **QueueFlow**, a PostgreSQL/PGMQ-native distributed job
-//! queue and workflow engine — a Rust rewrite of the Go `queueflow-core`.
+//! queue and workflow engine.
 //!
-//! ## What's improved over the Go version
+//! ## Design highlights
 //!
-//! * **Workflows are actually implemented.** The Go API returns `501` for every
-//!   workflow route; here the [`workflow`] module is a real DAG orchestrator
-//!   with dependency gating, context propagation, per-step failure policies,
+//! * **Workflows as a real DAG orchestrator.** The [`workflow`] module provides
+//!   dependency gating, context propagation, per-step failure policies,
 //!   cycle detection, and an ergonomic [`WorkflowBuilder`] DSL.
 //! * **Testability is a first-class design goal.** The engine is written
 //!   against the [`ports`] (`JobStore`/`MessageQueue`) so the entire system —
 //!   including retries and workflow orchestration — runs against the
 //!   deterministic [`adapters::memory`] adapters with **no database**.
 //! * **Durable retries.** Retries use the queue's native delayed redelivery
-//!   ([`MessageQueue::send_delayed`]) instead of the Go version's detached timer
-//!   goroutine, so they survive process restarts.
+//!   ([`MessageQueue::send_delayed`]), so they survive process restarts.
 //! * **Typed everything.** Statuses, backoff strategies, and failure policies
 //!   are exhaustive enums; durations are plain seconds for clean SDKs.
 //!

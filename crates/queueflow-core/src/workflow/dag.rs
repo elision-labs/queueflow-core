@@ -108,7 +108,7 @@ impl<'a> DependencyGraph<'a> {
     }
 
     /// Render the DAG as a Mermaid `graph TD` document (used by the
-    /// `/workflows/{id}/diagram` endpoint the Go version left unimplemented).
+    /// `/workflows/{id}/diagram` endpoint).
     pub fn mermaid(&self) -> String {
         let mut out = String::from("graph TD\n");
         for s in self.steps {

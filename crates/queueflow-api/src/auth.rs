@@ -1,8 +1,7 @@
 //! Bearer-token authentication middleware.
 //!
-//! Mirrors the Go reference: a non-empty `Authorization: Bearer <token>` is
-//! accepted and mapped to a tenant. Real JWT validation is a documented TODO
-//! (the Go version is identical in this regard) — the seam is here in
+//! A non-empty `Authorization: Bearer <token>` is accepted and mapped to a
+//! tenant. Real JWT validation is a documented TODO — the seam is here in
 //! [`validate_token`].
 
 use axum::extract::Request;

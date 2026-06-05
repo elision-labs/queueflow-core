@@ -1,7 +1,7 @@
 //! Ports (hexagonal architecture): the abstract interfaces the engine depends
 //! on. Concrete adapters live in [`crate::adapters`].
 //!
-//! This is the heart of the testability improvement over the Go version: the
+//! This is the heart of the engine's testability: the
 //! engine, workflow scheduler, and HTTP API are written against these traits,
 //! so the *entire* system runs against fast, deterministic in-memory adapters
 //! in unit tests — no PostgreSQL required — while production wires the
@@ -203,7 +203,7 @@ pub trait MessageQueue: Send + Sync {
 
     /// Enqueue but hide the message for `delay_secs`. This is the backbone of
     /// durable retries: the delay lives *in the queue*, so a retry survives a
-    /// process restart (unlike the Go version's in-process timer goroutine).
+    /// process restart.
     async fn send_delayed(
         &self,
         queue: &str,

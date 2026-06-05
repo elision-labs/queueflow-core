@@ -3,9 +3,8 @@
 //! PGMQ gives us durable, at-least-once delivery with visibility timeouts and
 //! native delayed sends — the latter is what makes retries survive restarts.
 //!
-//! Note: PGMQ is FIFO and has no native priority. Unlike the Go reference (which
-//! incorrectly passed a job's priority as PGMQ's *delay* argument), this adapter
-//! does not misuse the delay slot; `priority` is recorded on the job row but
+//! Note: PGMQ is FIFO and has no native priority. The delay slot is reserved
+//! strictly for delayed redelivery; `priority` is recorded on the job row but
 //! dequeue order is FIFO. Use separate queues for priority classes.
 
 use async_trait::async_trait;

@@ -1,6 +1,6 @@
 //! End-to-end engine tests on the in-memory adapters — no database required.
 //!
-//! These cover the behaviours that were entirely untested in the Go reference:
+//! These cover the core engine behaviours:
 //! the success path, durable exponential-backoff retries, dead-lettering,
 //! per-attempt timeouts, cancellation, and priority ordering.
 

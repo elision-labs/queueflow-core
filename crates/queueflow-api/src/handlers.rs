@@ -167,7 +167,7 @@ pub async fn cancel_job(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ---- Workflows (implemented; the Go version returned 501 for all of these) --
+// ---- Workflows -------------------------------------------------------------
 
 #[utoipa::path(
     post, path = "/api/v1/workflows", tag = "workflows", operation_id = "createWorkflow",

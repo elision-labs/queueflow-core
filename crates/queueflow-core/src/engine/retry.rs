@@ -1,10 +1,8 @@
 //! Typed retry backoff.
 //!
-//! Replaces the Go reference's stringly-typed `retry_backoff` (and its fragile
-//! detached-goroutine timer) with an exhaustive enum and a pure, testable delay
-//! function. The *scheduling* of the retry is durable: the engine asks the
-//! queue to redeliver after [`BackoffStrategy::next_retry_at`], so a retry
-//! survives a process restart.
+//! An exhaustive enum and a pure, testable delay function. The *scheduling* of
+//! the retry is durable: the engine asks the queue to redeliver after
+//! [`BackoffStrategy::next_retry_at`], so a retry survives a process restart.
 
 use chrono::{DateTime, Duration, Utc};
 

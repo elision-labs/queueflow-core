@@ -1,7 +1,7 @@
 //! HTTP request/response bodies.
 //!
-//! Field names mirror the Go API so existing/generated SDKs stay compatible —
-//! except durations are seconds (the Go API leaked nanoseconds).
+//! Durations are expressed as plain integer seconds for clean SDKs across
+//! every language.
 
 use chrono::{DateTime, Utc};
 use queueflow_core::{Job, JobConfig, Map, Workflow};

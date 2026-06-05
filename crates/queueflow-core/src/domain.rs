@@ -1,15 +1,14 @@
 //! Core domain types shared across the engine, the workflow orchestrator, and
 //! the HTTP API.
 //!
-//! Design notes (improvements over the Go reference):
-//! * Durations are plain integer **seconds** (`u64`), not `time.Duration`
-//!   nanoseconds. The Go API exposed nanoseconds through OpenAPI, which is
-//!   awkward for every generated SDK. Seconds serialize as `integer/int64` and
-//!   read naturally in Python/TypeScript/Rust/Go/Java clients.
+//! Design notes:
+//! * Durations are plain integer **seconds** (`u64`). Seconds serialize as
+//!   `integer/int64` and read naturally in Python/TypeScript/Rust/Go/Java
+//!   clients.
 //! * Statuses and the backoff strategy are real enums, not free-form strings,
 //!   so illegal states are unrepresentable and `match` is exhaustive.
 //! * IDs are opaque strings (UUID v4 text), matching the Postgres schema and
-//!   keeping JSON payloads identical to the existing SDKs.
+//!   keeping JSON payloads consistent across the SDKs.
 
 use std::collections::HashMap;
 
@@ -147,8 +146,8 @@ pub struct JobConfig {
 }
 
 impl Default for JobConfig {
-    /// Mirrors the Go `DefaultJobConfig()`: 3 retries, 60s base delay, 5m
-    /// timeout, exponential backoff capped at 1h, plus a little jitter.
+    /// Sensible defaults: 3 retries, 60s base delay, 5m timeout, exponential
+    /// backoff capped at 1h, plus a little jitter.
     fn default() -> Self {
         Self {
             max_retries: 3,
@@ -269,7 +268,7 @@ pub struct Workflow {
 }
 
 /// Request body for creating a workflow. Shared by the builder DSL and the API
-/// so callers and SDKs use the same contract as the Go server.
+/// so callers and SDKs use the same contract.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct CreateWorkflowRequest {
     pub name: String,

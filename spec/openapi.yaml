@@ -511,7 +511,7 @@ components:
       type: object
       description: |-
         Request body for creating a workflow. Shared by the builder DSL and the API
-        so callers and SDKs use the same contract as the Go server.
+        so callers and SDKs use the same contract.
       required:
       - name
       - steps

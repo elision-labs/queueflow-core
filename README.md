@@ -1,6 +1,6 @@
 <div align="center">
 
-# QueueFlow Core (Rust)
+# QueueFlow Core
 
 **A high-performance, PostgreSQL/PGMQ-native distributed job queue and workflow engine, written in Rust.**
 
@@ -18,27 +18,20 @@ Durable background jobs and real DAG workflows on a database you already run —
 
 ---
 
-This is a ground-up rewrite of the Go [`queueflow-core`](../queueflow-core), keeping the same product idea
-and the OpenAPI-driven SDK pipeline, while fixing the Go version's biggest gaps.
+QueueFlow Core runs durable background jobs and real DAG workflows directly on PostgreSQL + PGMQ,
+with an OpenAPI-driven SDK pipeline that ships clients in five languages.
 
-> The original Go module lives, untouched, in `../queueflow-core`. This crate is a parallel, improved
-> implementation. See [`repository-structure.md`](../repository-structure.md) for how the whole QueueFlow
-> multi-repo project fits together.
+## Design highlights
 
-## What's different from the Go version
-
-| Area | Go `queueflow-core` | This Rust rewrite |
-| --- | --- | --- |
-| **Workflows** | Every workflow endpoint returns `501 Not Implemented` | A real DAG orchestrator: dependency gating, context propagation, per-step failure policies, cycle detection, a builder DSL, and a Mermaid diagram endpoint |
-| **Tests** | None (CI references a `tests/integration` dir that doesn't exist) | 56 tests; the entire engine, scheduler, and HTTP API run against deterministic in-memory adapters with **no database**, plus opt-in Postgres integration tests |
-| **Retries** | A detached goroutine with a timer — lost on process restart | Queue-native delayed redelivery (PGMQ `send` with delay) — survives restarts |
-| **Delivery safety** | Silently ignored ack failures; no idempotency guard | Logged acks, a terminal-state idempotency guard, and "advance-before-ack" so a failed workflow step self-heals on redelivery |
-| **Architecture** | Engine hard-wired to `pgxpool` | Ports & adapters: the engine depends on `JobStore`/`MessageQueue` traits; Postgres and in-memory adapters implement them |
-| **OpenAPI spec** | Hand-maintained YAML that can drift | Generated **from the code** (utoipa), so it can't drift; emitted by `queueflow spec` |
-| **Durations in the API** | Nanoseconds (awkward for every SDK) | Plain integer seconds |
-| **Types** | Stringly-typed statuses/backoff | Exhaustive enums; illegal states unrepresentable |
-| **Multi-tenancy** | Ownership checks missing on cancel/diagram | Tenant isolation enforced on every job/workflow endpoint |
-| **SDKs** | Python + TypeScript | Python, TypeScript, **Rust, Go, Java** |
+- **Workflows as a real DAG orchestrator** — dependency gating, context propagation, per-step failure policies, cycle detection, a builder DSL, and a Mermaid diagram endpoint.
+- **Thoroughly tested** — 56 tests; the entire engine, scheduler, and HTTP API run against deterministic in-memory adapters with **no database**, plus opt-in Postgres integration tests.
+- **Durable retries** — queue-native delayed redelivery (PGMQ `send` with delay) that survives restarts.
+- **Delivery safety** — logged acks, a terminal-state idempotency guard, and "advance-before-ack" so a failed workflow step self-heals on redelivery.
+- **Ports & adapters** — the engine depends on `JobStore`/`MessageQueue` traits; Postgres and in-memory adapters implement them.
+- **Code-generated OpenAPI** — the spec is generated **from the code** (utoipa), so it can't drift; emitted by `queueflow spec`.
+- **Ergonomic API** — durations are plain integer seconds; statuses and backoff are exhaustive enums, so illegal states are unrepresentable.
+- **Multi-tenancy** — tenant isolation enforced on every job/workflow endpoint.
+- **Five SDKs** — Python, TypeScript, Rust, Go, and Java.
 
 ## Features
 
@@ -54,7 +47,7 @@ and the OpenAPI-driven SDK pipeline, while fixing the Go version's biggest gaps.
 ## Architecture
 
 ```
-queueflow-core-rs/                 Cargo workspace
+queueflow-core/                    Cargo workspace
 ├── crates/
 │   ├── queueflow-core/            library: domain, ports, adapters, engine, workflow
 │   │   ├── domain.rs              Job / Workflow / config / status enums
@@ -76,8 +69,7 @@ queueflow-core-rs/                 Cargo workspace
 
 The key design choice is **ports & adapters**: `queueflow-core` is written against the `JobStore` and
 `MessageQueue` traits, so the engine, the workflow scheduler, and the HTTP API can be exercised end-to-end
-against fast, deterministic in-memory adapters — which is why this rewrite ships with real tests where the
-original had none. In production the same code runs on the PostgreSQL + PGMQ adapters.
+against fast, deterministic in-memory adapters. In production the same code runs on the PostgreSQL + PGMQ adapters.
 
 ## Quick start
 
@@ -265,7 +257,6 @@ Generated SDKs land in the sibling repos:
 - **Runnable examples:** [`crates/queueflow-core/examples/`](./crates/queueflow-core/examples)
 - **Database schema:** [`migrations/0001_init.sql`](./migrations/0001_init.sql)
 - **Multi-repo overview:** [`repository-structure.md`](../repository-structure.md)
-- **Go reference implementation:** [`../queueflow-core`](../queueflow-core)
 
 ## Roadmap
 
@@ -286,7 +277,7 @@ Contributions welcome — these are the planned next steps, roughly in priority 
 
 ```bash
 git clone https://github.com/sjriddle/queueflow-core
-cd queueflow-core-rs
+cd queueflow-core
 make test && make clippy && make fmt-check
 ```
 

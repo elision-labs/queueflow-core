@@ -54,8 +54,8 @@ where
     Arc::new(FnHandler { f })
 }
 
-/// Built-in handlers mirroring the Go worker's `log`/`sleep`/`echo`, plus a
-/// `fail` handler that is handy in tests and demos.
+/// Built-in `log`/`sleep`/`echo` handlers, plus a `fail` handler that is handy
+/// in tests and demos.
 pub mod builtin {
     use std::sync::Arc;
     use std::time::Duration;

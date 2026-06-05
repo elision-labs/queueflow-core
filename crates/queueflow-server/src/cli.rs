@@ -1,5 +1,5 @@
-//! Command-line interface (mirrors the Go binary's flags, plus a `spec`
-//! subcommand for OpenAPI/SDK generation).
+//! Command-line interface, including a `spec` subcommand for OpenAPI/SDK
+//! generation.
 
 use std::path::PathBuf;
 

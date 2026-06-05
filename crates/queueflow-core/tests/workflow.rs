@@ -2,7 +2,7 @@
 //!
 //! Covers dependency-gated scheduling, fan-out/fan-in, the three failure
 //! policies (halt / skip / continue), status aggregation, context propagation,
-//! and creation-time cycle rejection — none of which existed in the Go version.
+//! and creation-time cycle rejection.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
