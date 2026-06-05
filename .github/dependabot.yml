@@ -1,0 +1,25 @@
+# =============================================================================
+# TEMPORARILY DISABLED — commented out until the repo and secrets are ready.
+# Re-enable by uncommenting the block below (remove the leading "# " on each
+# line after this banner).
+# =============================================================================
+# version: 2
+# updates:
+#   # Rust dependencies for the whole workspace.
+#   - package-ecosystem: cargo
+#     directory: "/"
+#     schedule:
+#       interval: weekly
+#     open-pull-requests-limit: 10
+#     groups:
+#       # Batch low-risk updates into a single PR to cut noise.
+#       patch-and-minor:
+#         update-types:
+#           - minor
+#           - patch
+# 
+#   # Keep the GitHub Actions themselves up to date.
+#   - package-ecosystem: github-actions
+#     directory: "/"
+#     schedule:
+#       interval: weekly

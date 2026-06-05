@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/queueflow-core",
+    "crates/queueflow-api",
+    "crates/queueflow-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT"
+repository = "https://github.com/sjriddle/queueflow-core"
+homepage = "https://queueflow.dev"
+authors = ["QueueFlow"]
+
+# Centralized dependency versions. Concrete versions are captured in the
+# committed Cargo.lock; these constraints keep the workspace internally
+# consistent and let `cargo update` move within a compatible range.
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "json",
+    "uuid",
+    "chrono",
+    "macros",
+    "migrate",
+] }
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono", "yaml"] }
+clap = { version = "4", features = ["derive", "env"] }
+prometheus = "0.13"
+rand = "0.8"
+
+# Internal crates
+queueflow-core = { path = "crates/queueflow-core" }
+queueflow-api = { path = "crates/queueflow-api" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

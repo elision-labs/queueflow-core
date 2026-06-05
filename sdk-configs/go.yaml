@@ -1,0 +1,8 @@
+# openapi-generator config for the Go SDK.
+generatorName: go
+additionalProperties:
+  packageName: queueflow
+  packageVersion: 0.1.0
+  isGoSubmodule: false
+  enumClassPrefix: true
+  hideGenerationTimestamp: true

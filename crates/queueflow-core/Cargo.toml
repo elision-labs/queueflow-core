@@ -1,0 +1,37 @@
+[package]
+name = "queueflow-core"
+description = "Core engine for QueueFlow: a PostgreSQL/PGMQ-native distributed job queue and workflow engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+utoipa = { workspace = true }
+
+# Optional, feature-gated. The core engine never touches sqlx directly; only the
+# Postgres adapter does, so unit tests compile and run with no database driver.
+sqlx = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables the Postgres + PGMQ adapters (PostgresJobStore / PostgresMessageQueue).
+postgres = ["dep:sqlx"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+serde_json = { workspace = true }

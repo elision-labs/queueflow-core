@@ -1,0 +1,35 @@
+# ---- Rust / Cargo ----
+/target
+**/target
+**/*.rs.bk
+*.pdb
+# Cargo.lock IS committed (this is a workspace with a binary) — do not ignore it.
+
+# ---- Environment / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Coverage / profiling ----
+/coverage
+*.profraw
+tarpaulin-report.*
+lcov.info
+
+# ---- OS / editor noise ----
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# ---- Generated SDK / OpenAPI scratch ----
+# The canonical spec in spec/openapi.{json,yaml} IS committed; throwaway copies
+# and locally generated SDK output are not.
+/tmp
+/scratch
+.openapi-generator/
+.openapi-generator-ignore

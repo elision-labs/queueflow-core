@@ -1,0 +1,25 @@
+[package]
+name = "queueflow-server"
+description = "QueueFlow server binary: REST API, workers, metrics, and OpenAPI spec generation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "queueflow"
+path = "src/main.rs"
+
+[dependencies]
+queueflow-core = { workspace = true, features = ["postgres"] }
+queueflow-api = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+utoipa = { workspace = true }

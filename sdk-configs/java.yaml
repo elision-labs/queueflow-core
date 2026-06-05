@@ -1,0 +1,11 @@
+# openapi-generator config for the Java SDK (native HTTP client).
+generatorName: java
+additionalProperties:
+  groupId: dev.queueflow
+  artifactId: queueflow-sdk
+  artifactVersion: 0.1.0
+  apiPackage: dev.queueflow.api
+  modelPackage: dev.queueflow.model
+  invokerPackage: dev.queueflow.client
+  library: native
+  hideGenerationTimestamp: true
