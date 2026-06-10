@@ -153,18 +153,35 @@ impl Worker {
             return;
         };
 
-        // Heartbeat at half the lease interval while the handler runs.
+        // Heartbeat at half the lease interval while the handler runs. The
+        // heartbeat doubles as a cancellation channel: a non-running status
+        // (or a 409 lost-lease) aborts the handler, since the server already
+        // owns the job's outcome.
         let heartbeat_every = Duration::from_secs((self.options.lease_secs / 2).max(1) as u64);
         let mut handler_fut = std::pin::pin!(handler(lease.job.clone()));
         let outcome = loop {
             tokio::select! {
-                out = &mut handler_fut => break out,
+                out = &mut handler_fut => break Some(out),
                 _ = tokio::time::sleep(heartbeat_every) => {
-                    if let Err(e) = self.client.heartbeat_job(&lease, self.options.lease_secs).await {
-                        tracing::warn!(job_id = %job_id, error = %e, "heartbeat failed");
+                    match self.client.heartbeat_job(&lease, self.options.lease_secs).await {
+                        Ok(queueflow_core::JobStatus::Running) => {}
+                        Ok(status) => {
+                            tracing::warn!(job_id = %job_id, status = status.as_str(), "job is no longer running (e.g. cancelled); abandoning handler");
+                            break None;
+                        }
+                        Err(e) if e.status() == Some(409) => {
+                            tracing::warn!(job_id = %job_id, error = %e, "lease lost; abandoning handler");
+                            break None;
+                        }
+                        Err(e) => {
+                            tracing::warn!(job_id = %job_id, error = %e, "heartbeat failed");
+                        }
                     }
                 }
             }
+        };
+        let Some(outcome) = outcome else {
+            return; // handler dropped; the server owns the outcome
         };
 
         let report = match outcome {

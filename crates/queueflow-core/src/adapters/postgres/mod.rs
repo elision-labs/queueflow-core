@@ -1,15 +1,16 @@
-//! PostgreSQL + PGMQ adapters (feature `postgres`).
+//! PostgreSQL adapter (feature `postgres`). Plain Postgres — no extensions:
+//! the jobs table doubles as the claim queue, and LISTEN/NOTIFY powers the
+//! long-poll wakeups.
 //!
-//! These use sqlx's **runtime** query API (string queries, no `query!` macros),
-//! so the crate compiles with no `DATABASE_URL` and no `.sqlx` cache. Their SQL
+//! Uses sqlx's **runtime** query API (string queries, no `query!` macros),
+//! so the crate compiles with no `DATABASE_URL` and no `.sqlx` cache. SQL
 //! correctness is verified by the opt-in integration tests gated on
 //! `TEST_DATABASE_URL`.
 
 mod job_store;
-mod message_queue;
+mod listener;
 
 pub use job_store::PostgresJobStore;
-pub use message_queue::PostgresMessageQueue;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;

@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "queueflow",
     version,
-    about = "QueueFlow: a PostgreSQL/PGMQ-native job queue and workflow engine"
+    about = "QueueFlow: a PostgreSQL-native job queue and workflow engine"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -74,6 +74,9 @@ pub enum JobCommand {
         /// Idempotency key: re-running the same command returns the same job.
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Don't run before this instant (RFC 3339, e.g. 2026-06-09T15:00:00Z).
+        #[arg(long)]
+        run_at: Option<chrono::DateTime<chrono::Utc>>,
         /// Block until the job reaches a terminal state, then print it.
         #[arg(long)]
         wait: bool,
@@ -176,7 +179,7 @@ pub struct ServeArgs {
     #[arg(long, env = "QUEUEFLOW_MODE", value_enum, default_value_t = Mode::All)]
     pub mode: Mode,
 
-    /// PostgreSQL connection string (must have the PGMQ extension available).
+    /// PostgreSQL connection string (any plain PostgreSQL 13+).
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: String,
 
@@ -203,6 +206,12 @@ pub struct ServeArgs {
     /// Apply migrations on startup (idempotent).
     #[arg(long, env = "QUEUEFLOW_AUTO_MIGRATE", default_value_t = true)]
     pub auto_migrate: bool,
+
+    /// Delete terminal jobs/workflows/dead letters older than this many
+    /// hours. Off by default (history is kept forever); the hot claim path is
+    /// unaffected either way.
+    #[arg(long, env = "QUEUEFLOW_RETENTION_HOURS")]
+    pub retention_hours: Option<u64>,
 }
 
 #[derive(Args, Debug)]

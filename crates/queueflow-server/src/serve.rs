@@ -7,9 +7,7 @@ use std::time::Duration;
 use anyhow::Context;
 use queueflow_api::{build_router, ApiState};
 use queueflow_core::task::builtin;
-use queueflow_core::{
-    connect, migrate, Engine, PostgresJobStore, PostgresMessageQueue, SystemClock,
-};
+use queueflow_core::{connect, migrate, Engine, JanitorConfig, PostgresJobStore, SystemClock};
 use tokio::net::TcpListener;
 
 use crate::cli::{Mode, ServeArgs};
@@ -25,18 +23,26 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         tracing::info!("migrations applied");
     }
 
-    let store = Arc::new(PostgresJobStore::new(pool.clone()));
-    let queue = Arc::new(PostgresMessageQueue::new(pool));
-    queue.ensure_queue(&args.default_queue).await.ok();
+    let store = Arc::new(PostgresJobStore::new(pool));
 
-    let engine = Engine::builder(store, queue, Arc::new(SystemClock))
+    let engine = Engine::builder(store, Arc::new(SystemClock))
         .default_queue(args.default_queue.clone())
         .worker_count(args.workers)
+        .janitor(JanitorConfig {
+            retention: args
+                .retention_hours
+                .map(|h| Duration::from_secs(h.max(1) * 3600)),
+            ..JanitorConfig::default()
+        })
         .register("echo", builtin::echo())
         .register("log", builtin::log())
         .register("sleep", builtin::sleep())
         .register("fail", builtin::fail())
         .build();
+
+    // The janitor runs on every server: expired-lease recovery and workflow
+    // self-heal are SKIP LOCKED / idempotent, retention is advisory-locked.
+    let janitor_handle = engine.run_janitor();
 
     // Graceful shutdown on SIGINT/SIGTERM.
     {
@@ -104,6 +110,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     metrics_handle.abort();
+    let _ = janitor_handle.await;
     tracing::info!("shutdown complete");
     Ok(())
 }

@@ -1,7 +1,9 @@
 //! # queueflow-core
 //!
-//! The core engine for **QueueFlow**, a PostgreSQL/PGMQ-native distributed job
-//! queue and workflow engine.
+//! The core engine for **QueueFlow**, a PostgreSQL-native distributed job
+//! queue and workflow engine. The jobs table *is* the queue: workers claim
+//! due rows with `FOR UPDATE SKIP LOCKED` and own them through lease tokens,
+//! so any plain Postgres (RDS, Cloud SQL, Azure) works — no extensions.
 //!
 //! ## Design highlights
 //!
@@ -9,11 +11,11 @@
 //!   dependency gating, context propagation, per-step failure policies,
 //!   cycle detection, and an ergonomic [`WorkflowBuilder`] DSL.
 //! * **Testability is a first-class design goal.** The engine is written
-//!   against the [`ports`] (`JobStore`/`MessageQueue`) so the entire system —
-//!   including retries and workflow orchestration — runs against the
-//!   deterministic [`adapters::memory`] adapters with **no database**.
-//! * **Durable retries.** Retries use the queue's native delayed redelivery
-//!   ([`MessageQueue::send_delayed`]), so they survive process restarts.
+//!   against the [`ports`] (`JobStore`) so the entire system — including
+//!   retries and workflow orchestration — runs against the deterministic
+//!   [`adapters::memory`] adapter with **no database**.
+//! * **Durable retries and scheduling.** A retry (or a `run_at` job) is just a
+//!   row whose `scheduled_at` lies in the future, so delays survive restarts.
 //! * **Typed everything.** Statuses, backoff strategies, and failure policies
 //!   are exhaustive enums; durations are plain seconds for clean SDKs.
 //!
@@ -26,10 +28,9 @@
 //!
 //! # async fn run() -> Result<(), EngineError> {
 //! let clock = Arc::new(SystemClock);
-//! let store = Arc::new(InMemoryJobStore::new());
-//! let queue = Arc::new(InMemoryMessageQueue::new(clock.clone()));
+//! let store = Arc::new(InMemoryJobStore::new(clock.clone()));
 //!
-//! let engine = Engine::builder(store, queue, clock)
+//! let engine = Engine::builder(store, clock)
 //!     .register("echo", queueflow_core::task::builtin::echo())
 //!     .build();
 //!
@@ -52,21 +53,19 @@ pub mod workflow;
 // ---- Curated public surface -------------------------------------------------
 
 pub use adapters::clock::{SystemClock, TestClock};
-pub use adapters::memory::{InMemoryJobStore, InMemoryMessageQueue};
+pub use adapters::memory::InMemoryJobStore;
 pub use api::JobApi;
 pub use domain::{
     BackoffStrategy, CreateWorkflowRequest, Job, JobConfig, JobStatus, Json, LeasedJob, Map,
     OnFailure, OnSuccess, StepStatus, Workflow, WorkflowStatus, WorkflowStep, CONTEXT_KEY,
 };
-pub use engine::{Engine, EngineBuilder, EnqueueOptions};
+pub use engine::janitor::JanitorSweepReport;
+pub use engine::{Engine, EngineBuilder, EnqueueOptions, JanitorConfig};
 pub use error::{EngineError, HandlerError};
-pub use ports::{
-    Clock, JobStore, ListFilter, MessageQueue, Page, QueueError, QueueMessage, ReadMessage,
-    StepRecord, StorageError,
-};
+pub use ports::{Claimed, Clock, JobStore, ListFilter, Page, StepRecord, StorageError};
 pub use stats::{EngineStats, StatsSnapshot};
 pub use task::{handler_fn, FnHandler, TaskHandler};
 pub use workflow::{CycleError, DependencyGraph, StepBuilder, WorkflowBuilder, WorkflowScheduler};
 
 #[cfg(feature = "postgres")]
-pub use adapters::postgres::{connect, migrate, PostgresJobStore, PostgresMessageQueue};
+pub use adapters::postgres::{connect, migrate, PostgresJobStore};

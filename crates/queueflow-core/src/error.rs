@@ -1,6 +1,6 @@
 //! Error types for the engine surface.
 
-use crate::ports::{QueueError, StorageError};
+use crate::ports::StorageError;
 use crate::workflow::dag::CycleError;
 
 /// Top-level error returned by engine and [`crate::api::JobApi`] operations.
@@ -13,17 +13,11 @@ pub enum EngineError {
     #[error(transparent)]
     Storage(#[from] StorageError),
 
-    #[error(transparent)]
-    Queue(#[from] QueueError),
-
     #[error("invalid workflow: {0}")]
     Workflow(#[from] CycleError),
 
     #[error("validation error: {0}")]
     Validation(String),
-
-    #[error("not found: {0}")]
-    NotFound(String),
 
     #[error("conflict: {0}")]
     Conflict(String),
@@ -40,12 +34,11 @@ impl EngineError {
     pub fn is_not_found(&self) -> bool {
         matches!(
             self,
-            EngineError::NotFound(_)
-                | EngineError::Storage(
-                    StorageError::JobNotFound(_)
-                        | StorageError::WorkflowNotFound(_)
-                        | StorageError::StepNotFound { .. }
-                )
+            EngineError::Storage(
+                StorageError::JobNotFound(_)
+                    | StorageError::WorkflowNotFound(_)
+                    | StorageError::StepNotFound { .. }
+            )
         )
     }
 

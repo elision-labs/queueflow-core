@@ -4,9 +4,9 @@
 //! on its dependencies, propagates per-step results through the workflow
 //! context, applies failure policies, and aggregates the final workflow status.
 //!
-//! It is intentionally generic over the [`JobStore`]/[`MessageQueue`] ports so
-//! the full orchestration is exercised by fast in-memory tests as well as the
-//! Postgres adapter.
+//! It is intentionally generic over the [`JobStore`] port so the full
+//! orchestration is exercised by fast in-memory tests as well as the Postgres
+//! adapter.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,34 +15,30 @@ use uuid::Uuid;
 
 use crate::domain::*;
 use crate::error::EngineError;
-use crate::ports::{Clock, JobStore, MessageQueue, QueueMessage};
+use crate::ports::{Clock, JobStore};
 use crate::stats::EngineStats;
 use crate::workflow::dag::DependencyGraph;
 
-/// Schedules and advances workflows over the storage + queue ports.
-pub struct WorkflowScheduler<JS, MQ> {
+/// Schedules and advances workflows over the storage port.
+pub struct WorkflowScheduler<JS> {
     store: Arc<JS>,
-    queue: Arc<MQ>,
     clock: Arc<dyn Clock>,
     default_queue: String,
     stats: Arc<EngineStats>,
 }
 
-impl<JS, MQ> WorkflowScheduler<JS, MQ>
+impl<JS> WorkflowScheduler<JS>
 where
     JS: JobStore,
-    MQ: MessageQueue,
 {
     pub(crate) fn new(
         store: Arc<JS>,
-        queue: Arc<MQ>,
         clock: Arc<dyn Clock>,
         default_queue: String,
         stats: Arc<EngineStats>,
     ) -> Self {
         Self {
             store,
-            queue,
             clock,
             default_queue,
             stats,
@@ -178,8 +174,9 @@ where
 
     /// Schedule newly-ready steps and cascade skips, to a fixpoint, then
     /// recompute the workflow's aggregate status. Idempotent and a no-op once
-    /// the workflow is terminal.
-    async fn advance(&self, workflow_id: &str) -> Result<(), EngineError> {
+    /// the workflow is terminal. Also re-driven by the janitor for workflows
+    /// stalled by a crash mid-advance.
+    pub(crate) async fn advance(&self, workflow_id: &str) -> Result<(), EngineError> {
         let wf = self.store.get_workflow(workflow_id).await?;
         if wf.status.is_terminal() {
             return Ok(());
@@ -290,7 +287,9 @@ where
         Ok(())
     }
 
-    /// Create + enqueue a job for a single step, injecting the workflow context.
+    /// Create a job for a single step, injecting the workflow context. The
+    /// insert *is* the publish, so the only ordering that matters is the
+    /// step->job claim below.
     async fn enqueue_step(
         &self,
         wf: &Workflow,
@@ -305,6 +304,7 @@ where
             );
         }
 
+        let now = self.clock.now();
         let job = Job {
             id: Uuid::new_v4().to_string(),
             queue_name: self.default_queue.clone(),
@@ -312,9 +312,11 @@ where
             payload,
             config: step.config.clone().unwrap_or_default(),
             status: JobStatus::Pending,
-            created_at: self.clock.now(),
+            created_at: now,
+            scheduled_at: now,
             started_at: None,
             completed_at: None,
+            delivery_count: 0,
             error_message: None,
             retry_count: 0,
             next_retry_at: None,
@@ -326,34 +328,17 @@ where
             idempotency_key: None,
         };
 
-        // Persist the job, then CLAIM the step->job link, and only publish if
-        // the claim won. Two workers completing sibling steps concurrently both
-        // run `advance` and can both see a join step as unscheduled; the atomic
-        // claim guarantees exactly one of them enqueues it. Linking before
-        // `send` also means a crash here can at worst stall this step
-        // (recoverable) rather than enqueue it twice (duplicate execution).
-        self.store.create_job(&job).await?;
-        let claimed = self
-            .store
-            .link_step_job(&wf.id, &step.name, &job.id)
-            .await?;
+        // CLAIM the step and create its job in one atomic store operation.
+        // Two workers completing sibling steps concurrently both run `advance`
+        // and can both see a join step as unscheduled; the claim guarantees
+        // exactly one job is ever persisted. Atomicity matters because the
+        // insert is the publish: a separately-inserted loser row would be
+        // claimable by a worker before it could be retired.
+        let claimed = self.store.create_step_job(&job).await?;
         if !claimed {
-            // Lost the race: retire our duplicate job row and enqueue nothing.
-            let _ = self
-                .store
-                .update_status(
-                    &job.id,
-                    JobStatus::Cancelled,
-                    Some("superseded: step was scheduled by a concurrent advance"),
-                    None,
-                )
-                .await;
+            // Lost the race: nothing was persisted.
             return Ok(job.id);
         }
-        let msg = QueueMessage::for_job(&job);
-        self.queue
-            .send(&job.queue_name, &msg, job.config.priority)
-            .await?;
         EngineStats::incr(&self.stats.jobs_created);
         Ok(job.id)
     }

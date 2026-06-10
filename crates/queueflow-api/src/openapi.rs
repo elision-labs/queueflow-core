@@ -36,7 +36,7 @@ impl Modify for SecurityAddon {
     info(
         title = "QueueFlow API",
         version = "1.0.0",
-        description = "REST API for QueueFlow, a PostgreSQL/PGMQ-native distributed job queue and workflow engine.",
+        description = "REST API for QueueFlow, a PostgreSQL-native distributed job queue and workflow engine.",
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "QueueFlow", url = "https://queueflow.dev"),
     ),
@@ -83,6 +83,7 @@ impl Modify for SecurityAddon {
         CompleteJobRequest,
         FailJobRequest,
         HeartbeatRequest,
+        HeartbeatResponse,
         JobConfigRequest,
         CreateJobRequest,
         CreateJobResponse,

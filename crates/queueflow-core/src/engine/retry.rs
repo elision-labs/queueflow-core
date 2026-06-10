@@ -1,8 +1,8 @@
 //! Typed retry backoff.
 //!
 //! An exhaustive enum and a pure, testable delay function. The *scheduling* of
-//! the retry is durable: the engine asks the queue to redeliver after
-//! [`BackoffStrategy::next_retry_at`], so a retry survives a process restart.
+//! the retry is durable: [`BackoffStrategy::next_retry_at`] becomes the job
+//! row's `scheduled_at`, so a retry survives a process restart.
 
 use chrono::{DateTime, Duration, Utc};
 

@@ -60,12 +60,12 @@
 #           path: spec/
 # 
 #   postgres:
-#     name: Postgres + PGMQ integration
+#     name: Postgres integration
 #     runs-on: ubuntu-latest
 #     services:
 #       postgres:
-#         # PGMQ-enabled PostgreSQL. Adjust the tag to your preferred pgmq build.
-#         image: quay.io/tembo/pg16-pgmq:latest
+#         # Any plain PostgreSQL 13+ works; no extensions required.
+#         image: postgres:16-alpine
 #         env:
 #           POSTGRES_PASSWORD: postgres
 #           POSTGRES_DB: queueflow_test

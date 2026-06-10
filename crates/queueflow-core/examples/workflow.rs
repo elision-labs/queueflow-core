@@ -13,10 +13,9 @@ use queueflow_core::*;
 #[tokio::main]
 async fn main() -> Result<(), EngineError> {
     let clock = Arc::new(SystemClock);
-    let store = Arc::new(InMemoryJobStore::new());
-    let queue = Arc::new(InMemoryMessageQueue::new(clock.clone()));
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
 
-    let engine = Engine::builder(store, queue, clock)
+    let engine = Engine::builder(store, clock)
         // One generic handler stands in for every step's work.
         .register("step", builtin::echo())
         .build();

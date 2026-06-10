@@ -13,13 +13,11 @@ authors.workspace = true
 queueflow-core = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
-async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 axum = { workspace = true }
-tower = { workspace = true }
 tower-http = { workspace = true }
 utoipa = { workspace = true }
 

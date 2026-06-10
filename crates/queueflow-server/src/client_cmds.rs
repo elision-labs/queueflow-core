@@ -33,6 +33,7 @@ pub async fn job(cmd: JobCommand) -> anyhow::Result<()> {
             max_retries,
             timeout_secs,
             idempotency_key,
+            run_at,
             wait,
         } => {
             let c = client(&args);
@@ -46,6 +47,7 @@ pub async fn job(cmd: JobCommand) -> anyhow::Result<()> {
                         max_retries,
                         timeout_secs,
                         idempotency_key,
+                        run_at,
                     },
                 )
                 .await?;

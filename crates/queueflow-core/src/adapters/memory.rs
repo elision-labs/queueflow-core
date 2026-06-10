@@ -1,25 +1,24 @@
-//! In-memory adapters: a complete, dependency-free implementation of the
-//! [`JobStore`] and [`MessageQueue`] ports.
+//! In-memory adapter: a complete, dependency-free implementation of the
+//! [`JobStore`] port, including its claim/lease queue role.
 //!
-//! These are not toys — they faithfully model the *observable* behaviour the
-//! engine relies on, in particular PGMQ's visibility-timeout and delayed
-//! delivery. Combined with [`TestClock`](crate::adapters::clock::TestClock),
-//! they make the engine, retry/backoff logic, and the whole workflow scheduler
-//! testable deterministically with zero external services.
+//! This is not a toy — it faithfully models the *observable* behaviour the
+//! engine relies on: priority-ordered claims, `scheduled_at` visibility,
+//! lease tokens and expiry, and the janitor sweeps. Combined with
+//! [`TestClock`](crate::adapters::clock::TestClock), it makes the engine,
+//! retry/backoff logic, and the whole workflow scheduler testable
+//! deterministically with zero external services.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use tokio::sync::Notify;
+use uuid::Uuid;
 
 use crate::domain::*;
 use crate::ports::*;
-
-// ---------------------------------------------------------------------------
-// Job store
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct StepState {
@@ -37,26 +36,75 @@ struct DeadLetter {
     reason: String,
     #[allow(dead_code)]
     error: String,
+    #[allow(dead_code)]
+    tenant_id: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+/// A held lease on a `running` job.
+#[derive(Clone)]
+struct Lease {
+    token: String,
+    locked_until: DateTime<Utc>,
 }
 
 /// In-memory [`JobStore`]. Cloneable; clones share the same backing maps.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct InMemoryJobStore {
     inner: Arc<Inner>,
 }
 
-#[derive(Default)]
+/// Lock order: when holding more than one of these mutexes, acquire them in
+/// field-declaration order (jobs -> leases -> workflows -> steps ->
+/// dead_letters -> waiters). Every multi-lock method follows it; deviating
+/// can deadlock a janitor sweep racing a workflow advance.
 struct Inner {
+    clock: Arc<dyn Clock>,
     jobs: Mutex<HashMap<String, Job>>,
+    /// job_id -> lease. Entries exist only while a job is leased (`running`).
+    leases: Mutex<HashMap<String, Lease>>,
     workflows: Mutex<HashMap<String, Workflow>>,
     // keyed by (workflow_id, step_name)
     steps: Mutex<HashMap<(String, String), StepState>>,
     dead_letters: Mutex<Vec<DeadLetter>>,
+    /// Per-queue wakeups for `await_work`.
+    waiters: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
 impl InMemoryJobStore {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                clock,
+                jobs: Mutex::new(HashMap::new()),
+                leases: Mutex::new(HashMap::new()),
+                workflows: Mutex::new(HashMap::new()),
+                steps: Mutex::new(HashMap::new()),
+                dead_letters: Mutex::new(Vec::new()),
+                waiters: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        self.inner.clock.now()
+    }
+
+    fn waiter(&self, queue: &str) -> Arc<Notify> {
+        self.inner
+            .waiters
+            .lock()
+            .unwrap()
+            .entry(queue.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Wake every `await_work` parked on `queue` (mirrors the NOTIFY trigger).
+    fn notify_work(&self, queue: &str) {
+        if let Some(n) = self.inner.waiters.lock().unwrap().get(queue) {
+            n.notify_waiters();
+        }
     }
 }
 
@@ -100,16 +148,22 @@ fn matches_filter(job: &Job, f: &ListFilter) -> bool {
 #[async_trait]
 impl JobStore for InMemoryJobStore {
     async fn create_job(&self, job: &Job) -> Result<bool, StorageError> {
-        let mut guard = self.inner.jobs.lock().unwrap();
-        if let Some(key) = &job.idempotency_key {
-            let duplicate = guard.values().any(|j| {
-                j.idempotency_key.as_deref() == Some(key.as_str()) && j.tenant_id == job.tenant_id
-            });
-            if duplicate {
-                return Ok(false);
+        {
+            let mut guard = self.inner.jobs.lock().unwrap();
+            if let Some(key) = &job.idempotency_key {
+                let duplicate = guard.values().any(|j| {
+                    j.idempotency_key.as_deref() == Some(key.as_str())
+                        && j.tenant_id == job.tenant_id
+                });
+                if duplicate {
+                    return Ok(false);
+                }
             }
+            guard.insert(job.id.clone(), job.clone());
         }
-        guard.insert(job.id.clone(), job.clone());
+        if job.status == JobStatus::Pending {
+            self.notify_work(&job.queue_name);
+        }
         Ok(true)
     }
 
@@ -131,11 +185,20 @@ impl JobStore for InMemoryJobStore {
     }
 
     async fn batch_create_jobs(&self, jobs: &[Job]) -> Result<Vec<String>, StorageError> {
-        let mut guard = self.inner.jobs.lock().unwrap();
         let mut ids = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            guard.insert(job.id.clone(), job.clone());
-            ids.push(job.id.clone());
+        {
+            let mut guard = self.inner.jobs.lock().unwrap();
+            for job in jobs {
+                guard.insert(job.id.clone(), job.clone());
+                ids.push(job.id.clone());
+            }
+        }
+        // One wakeup per distinct queue, like the trigger's per-tx dedup.
+        let mut queues: Vec<&str> = jobs.iter().map(|j| j.queue_name.as_str()).collect();
+        queues.sort_unstable();
+        queues.dedup();
+        for q in queues {
+            self.notify_work(q);
         }
         Ok(ids)
     }
@@ -168,30 +231,140 @@ impl JobStore for InMemoryJobStore {
         Ok(paginate(matched, filter, total))
     }
 
-    async fn update_status(
+    // ---- Claim / lease ------------------------------------------------------
+
+    async fn claim_jobs(
         &self,
-        id: &str,
+        queue: &str,
+        count: usize,
+        lease_secs: u32,
+    ) -> Result<Claimed, StorageError> {
+        let now = self.now();
+        let mut jobs = self.inner.jobs.lock().unwrap();
+        let mut leases = self.inner.leases.lock().unwrap();
+
+        let claimable = |j: &Job| {
+            j.queue_name == queue && matches!(j.status, JobStatus::Pending | JobStatus::Retrying)
+        };
+
+        // Due jobs, ordered like the Postgres claim query: higher priority
+        // first, then earlier scheduled_at, then created_at, then id (stable).
+        let mut due: Vec<String> = jobs
+            .values()
+            .filter(|j| claimable(j) && j.scheduled_at <= now)
+            .map(|j| j.id.clone())
+            .collect();
+        due.sort_by(|a, b| {
+            let ja = &jobs[a];
+            let jb = &jobs[b];
+            jb.config
+                .priority
+                .cmp(&ja.config.priority)
+                .then(ja.scheduled_at.cmp(&jb.scheduled_at))
+                .then(ja.created_at.cmp(&jb.created_at))
+                .then(a.cmp(b))
+        });
+
+        let mut out = Vec::new();
+        for id in due.into_iter().take(count) {
+            let job = jobs.get_mut(&id).unwrap();
+            job.status = JobStatus::Running;
+            job.started_at.get_or_insert(now);
+            job.delivery_count += 1;
+            let token = Uuid::new_v4().to_string();
+            leases.insert(
+                id.clone(),
+                Lease {
+                    token: token.clone(),
+                    locked_until: now + Duration::seconds(lease_secs as i64),
+                },
+            );
+            out.push(LeasedJob {
+                job: job.clone(),
+                lease_token: token,
+            });
+        }
+
+        let next_due = if out.is_empty() {
+            jobs.values()
+                .filter(|j| claimable(j) && j.scheduled_at > now)
+                .map(|j| j.scheduled_at)
+                .min()
+        } else {
+            None
+        };
+
+        Ok(Claimed {
+            jobs: out,
+            next_due,
+        })
+    }
+
+    async fn extend_lease(
+        &self,
+        job_id: &str,
+        token: &str,
+        lease_secs: u32,
+    ) -> Result<Option<JobStatus>, StorageError> {
+        let now = self.now();
+        let jobs = self.inner.jobs.lock().unwrap();
+        let job = jobs
+            .get(job_id)
+            .ok_or_else(|| StorageError::JobNotFound(job_id.to_string()))?;
+        if job.status != JobStatus::Running {
+            // Finished or cancelled mid-run: report it, extend nothing.
+            return Ok(Some(job.status));
+        }
+        let mut leases = self.inner.leases.lock().unwrap();
+        match leases.get_mut(job_id) {
+            Some(lease) if lease.token == token => {
+                lease.locked_until = now + Duration::seconds(lease_secs as i64);
+                Ok(Some(JobStatus::Running))
+            }
+            _ => Ok(None), // reclaimed under a different token
+        }
+    }
+
+    async fn finish_if_leased(
+        &self,
+        job_id: &str,
+        token: &str,
         status: JobStatus,
         error: Option<&str>,
         result: Option<&Json>,
-    ) -> Result<(), StorageError> {
-        let mut guard = self.inner.jobs.lock().unwrap();
-        let job = guard
-            .get_mut(id)
-            .ok_or_else(|| StorageError::JobNotFound(id.to_string()))?;
+    ) -> Result<bool, StorageError> {
+        debug_assert!(status.is_terminal());
+        let now = self.now();
+        let mut jobs = self.inner.jobs.lock().unwrap();
+        let mut leases = self.inner.leases.lock().unwrap();
+        let Some(job) = jobs.get_mut(job_id) else {
+            return Ok(false);
+        };
+        let owned = job.status == JobStatus::Running
+            && leases.get(job_id).is_some_and(|l| l.token == token);
+        if !owned {
+            return Ok(false);
+        }
         job.status = status;
-        let now = Utc::now();
-        if status == JobStatus::Running && job.started_at.is_none() {
-            job.started_at = Some(now);
-        }
-        if status.is_terminal() {
-            job.completed_at = Some(now);
-        }
+        job.completed_at = Some(now);
         if let Some(e) = error {
             job.error_message = Some(e.to_string());
         }
         if let Some(r) = result {
             job.result = Some(r.clone());
+        }
+        leases.remove(job_id);
+        Ok(true)
+    }
+
+    async fn await_work(&self, queue: &str, max_wait: StdDuration) -> Result<(), StorageError> {
+        let notify = self.waiter(queue);
+        // Note: a wakeup fired between the caller's empty claim and this call
+        // is missed, exactly like a NOTIFY between query and LISTEN; max_wait
+        // bounds the damage and the caller re-claims in a loop.
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = tokio::time::sleep(max_wait) => {}
         }
         Ok(())
     }
@@ -206,33 +379,53 @@ impl JobStore for InMemoryJobStore {
         }
         job.status = JobStatus::Cancelled;
         job.error_message = Some(reason.to_string());
-        job.completed_at = Some(Utc::now());
+        job.completed_at = Some(self.now());
+        self.inner.leases.lock().unwrap().remove(id);
         Ok(true)
     }
 
     async fn mark_retrying(
         &self,
         id: &str,
+        token: &str,
         retry_count: u32,
         next_retry_at: DateTime<Utc>,
         error: &str,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         let mut guard = self.inner.jobs.lock().unwrap();
-        let job = guard
-            .get_mut(id)
-            .ok_or_else(|| StorageError::JobNotFound(id.to_string()))?;
+        let mut leases = self.inner.leases.lock().unwrap();
+        let Some(job) = guard.get_mut(id) else {
+            return Ok(false);
+        };
+        let owned =
+            job.status == JobStatus::Running && leases.get(id).is_some_and(|l| l.token == token);
+        if !owned {
+            return Ok(false);
+        }
         job.status = JobStatus::Retrying;
         job.retry_count = retry_count;
         job.next_retry_at = Some(next_retry_at);
+        // The durable delay: the row itself is invisible to claims until then.
+        job.scheduled_at = next_retry_at;
         job.error_message = Some(error.to_string());
-        Ok(())
+        leases.remove(id);
+        Ok(true)
     }
 
     async fn move_to_dlq(&self, id: &str, reason: &str, error: &str) -> Result<(), StorageError> {
+        let tenant_id = self
+            .inner
+            .jobs
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|j| j.tenant_id.clone());
         self.inner.dead_letters.lock().unwrap().push(DeadLetter {
             job_id: id.to_string(),
             reason: reason.to_string(),
             error: error.to_string(),
+            tenant_id,
+            created_at: self.now(),
         });
         Ok(())
     }
@@ -244,6 +437,114 @@ impl JobStore for InMemoryJobStore {
     async fn ping(&self) -> Result<(), StorageError> {
         Ok(())
     }
+
+    // ---- Janitor sweeps -----------------------------------------------------
+
+    async fn claim_expired_leases(
+        &self,
+        limit: usize,
+        lease_secs: u32,
+    ) -> Result<Vec<LeasedJob>, StorageError> {
+        let now = self.now();
+        let jobs = self.inner.jobs.lock().unwrap();
+        let mut leases = self.inner.leases.lock().unwrap();
+
+        let expired: Vec<String> = leases
+            .iter()
+            .filter(|(id, l)| {
+                l.locked_until < now && jobs.get(*id).map(|j| j.status) == Some(JobStatus::Running)
+            })
+            .map(|(id, _)| id.clone())
+            .take(limit)
+            .collect();
+
+        let mut out = Vec::with_capacity(expired.len());
+        for id in expired {
+            let token = Uuid::new_v4().to_string();
+            leases.insert(
+                id.clone(),
+                Lease {
+                    token: token.clone(),
+                    locked_until: now + Duration::seconds(lease_secs as i64),
+                },
+            );
+            out.push(LeasedJob {
+                job: jobs[&id].clone(),
+                lease_token: token,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn stalled_step_jobs(&self, limit: usize) -> Result<Vec<Job>, StorageError> {
+        let jobs = self.inner.jobs.lock().unwrap();
+        let steps = self.inner.steps.lock().unwrap();
+        Ok(steps
+            .values()
+            .filter(|st| !st.status.is_terminal())
+            .filter_map(|st| st.job_id.as_ref().and_then(|id| jobs.get(id)))
+            .filter(|j| j.status.is_terminal())
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn stalled_workflow_ids(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        let jobs = self.inner.jobs.lock().unwrap();
+        let workflows = self.inner.workflows.lock().unwrap();
+        let steps = self.inner.steps.lock().unwrap();
+        Ok(workflows
+            .values()
+            .filter(|wf| !wf.status.is_terminal())
+            .filter(|wf| {
+                // No live (non-terminal) linked job anywhere in the workflow.
+                !steps.iter().any(|((wf_id, _), st)| {
+                    wf_id == &wf.id
+                        && st
+                            .job_id
+                            .as_ref()
+                            .and_then(|id| jobs.get(id))
+                            .is_some_and(|j| !j.status.is_terminal())
+                })
+            })
+            .map(|wf| wf.id.clone())
+            .take(limit)
+            .collect())
+    }
+
+    async fn purge_terminal(&self, older_than: DateTime<Utc>) -> Result<u64, StorageError> {
+        let mut jobs = self.inner.jobs.lock().unwrap();
+        let before = jobs.len();
+        jobs.retain(|_, j| {
+            !(j.status.is_terminal() && j.completed_at.unwrap_or(j.created_at) < older_than)
+        });
+        let purged = (before - jobs.len()) as u64;
+
+        let mut workflows = self.inner.workflows.lock().unwrap();
+        let dead_wfs: Vec<String> = workflows
+            .values()
+            .filter(|w| {
+                w.status.is_terminal() && w.completed_at.unwrap_or(w.created_at) < older_than
+            })
+            .map(|w| w.id.clone())
+            .collect();
+        for id in &dead_wfs {
+            workflows.remove(id);
+        }
+        self.inner
+            .steps
+            .lock()
+            .unwrap()
+            .retain(|(wf_id, _), _| !dead_wfs.contains(wf_id));
+        self.inner
+            .dead_letters
+            .lock()
+            .unwrap()
+            .retain(|d| d.created_at >= older_than);
+        Ok(purged)
+    }
+
+    // ---- Workflows ----------------------------------------------------------
 
     async fn create_workflow(&self, wf: &Workflow) -> Result<(), StorageError> {
         self.inner
@@ -344,6 +645,32 @@ impl JobStore for InMemoryJobStore {
         Ok(true)
     }
 
+    async fn create_step_job(&self, job: &Job) -> Result<bool, StorageError> {
+        let wf_id = job.workflow_id.clone().unwrap_or_default();
+        let step_name = job.workflow_step_id.clone().unwrap_or_default();
+        {
+            // One critical section covers the claim and the insert, so the
+            // job only ever exists linked to the step it won.
+            let mut jobs = self.inner.jobs.lock().unwrap();
+            let mut steps = self.inner.steps.lock().unwrap();
+            let st = steps.get_mut(&(wf_id.clone(), step_name.clone())).ok_or(
+                StorageError::StepNotFound {
+                    workflow: wf_id,
+                    step: step_name,
+                },
+            )?;
+            if st.job_id.is_some() {
+                return Ok(false);
+            }
+            st.job_id = Some(job.id.clone());
+            jobs.insert(job.id.clone(), job.clone());
+        }
+        if job.status == JobStatus::Pending {
+            self.notify_work(&job.queue_name);
+        }
+        Ok(true)
+    }
+
     async fn set_step_status(
         &self,
         workflow_id: &str,
@@ -379,7 +706,7 @@ impl JobStore for InMemoryJobStore {
             return Ok(false);
         }
         wf.status = status;
-        let now = Utc::now();
+        let now = self.now();
         if status == WorkflowStatus::Running && wf.started_at.is_none() {
             wf.started_at = Some(now);
         }
@@ -404,301 +731,195 @@ impl JobStore for InMemoryJobStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Message queue
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct MemMsg {
-    message: QueueMessage,
-    priority: i32,
-    enqueued_at: DateTime<Utc>,
-    visible_at: DateTime<Utc>,
-    read_count: u32,
-}
-
-/// In-memory [`MessageQueue`] that simulates PGMQ visibility timeouts and
-/// delayed delivery against an injected [`Clock`].
-#[derive(Clone)]
-pub struct InMemoryMessageQueue {
-    clock: Arc<dyn Clock>,
-    queues: Arc<Mutex<HashMap<String, HashMap<i64, MemMsg>>>>,
-    next_id: Arc<AtomicI64>,
-}
-
-impl InMemoryMessageQueue {
-    pub fn new(clock: Arc<dyn Clock>) -> Self {
-        Self {
-            clock,
-            queues: Arc::new(Mutex::new(HashMap::new())),
-            next_id: Arc::new(AtomicI64::new(1)),
-        }
-    }
-
-    fn push(&self, queue: &str, msg: &QueueMessage, priority: i32, delay_secs: u64) -> i64 {
-        let now = self.clock.now();
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let mut guard = self.queues.lock().unwrap();
-        let q = guard.entry(queue.to_string()).or_default();
-        q.insert(
-            id,
-            MemMsg {
-                message: msg.clone(),
-                priority,
-                enqueued_at: now,
-                visible_at: now + Duration::seconds(delay_secs as i64),
-                read_count: 0,
-            },
-        );
-        id
-    }
-}
-
-#[async_trait]
-impl MessageQueue for InMemoryMessageQueue {
-    async fn send(
-        &self,
-        queue: &str,
-        msg: &QueueMessage,
-        priority: i32,
-    ) -> Result<i64, QueueError> {
-        Ok(self.push(queue, msg, priority, 0))
-    }
-
-    async fn send_batch(
-        &self,
-        queue: &str,
-        msgs: &[QueueMessage],
-        priority: i32,
-    ) -> Result<Vec<i64>, QueueError> {
-        Ok(msgs
-            .iter()
-            .map(|m| self.push(queue, m, priority, 0))
-            .collect())
-    }
-
-    async fn send_delayed(
-        &self,
-        queue: &str,
-        msg: &QueueMessage,
-        priority: i32,
-        delay_secs: u64,
-    ) -> Result<i64, QueueError> {
-        Ok(self.push(queue, msg, priority, delay_secs))
-    }
-
-    async fn read(
-        &self,
-        queue: &str,
-        vt_secs: u32,
-        count: usize,
-    ) -> Result<Vec<ReadMessage>, QueueError> {
-        let now = self.clock.now();
-        let mut guard = self.queues.lock().unwrap();
-        let Some(q) = guard.get_mut(queue) else {
-            return Ok(vec![]);
-        };
-        // Visible messages, ordered like PGMQ-with-priority: higher priority
-        // first, then oldest first, then stable by msg_id.
-        let mut visible: Vec<i64> = q
-            .iter()
-            .filter(|(_, m)| m.visible_at <= now)
-            .map(|(id, _)| *id)
-            .collect();
-        visible.sort_by(|a, b| {
-            let ma = &q[a];
-            let mb = &q[b];
-            mb.priority
-                .cmp(&ma.priority)
-                .then(ma.enqueued_at.cmp(&mb.enqueued_at))
-                .then(a.cmp(b))
-        });
-
-        let mut out = Vec::new();
-        for id in visible.into_iter().take(count) {
-            let m = q.get_mut(&id).unwrap();
-            m.visible_at = now + Duration::seconds(vt_secs as i64);
-            m.read_count += 1;
-            out.push(ReadMessage {
-                msg_id: id,
-                message: m.message.clone(),
-                read_count: m.read_count,
-                enqueued_at: m.enqueued_at,
-            });
-        }
-        Ok(out)
-    }
-
-    async fn read_with_poll(
-        &self,
-        queue: &str,
-        vt_secs: u32,
-        count: usize,
-        poll_secs: u32,
-    ) -> Result<Vec<ReadMessage>, QueueError> {
-        // Wall-clock polling loop mirroring pgmq.read_with_poll. Message
-        // *visibility* still follows the injected clock; only the waiting is
-        // real time, so deterministic tests should use `read` directly.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(poll_secs as u64);
-        loop {
-            let msgs = self.read(queue, vt_secs, count).await?;
-            if !msgs.is_empty() || std::time::Instant::now() >= deadline {
-                return Ok(msgs);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
-    async fn set_vt(&self, queue: &str, msg_id: i64, vt_secs: u32) -> Result<(), QueueError> {
-        let now = self.clock.now();
-        if let Some(q) = self.queues.lock().unwrap().get_mut(queue) {
-            if let Some(m) = q.get_mut(&msg_id) {
-                m.visible_at = now + Duration::seconds(vt_secs as i64);
-            }
-        }
-        Ok(())
-    }
-
-    async fn delete(&self, queue: &str, msg_id: i64) -> Result<(), QueueError> {
-        if let Some(q) = self.queues.lock().unwrap().get_mut(queue) {
-            q.remove(&msg_id);
-        }
-        Ok(())
-    }
-
-    async fn purge(&self, queue: &str) -> Result<u64, QueueError> {
-        if let Some(q) = self.queues.lock().unwrap().get_mut(queue) {
-            let n = q.len() as u64;
-            q.clear();
-            Ok(n)
-        } else {
-            Ok(0)
-        }
-    }
-
-    async fn queue_depth(&self, queue: &str) -> Result<u64, QueueError> {
-        let now = self.clock.now();
-        Ok(self
-            .queues
-            .lock()
-            .unwrap()
-            .get(queue)
-            .map(|q| q.values().filter(|m| m.visible_at <= now).count() as u64)
-            .unwrap_or(0))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::adapters::clock::TestClock;
 
-    fn msg(id: &str) -> QueueMessage {
-        QueueMessage {
-            job_id: id.to_string(),
+    fn job(id: &str, queue: &str, priority: i32) -> Job {
+        let epoch = TestClock::epoch().now();
+        Job {
+            id: id.to_string(),
+            queue_name: queue.to_string(),
             task_name: "t".into(),
             payload: Map::new(),
-            config: JobConfig::default(),
+            config: JobConfig {
+                priority,
+                ..JobConfig::default()
+            },
+            status: JobStatus::Pending,
+            created_at: epoch,
+            scheduled_at: epoch,
+            started_at: None,
+            completed_at: None,
+            delivery_count: 0,
+            error_message: None,
+            retry_count: 0,
+            next_retry_at: None,
+            workflow_id: None,
+            workflow_step_id: None,
+            result: None,
+            metadata: Map::new(),
+            tenant_id: None,
+            idempotency_key: None,
         }
     }
 
-    #[tokio::test]
-    async fn read_hides_message_until_visibility_timeout_elapses() {
+    fn store() -> (InMemoryJobStore, Arc<TestClock>) {
         let clock = Arc::new(TestClock::epoch());
-        let q = InMemoryMessageQueue::new(clock.clone());
-        q.send("default", &msg("a"), 0).await.unwrap();
-
-        let first = q.read("default", 30, 1).await.unwrap();
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].read_count, 1);
-
-        // Hidden while leased.
-        assert!(q.read("default", 30, 1).await.unwrap().is_empty());
-
-        // Reappears after the visibility timeout, with an incremented read count.
-        clock.advance_secs(31);
-        let again = q.read("default", 30, 1).await.unwrap();
-        assert_eq!(again.len(), 1);
-        assert_eq!(again[0].read_count, 2);
+        (InMemoryJobStore::new(clock.clone()), clock)
     }
 
     #[tokio::test]
-    async fn delayed_send_is_invisible_until_delay_passes() {
-        let clock = Arc::new(TestClock::epoch());
-        let q = InMemoryMessageQueue::new(clock.clone());
-        q.send_delayed("default", &msg("a"), 0, 60).await.unwrap();
+    async fn claimed_job_is_hidden_until_finished_or_expired() {
+        let (s, clock) = store();
+        s.create_job(&job("a", "default", 0)).await.unwrap();
 
-        assert!(q.read("default", 30, 1).await.unwrap().is_empty());
+        let first = s.claim_jobs("default", 1, 30).await.unwrap();
+        assert_eq!(first.jobs.len(), 1);
+        assert_eq!(first.jobs[0].job.delivery_count, 1);
+        assert_eq!(first.jobs[0].job.status, JobStatus::Running);
+
+        // Hidden while leased — and unlike a visibility timeout, a lease does
+        // NOT make the job claimable again on expiry; recovery is the
+        // janitor's expired-lease sweep.
+        assert!(s
+            .claim_jobs("default", 1, 30)
+            .await
+            .unwrap()
+            .jobs
+            .is_empty());
+        clock.advance_secs(31);
+        assert!(s
+            .claim_jobs("default", 1, 30)
+            .await
+            .unwrap()
+            .jobs
+            .is_empty());
+
+        let expired = s.claim_expired_leases(10, 30).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_ne!(expired[0].lease_token, first.jobs[0].lease_token);
+    }
+
+    #[tokio::test]
+    async fn future_scheduled_job_is_invisible_and_reports_next_due() {
+        let (s, clock) = store();
+        let mut j = job("a", "default", 0);
+        j.scheduled_at = clock.now() + Duration::seconds(60);
+        s.create_job(&j).await.unwrap();
+
+        let c = s.claim_jobs("default", 1, 30).await.unwrap();
+        assert!(c.jobs.is_empty());
+        assert_eq!(c.next_due, Some(j.scheduled_at));
+
         clock.advance_secs(61);
-        assert_eq!(q.read("default", 30, 1).await.unwrap().len(), 1);
+        assert_eq!(s.claim_jobs("default", 1, 30).await.unwrap().jobs.len(), 1);
     }
 
     #[tokio::test]
-    async fn higher_priority_is_read_first() {
-        let clock = Arc::new(TestClock::epoch());
-        let q = InMemoryMessageQueue::new(clock.clone());
-        q.send("default", &msg("low"), 0).await.unwrap();
-        q.send("default", &msg("high"), 10).await.unwrap();
-        let read = q.read("default", 30, 1).await.unwrap();
-        assert_eq!(read[0].message.job_id, "high");
+    async fn higher_priority_is_claimed_first() {
+        let (s, _) = store();
+        s.create_job(&job("low", "default", 0)).await.unwrap();
+        s.create_job(&job("high", "default", 10)).await.unwrap();
+        let c = s.claim_jobs("default", 1, 30).await.unwrap();
+        assert_eq!(c.jobs[0].job.id, "high");
     }
 
     #[tokio::test]
-    async fn set_vt_extends_a_lease() {
-        let clock = Arc::new(TestClock::epoch());
-        let q = InMemoryMessageQueue::new(clock.clone());
-        let id = q.send("default", &msg("a"), 0).await.unwrap();
+    async fn stale_token_cannot_finish_or_extend() {
+        let (s, clock) = store();
+        s.create_job(&job("a", "default", 0)).await.unwrap();
+        let stale = s.claim_jobs("default", 1, 30).await.unwrap().jobs[0]
+            .lease_token
+            .clone();
 
-        // Lease for 30s, then extend to 600s.
-        assert_eq!(q.read("default", 30, 1).await.unwrap().len(), 1);
-        q.set_vt("default", id, 600).await.unwrap();
-
-        // Past the original lease the message stays hidden...
+        // Lease expires; the janitor reclaims under a fresh token.
         clock.advance_secs(31);
-        assert!(q.read("default", 30, 1).await.unwrap().is_empty());
-        // ...until the extended lease elapses.
-        clock.advance_secs(600);
-        assert_eq!(q.read("default", 30, 1).await.unwrap().len(), 1);
+        let fresh = s.claim_expired_leases(10, 30).await.unwrap()[0]
+            .lease_token
+            .clone();
+
+        assert_eq!(s.extend_lease("a", &stale, 30).await.unwrap(), None);
+        assert!(!s
+            .finish_if_leased("a", &stale, JobStatus::Completed, None, None)
+            .await
+            .unwrap());
+        assert!(s
+            .finish_if_leased("a", &fresh, JobStatus::Completed, None, None)
+            .await
+            .unwrap());
+        // A replay of the fresh token after finishing is also rejected.
+        assert!(!s
+            .finish_if_leased("a", &fresh, JobStatus::Completed, None, None)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
-    async fn read_with_poll_returns_when_a_message_arrives() {
-        let clock = Arc::new(TestClock::epoch());
-        let q = InMemoryMessageQueue::new(clock.clone());
+    async fn heartbeat_observes_mid_run_cancellation() {
+        let (s, _) = store();
+        s.create_job(&job("a", "default", 0)).await.unwrap();
+        let token = s.claim_jobs("default", 1, 30).await.unwrap().jobs[0]
+            .lease_token
+            .clone();
+        assert_eq!(
+            s.extend_lease("a", &token, 60).await.unwrap(),
+            Some(JobStatus::Running)
+        );
 
-        let q2 = q.clone();
+        assert!(s.cancel_job_if_active("a", "user").await.unwrap());
+        assert_eq!(
+            s.extend_lease("a", &token, 60).await.unwrap(),
+            Some(JobStatus::Cancelled)
+        );
+        // And the cancelled job can no longer be completed under the token.
+        assert!(!s
+            .finish_if_leased("a", &token, JobStatus::Completed, None, None)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn mark_retrying_reschedules_and_releases_the_lease() {
+        let (s, clock) = store();
+        s.create_job(&job("a", "default", 0)).await.unwrap();
+        let token = s.claim_jobs("default", 1, 30).await.unwrap().jobs[0]
+            .lease_token
+            .clone();
+
+        let next = clock.now() + Duration::seconds(60);
+        // A bogus token must not reschedule; the real one must.
+        assert!(!s
+            .mark_retrying("a", "bogus", 1, next, "boom")
+            .await
+            .unwrap());
+        assert!(s.mark_retrying("a", &token, 1, next, "boom").await.unwrap());
+
+        let c = s.claim_jobs("default", 1, 30).await.unwrap();
+        assert!(c.jobs.is_empty());
+        assert_eq!(c.next_due, Some(next));
+
+        clock.advance_secs(61);
+        let again = s.claim_jobs("default", 1, 30).await.unwrap();
+        assert_eq!(again.jobs[0].job.retry_count, 1);
+        assert_eq!(again.jobs[0].job.delivery_count, 2);
+    }
+
+    #[tokio::test]
+    async fn await_work_wakes_on_new_job() {
+        let (s, _) = store();
+        let s2 = s.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            q2.send("default", &msg("late"), 0).await.unwrap();
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+            s2.create_job(&job("late", "default", 0)).await.unwrap();
         });
-
-        let got = q.read_with_poll("default", 30, 1, 5).await.unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].message.job_id, "late");
-    }
-
-    #[tokio::test]
-    async fn send_batch_enqueues_in_order() {
-        let clock = Arc::new(TestClock::epoch());
-        let q = InMemoryMessageQueue::new(clock);
-        let ids = q
-            .send_batch("default", &[msg("a"), msg("b"), msg("c")], 0)
+        // Wakes well before the 5s cap once the job lands.
+        let start = std::time::Instant::now();
+        s.await_work("default", StdDuration::from_secs(5))
             .await
             .unwrap();
-        assert_eq!(ids.len(), 3);
-        assert!(ids.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(q.queue_depth("default").await.unwrap(), 3);
-    }
-
-    #[tokio::test]
-    async fn delete_acknowledges_and_purge_clears() {
-        let clock = Arc::new(TestClock::epoch());
-        let q = InMemoryMessageQueue::new(clock.clone());
-        let id = q.send("default", &msg("a"), 0).await.unwrap();
-        q.send("default", &msg("b"), 0).await.unwrap();
-        q.delete("default", id).await.unwrap();
-        assert_eq!(q.queue_depth("default").await.unwrap(), 1);
-        assert_eq!(q.purge("default").await.unwrap(), 1);
-        assert_eq!(q.queue_depth("default").await.unwrap(), 0);
+        assert!(start.elapsed() < StdDuration::from_secs(4));
+        assert_eq!(s.claim_jobs("default", 1, 30).await.unwrap().jobs.len(), 1);
     }
 }

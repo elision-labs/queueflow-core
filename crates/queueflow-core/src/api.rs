@@ -1,15 +1,16 @@
 //! Object-safe engine facade.
 //!
-//! The HTTP layer must not be generic over the storage/queue adapters, so the
+//! The HTTP layer must not be generic over the storage adapter, so the
 //! generic [`Engine`] is erased behind `Arc<dyn JobApi>`. axum handlers depend
 //! only on this trait.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::domain::*;
 use crate::engine::{Engine, EnqueueOptions};
 use crate::error::EngineError;
-use crate::ports::{JobStore, ListFilter, MessageQueue, Page};
+use crate::ports::{JobStore, ListFilter, Page};
 use crate::stats::StatsSnapshot;
 
 /// The operations the HTTP API needs from the engine.
@@ -24,6 +25,7 @@ pub trait JobApi: Send + Sync {
         queue: Option<String>,
         tenant_id: Option<String>,
         idempotency_key: Option<String>,
+        run_at: Option<DateTime<Utc>>,
     ) -> Result<String, EngineError>;
 
     async fn enqueue_batch(
@@ -46,7 +48,7 @@ pub trait JobApi: Send + Sync {
     async fn cancel_workflow(&self, id: &str) -> Result<(), EngineError>;
     async fn workflow_diagram(&self, id: &str) -> Result<String, EngineError>;
 
-    // Remote worker protocol.
+    // Remote worker protocol. Lease ownership rides on the lease token.
     async fn lease_jobs(
         &self,
         queue: &str,
@@ -56,22 +58,20 @@ pub trait JobApi: Send + Sync {
     ) -> Result<Vec<LeasedJob>, EngineError>;
     async fn heartbeat_lease(
         &self,
-        queue: &str,
-        lease_id: i64,
+        job_id: &str,
+        lease_token: &str,
         extend_secs: u32,
-    ) -> Result<(), EngineError>;
+    ) -> Result<JobStatus, EngineError>;
     async fn complete_leased(
         &self,
-        queue: &str,
-        lease_id: i64,
         job_id: &str,
+        lease_token: &str,
         result: Map,
     ) -> Result<(), EngineError>;
     async fn fail_leased(
         &self,
-        queue: &str,
-        lease_id: i64,
         job_id: &str,
+        lease_token: &str,
         error: &str,
         retryable: bool,
     ) -> Result<(), EngineError>;
@@ -83,10 +83,9 @@ pub trait JobApi: Send + Sync {
 }
 
 #[async_trait]
-impl<JS, MQ> JobApi for Engine<JS, MQ>
+impl<JS> JobApi for Engine<JS>
 where
     JS: JobStore + 'static,
-    MQ: MessageQueue + 'static,
 {
     async fn enqueue(
         &self,
@@ -96,6 +95,7 @@ where
         queue: Option<String>,
         tenant_id: Option<String>,
         idempotency_key: Option<String>,
+        run_at: Option<DateTime<Utc>>,
     ) -> Result<String, EngineError> {
         Engine::enqueue(
             self,
@@ -107,6 +107,7 @@ where
                 tenant_id,
                 metadata: Map::new(),
                 idempotency_key,
+                run_at,
             },
         )
         .await
@@ -168,32 +169,30 @@ where
 
     async fn heartbeat_lease(
         &self,
-        queue: &str,
-        lease_id: i64,
+        job_id: &str,
+        lease_token: &str,
         extend_secs: u32,
-    ) -> Result<(), EngineError> {
-        Engine::heartbeat_lease(self, queue, lease_id, extend_secs).await
+    ) -> Result<JobStatus, EngineError> {
+        Engine::heartbeat_lease(self, job_id, lease_token, extend_secs).await
     }
 
     async fn complete_leased(
         &self,
-        queue: &str,
-        lease_id: i64,
         job_id: &str,
+        lease_token: &str,
         result: Map,
     ) -> Result<(), EngineError> {
-        Engine::complete_leased(self, queue, lease_id, job_id, result).await
+        Engine::complete_leased(self, job_id, lease_token, result).await
     }
 
     async fn fail_leased(
         &self,
-        queue: &str,
-        lease_id: i64,
         job_id: &str,
+        lease_token: &str,
         error: &str,
         retryable: bool,
     ) -> Result<(), EngineError> {
-        Engine::fail_leased(self, queue, lease_id, job_id, error, retryable).await
+        Engine::fail_leased(self, job_id, lease_token, error, retryable).await
     }
 
     async fn ping(&self) -> Result<(), EngineError> {

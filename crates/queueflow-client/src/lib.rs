@@ -34,6 +34,9 @@ pub enum Error {
     /// The server answered with a non-success status.
     #[error("api error ({status}): {message}")]
     Api { status: u16, message: String },
+    /// A response body could not be decoded.
+    #[error("decode error: {0}")]
+    Decode(#[from] serde_json::Error),
     /// Waiting for a job to finish exceeded the caller's deadline.
     #[error("timed out waiting for job {0}")]
     WaitTimeout(String),
@@ -62,6 +65,9 @@ pub struct CreateJobOptions {
     pub timeout_secs: Option<u64>,
     /// Makes the create idempotent per tenant (sent as `Idempotency-Key`).
     pub idempotency_key: Option<String>,
+    /// Don't run before this instant. The job is created immediately but
+    /// invisible to workers until then.
+    pub run_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Query for the list endpoints.
@@ -132,6 +138,64 @@ struct TasksResponse {
 #[derive(Deserialize)]
 struct LeaseJobsResponse {
     jobs: Vec<LeasedJob>,
+}
+
+#[derive(Deserialize)]
+struct HeartbeatResponse {
+    status: JobStatus,
+}
+
+/// Response of the liveness probe (`GET /health`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct HealthStatus {
+    pub status: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub version: String,
+}
+
+/// Response of the readiness probe (`GET /ready`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReadyStatus {
+    pub status: String,
+}
+
+/// A live stream of a job's status transitions, from the server-sent-events
+/// endpoint (`GET /api/v1/jobs/{id}/events`). Each item is the full job at a
+/// status change; the stream ends after the job reaches a terminal state.
+/// Obtained from [`Client::watch_job`].
+pub struct JobEvents {
+    resp: reqwest::Response,
+    buf: String,
+}
+
+impl JobEvents {
+    /// The job at its next status transition, or `None` when the server
+    /// closes the stream (after a terminal status, or its idle cap).
+    pub async fn next(&mut self) -> Result<Option<Job>, Error> {
+        loop {
+            // A complete SSE event is terminated by a blank line.
+            if let Some(pos) = self.buf.find("\n\n") {
+                let event: String = self.buf.drain(..pos + 2).collect();
+                let mut name = "";
+                let mut data = String::new();
+                for line in event.lines() {
+                    if let Some(v) = line.strip_prefix("event:") {
+                        name = v.trim();
+                    } else if let Some(v) = line.strip_prefix("data:") {
+                        data.push_str(v.trim_start());
+                    }
+                }
+                if name == "status" && !data.is_empty() {
+                    return Ok(Some(serde_json::from_str(&data)?));
+                }
+                continue; // keep-alive comment or unknown event: skip
+            }
+            match self.resp.chunk().await? {
+                Some(bytes) => self.buf.push_str(&String::from_utf8_lossy(&bytes)),
+                None => return Ok(None),
+            }
+        }
+    }
 }
 
 /// A QueueFlow API client. Cheap to clone (shares the connection pool).
@@ -208,7 +272,7 @@ impl Client {
         payload: Map,
         opts: CreateJobOptions,
     ) -> Result<String, Error> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "task_name": task_name,
             "payload": payload,
             "config": JobConfigBody {
@@ -218,6 +282,9 @@ impl Client {
                 queue: opts.queue.as_deref(),
             },
         });
+        if let Some(run_at) = &opts.run_at {
+            body["run_at"] = serde_json::json!(run_at);
+        }
         let mut req = self
             .request(reqwest::Method::POST, "/api/v1/jobs")
             .json(&body);
@@ -271,6 +338,41 @@ impl Client {
                 .await?,
         )
         .await
+    }
+
+    /// Stream the job's status transitions as they happen (Server-Sent
+    /// Events). Lower-latency alternative to [`Client::wait_for_job`] when
+    /// you want every transition, not just the terminal one:
+    ///
+    /// ```no_run
+    /// # async fn run(client: queueflow_client::Client) -> Result<(), queueflow_client::Error> {
+    /// let mut events = client.watch_job("some-job-id").await?;
+    /// while let Some(job) = events.next().await? {
+    ///     println!("{}", job.status.as_str());
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn watch_job(&self, id: &str) -> Result<JobEvents, Error> {
+        let resp = self
+            .request(reqwest::Method::GET, &format!("/api/v1/jobs/{id}/events"))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp
+                .json::<ErrorBody>()
+                .await
+                .map(|b| b.error)
+                .unwrap_or_else(|_| status.to_string());
+            return Err(Error::Api {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        Ok(JobEvents {
+            resp,
+            buf: String::new(),
+        })
     }
 
     /// Poll until the job reaches a terminal state, or `timeout` elapses.
@@ -370,6 +472,16 @@ impl Client {
         .await
     }
 
+    /// Liveness probe (`GET /health`; no auth required).
+    pub async fn health(&self) -> Result<HealthStatus, Error> {
+        Self::decode(self.http.get(self.url("/health")).send().await?).await
+    }
+
+    /// Readiness probe (`GET /ready`; no auth required).
+    pub async fn ready(&self) -> Result<ReadyStatus, Error> {
+        Self::decode(self.http.get(self.url("/ready")).send().await?).await
+    }
+
     // ---- Remote worker protocol --------------------------------------------------
 
     /// Lease up to `max_jobs` jobs for `lease_secs`, waiting up to `wait_secs`
@@ -399,14 +511,20 @@ impl Client {
         Ok(resp.jobs)
     }
 
-    /// Extend a lease (heartbeat) so a still-running job is not redelivered.
-    pub async fn heartbeat_job(&self, lease: &LeasedJob, extend_secs: u32) -> Result<(), Error> {
+    /// Extend a lease (heartbeat) so a still-running job is not reaped.
+    /// Returns the job's current status: [`JobStatus::Running`] means the
+    /// lease was extended; anything else (e.g. cancelled mid-run) means it
+    /// was not, and the worker should stop working on the job.
+    pub async fn heartbeat_job(
+        &self,
+        lease: &LeasedJob,
+        extend_secs: u32,
+    ) -> Result<JobStatus, Error> {
         let body = serde_json::json!({
-            "queue": lease.queue,
-            "lease_id": lease.lease_id,
+            "lease_token": lease.lease_token,
             "extend_secs": extend_secs,
         });
-        Self::expect_no_content(
+        let resp: HeartbeatResponse = Self::decode(
             self.request(
                 reqwest::Method::POST,
                 &format!("/api/v1/jobs/{}/heartbeat", lease.job.id),
@@ -415,14 +533,14 @@ impl Client {
             .send()
             .await?,
         )
-        .await
+        .await?;
+        Ok(resp.status)
     }
 
     /// Report success for a leased job.
     pub async fn complete_job(&self, lease: &LeasedJob, result: Map) -> Result<(), Error> {
         let body = serde_json::json!({
-            "queue": lease.queue,
-            "lease_id": lease.lease_id,
+            "lease_token": lease.lease_token,
             "result": result,
         });
         Self::expect_no_content(
@@ -445,8 +563,7 @@ impl Client {
         retryable: bool,
     ) -> Result<(), Error> {
         let body = serde_json::json!({
-            "queue": lease.queue,
-            "lease_id": lease.lease_id,
+            "lease_token": lease.lease_token,
             "error": error,
             "retryable": retryable,
         });

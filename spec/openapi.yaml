@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: QueueFlow API
-  description: REST API for QueueFlow, a PostgreSQL/PGMQ-native distributed job queue and workflow engine.
+  description: REST API for QueueFlow, a PostgreSQL-native distributed job queue and workflow engine.
   contact:
     name: QueueFlow
     url: https://queueflow.dev
@@ -236,7 +236,7 @@ paths:
         required: true
       responses:
         '204':
-          description: 'Completed (idempotent: replaying a finished lease also succeeds)'
+          description: 'Completed (idempotent: replaying against an already-finished job also succeeds)'
         '401':
           description: Unauthorized
           content:
@@ -245,6 +245,12 @@ paths:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
           description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: Lease no longer held (expired and reclaimed)
           content:
             application/json:
               schema:
@@ -327,6 +333,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: Lease no longer held (expired and reclaimed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
       security:
       - bearerAuth: []
   /api/v1/jobs/{id}/heartbeat:
@@ -348,10 +360,26 @@ paths:
               $ref: '#/components/schemas/HeartbeatRequest'
         required: true
       responses:
-        '204':
-          description: Lease extended
+        '200':
+          description: Current job status. `running` = lease extended; anything else (e.g. `cancelled`) = not extended, stop working on the job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HeartbeatResponse'
         '401':
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: Lease no longer held (expired and reclaimed)
           content:
             application/json:
               schema:
@@ -667,16 +695,11 @@ components:
       type: object
       description: Body for `POST /api/v1/jobs/{id}/complete`.
       required:
-      - queue
-      - lease_id
+      - lease_token
       properties:
-        lease_id:
-          type: integer
-          format: int64
-          description: The lease handle returned by the lease call.
-        queue:
+        lease_token:
           type: string
-          description: Queue the lease was taken from.
+          description: The lease token returned by the lease call.
         result:
           type: object
           description: Handler result, recorded on the job and merged into workflow context.
@@ -714,6 +737,14 @@ components:
         payload:
           type: object
           description: Arbitrary JSON object passed to the handler.
+        run_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: |-
+            Don't run before this instant (RFC 3339). The job is created
+            immediately but stays invisible to workers until then.
         task_name:
           type: string
           description: The registered task handler to invoke.
@@ -765,18 +796,15 @@ components:
       type: object
       description: Body for `POST /api/v1/jobs/{id}/fail`.
       required:
-      - queue
-      - lease_id
+      - lease_token
       - error
       properties:
         error:
           type: string
           description: Human-readable failure reason.
-        lease_id:
-          type: integer
-          format: int64
-        queue:
+        lease_token:
           type: string
+          description: The lease token returned by the lease call.
         retryable:
           type: boolean
           description: |-
@@ -800,8 +828,7 @@ components:
       type: object
       description: Body for `POST /api/v1/jobs/{id}/heartbeat`.
       required:
-      - queue
-      - lease_id
+      - lease_token
       - extend_secs
       properties:
         extend_secs:
@@ -809,11 +836,21 @@ components:
           format: int32
           description: New lease duration in seconds, measured from now (1..=3600).
           minimum: 0
-        lease_id:
-          type: integer
-          format: int64
-        queue:
+        lease_token:
           type: string
+          description: The lease token returned by the lease call.
+    HeartbeatResponse:
+      type: object
+      description: Response for `POST /api/v1/jobs/{id}/heartbeat`.
+      required:
+      - status
+      properties:
+        status:
+          $ref: '#/components/schemas/JobStatus'
+          description: |-
+            The job's current status. `running` means the lease was extended;
+            anything else (`cancelled`, `completed`, ...) means it was not, and
+            the worker should stop working on the job.
     Job:
       type: object
       description: A single unit of work.
@@ -824,6 +861,7 @@ components:
       - config
       - status
       - created_at
+      - scheduled_at
       - retry_count
       properties:
         completed_at:
@@ -836,6 +874,14 @@ components:
         created_at:
           type: string
           format: date-time
+        delivery_count:
+          type: integer
+          format: int32
+          description: |-
+            How many times this job has been claimed (delivered to a worker).
+            Greater than `retry_count + 1` means a lease expired without a report —
+            i.e. a worker crashed mid-run.
+          minimum: 0
         error_message:
           type:
           - string
@@ -858,8 +904,8 @@ components:
           - 'null'
           format: date-time
           description: |-
-            When this job becomes visible again for a retry. Audit/inspection only —
-            the actual scheduling is owned by the message queue's delayed delivery.
+            When this job's next retry becomes claimable (mirrors `scheduled_at`
+            while the job is `retrying`; kept for audit/inspection).
         payload:
           type: object
         queue_name:
@@ -872,6 +918,13 @@ components:
           type: integer
           format: int32
           minimum: 0
+        scheduled_at:
+          type: string
+          format: date-time
+          description: |-
+            When the job becomes claimable. `created_at` for immediate jobs, the
+            requested `run_at` for scheduled jobs, and the next backoff instant
+            while retrying — the durable delay lives in the row itself.
         started_at:
           type:
           - string
@@ -920,9 +973,8 @@ components:
           type: integer
           format: int32
           description: |-
-            Recorded on the job for inspection. The Postgres/PGMQ backend dequeues
-            strictly FIFO, so priority does not affect ordering there; use separate
-            queues for priority classes. The in-memory adapter honours it.
+            Higher is claimed first within a queue; ties break on `scheduled_at`,
+            then `created_at`.
         retry_backoff:
           $ref: '#/components/schemas/BackoffStrategy'
         retry_delay_secs:
@@ -952,7 +1004,7 @@ components:
           - integer
           - 'null'
           format: int32
-          description: Higher is dequeued first (FIFO within a priority on PGMQ).
+          description: 'Higher is claimed first within a queue (ties: oldest first).'
         queue:
           type:
           - string
@@ -1011,24 +1063,20 @@ components:
     LeasedJob:
       type: object
       description: |-
-        A job leased to a (possibly remote) worker, together with the lease handle
+        A job leased to a (possibly remote) worker, together with the lease token
         needed to heartbeat, complete, or fail it.
       required:
       - job
-      - lease_id
-      - queue
+      - lease_token
       properties:
         job:
           $ref: '#/components/schemas/Job'
-        lease_id:
-          type: integer
-          format: int64
-          description: |-
-            Opaque lease handle (the queue message id). Pass it back on
-            heartbeat/complete/fail together with the queue name.
-        queue:
+        lease_token:
           type: string
-          description: The queue the lease was taken from.
+          description: |-
+            Opaque, unguessable proof of lease ownership, regenerated on every
+            claim. Pass it back on heartbeat/complete/fail; a stale token (the
+            lease expired and the job was reclaimed) is rejected.
     ListJobsResponse:
       type: object
       required:

@@ -20,7 +20,7 @@ run: ## Run the server (needs DATABASE_URL)
 test: ## Run unit + integration tests (no database needed)
 	$(CARGO) test --workspace
 
-test-pg: ## Run Postgres integration tests (needs TEST_DATABASE_URL + pgmq)
+test-pg: ## Run Postgres integration tests (needs TEST_DATABASE_URL; any plain PostgreSQL 13+)
 	$(CARGO) test -p queueflow-core --features postgres -- --include-ignored
 
 fmt: ## Format the code

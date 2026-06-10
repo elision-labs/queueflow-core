@@ -1,26 +1,48 @@
 //! PostgreSQL-backed [`JobStore`].
+//!
+//! The jobs table is also the queue: claims are `FOR UPDATE SKIP LOCKED`
+//! against the partial `idx_jobs_claim` index, and lease ownership rides on a
+//! random `lease_token` UUID stamped by every claim.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
+use super::listener::WorkHub;
 use super::{enum_from_str, to_jsonb};
 use crate::domain::*;
 use crate::ports::*;
+
+/// Advisory lock key for the retention sweep ("qflow_rt" as big-endian bytes):
+/// concurrent janitors must not race the same bulk delete.
+const RETENTION_LOCK_KEY: i64 = 0x7166_6c6f_775f_7274;
 
 /// Stores jobs and workflows in PostgreSQL.
 #[derive(Clone)]
 pub struct PostgresJobStore {
     pool: PgPool,
+    hub: Arc<WorkHub>,
 }
 
 impl PostgresJobStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        let hub = WorkHub::new(pool.clone());
+        Self { pool, hub }
     }
 
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    /// Delete every job on `queue` regardless of status; returns the number
+    /// removed. Admin/test helper — the engine never calls this.
+    pub async fn purge_queue(&self, queue: &str) -> Result<u64, StorageError> {
+        let affected = sqlx::query("DELETE FROM queueflow.jobs WHERE queue_name = $1")
+            .bind(queue)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        Ok(affected)
     }
 }
 
@@ -35,6 +57,7 @@ fn job_from_row(row: &sqlx::postgres::PgRow) -> Result<Job, StorageError> {
     let metadata: Json = row.try_get("metadata").map_err(db)?;
     let result: Option<Json> = row.try_get("result").map_err(db)?;
     let retry_count: i32 = row.try_get("retry_count").map_err(db)?;
+    let delivery_count: i32 = row.try_get("delivery_count").map_err(db)?;
 
     Ok(Job {
         id: row.try_get("id").map_err(db)?,
@@ -44,8 +67,10 @@ fn job_from_row(row: &sqlx::postgres::PgRow) -> Result<Job, StorageError> {
         config: serde_json::from_value(config)?,
         status: enum_from_str(&status)?,
         created_at: row.try_get("created_at").map_err(db)?,
+        scheduled_at: row.try_get("scheduled_at").map_err(db)?,
         started_at: row.try_get("started_at").map_err(db)?,
         completed_at: row.try_get("completed_at").map_err(db)?,
+        delivery_count: delivery_count.max(0) as u32,
         error_message: row.try_get("error_message").map_err(db)?,
         retry_count: retry_count.max(0) as u32,
         next_retry_at: row.try_get("next_retry_at").map_err(db)?,
@@ -59,18 +84,32 @@ fn job_from_row(row: &sqlx::postgres::PgRow) -> Result<Job, StorageError> {
 }
 
 const JOB_COLUMNS: &str = "id, queue_name, task_name, payload, config, status, created_at, \
-     started_at, completed_at, error_message, retry_count, next_retry_at, \
-     workflow_id, workflow_step_id, result, metadata, tenant_id, idempotency_key";
+     scheduled_at, started_at, completed_at, delivery_count, error_message, retry_count, \
+     next_retry_at, workflow_id, workflow_step_id, result, metadata, tenant_id, idempotency_key";
+
+/// `JOB_COLUMNS` qualified with a table alias, for queries where an
+/// unqualified name would be ambiguous (e.g. `UPDATE ... FROM ... RETURNING`).
+fn job_columns_prefixed(alias: &str) -> String {
+    JOB_COLUMNS
+        .split(',')
+        .map(|c| format!("{alias}.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Insert one job row. `ON CONFLICT DO NOTHING` absorbs an idempotency-key
 /// collision (the partial unique index from migration 0002); returns whether a
-/// row was actually inserted.
-async fn insert_job(pool: &PgPool, job: &Job) -> Result<bool, StorageError> {
+/// row was actually inserted. Generic over the executor so it can run both
+/// standalone and inside the `create_step_job` transaction.
+async fn insert_job<'e, E>(executor: E, job: &Job) -> Result<bool, StorageError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let affected = sqlx::query(
         "INSERT INTO queueflow.jobs (id, queue_name, task_name, payload, config, status, priority, \
-         created_at, started_at, completed_at, error_message, retry_count, next_retry_at, \
+         created_at, scheduled_at, started_at, completed_at, error_message, retry_count, next_retry_at, \
          workflow_id, workflow_step_id, result, metadata, tenant_id, idempotency_key) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) \
          ON CONFLICT DO NOTHING",
     )
     .bind(&job.id)
@@ -81,6 +120,7 @@ async fn insert_job(pool: &PgPool, job: &Job) -> Result<bool, StorageError> {
     .bind(job.status.as_str())
     .bind(job.config.priority)
     .bind(job.created_at)
+    .bind(job.scheduled_at)
     .bind(job.started_at)
     .bind(job.completed_at)
     .bind(job.error_message.as_deref())
@@ -92,7 +132,7 @@ async fn insert_job(pool: &PgPool, job: &Job) -> Result<bool, StorageError> {
     .bind(to_jsonb(&job.metadata)?)
     .bind(job.tenant_id.as_deref())
     .bind(job.idempotency_key.as_deref())
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(db)?
     .rows_affected();
@@ -123,7 +163,8 @@ impl JobStore for PostgresJobStore {
     }
 
     /// One multi-row INSERT via UNNEST: a 1000-job batch is a single round
-    /// trip instead of 1000.
+    /// trip instead of 1000 — and a single NOTIFY per queue, thanks to
+    /// per-transaction dedup.
     async fn batch_create_jobs(&self, jobs: &[Job]) -> Result<Vec<String>, StorageError> {
         if jobs.is_empty() {
             return Ok(vec![]);
@@ -136,6 +177,7 @@ impl JobStore for PostgresJobStore {
         let mut configs = Vec::with_capacity(n);
         let mut priorities = Vec::with_capacity(n);
         let mut created = Vec::with_capacity(n);
+        let mut scheduled = Vec::with_capacity(n);
         let mut metadatas = Vec::with_capacity(n);
         let mut tenants: Vec<Option<String>> = Vec::with_capacity(n);
         for job in jobs {
@@ -146,17 +188,18 @@ impl JobStore for PostgresJobStore {
             configs.push(to_jsonb(&job.config)?);
             priorities.push(job.config.priority);
             created.push(job.created_at);
+            scheduled.push(job.scheduled_at);
             metadatas.push(to_jsonb(&job.metadata)?);
             tenants.push(job.tenant_id.clone());
         }
         sqlx::query(
             "INSERT INTO queueflow.jobs (id, queue_name, task_name, payload, config, status, \
-             priority, created_at, retry_count, metadata, tenant_id) \
+             priority, created_at, scheduled_at, retry_count, metadata, tenant_id) \
              SELECT u.id, u.queue_name, u.task_name, u.payload, u.config, 'pending', \
-             u.priority, u.created_at, 0, u.metadata, u.tenant_id \
+             u.priority, u.created_at, u.scheduled_at, 0, u.metadata, u.tenant_id \
              FROM UNNEST($1::text[], $2::text[], $3::text[], $4::jsonb[], $5::jsonb[], \
-             $6::int[], $7::timestamptz[], $8::jsonb[], $9::text[]) \
-             AS u(id, queue_name, task_name, payload, config, priority, created_at, metadata, tenant_id)",
+             $6::int[], $7::timestamptz[], $8::timestamptz[], $9::jsonb[], $10::text[]) \
+             AS u(id, queue_name, task_name, payload, config, priority, created_at, scheduled_at, metadata, tenant_id)",
         )
         .bind(&ids)
         .bind(&queues)
@@ -165,6 +208,7 @@ impl JobStore for PostgresJobStore {
         .bind(&configs)
         .bind(&priorities)
         .bind(&created)
+        .bind(&scheduled)
         .bind(&metadatas)
         .bind(&tenants)
         .execute(&self.pool)
@@ -233,22 +277,130 @@ impl JobStore for PostgresJobStore {
         })
     }
 
-    async fn update_status(
+    // ---- Claim / lease ------------------------------------------------------
+
+    async fn claim_jobs(
         &self,
-        id: &str,
+        queue: &str,
+        count: usize,
+        lease_secs: u32,
+    ) -> Result<Claimed, StorageError> {
+        // SKIP LOCKED makes concurrent claimers disjoint without blocking;
+        // the CTE-then-UPDATE shape is the standard Postgres claim pattern.
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "WITH c AS (\
+                 SELECT id FROM queueflow.jobs \
+                 WHERE queue_name = $1 AND status IN ('pending','retrying') \
+                   AND scheduled_at <= now() \
+                 ORDER BY priority DESC, scheduled_at, created_at \
+                 FOR UPDATE SKIP LOCKED \
+                 LIMIT $2\
+             ) \
+             UPDATE queueflow.jobs j \
+             SET status = 'running', \
+                 started_at = COALESCE(j.started_at, now()), \
+                 locked_until = now() + make_interval(secs => $3), \
+                 lease_token = gen_random_uuid(), \
+                 delivery_count = j.delivery_count + 1 \
+             FROM c WHERE j.id = c.id \
+             RETURNING {}, j.lease_token::text AS lease_token",
+            job_columns_prefixed("j")
+        )))
+        .bind(queue)
+        .bind(count as i64)
+        .bind(lease_secs as f64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            jobs.push(LeasedJob {
+                job: job_from_row(row)?,
+                lease_token: row.try_get("lease_token").map_err(db)?,
+            });
+        }
+
+        // Only when empty-handed: when is the next delayed job due?
+        let next_due = if jobs.is_empty() {
+            sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+                "SELECT MIN(scheduled_at) FROM queueflow.jobs \
+                 WHERE queue_name = $1 AND status IN ('pending','retrying') \
+                   AND scheduled_at > now()",
+            )
+            .bind(queue)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db)?
+        } else {
+            None
+        };
+
+        Ok(Claimed { jobs, next_due })
+    }
+
+    async fn extend_lease(
+        &self,
+        job_id: &str,
+        token: &str,
+        lease_secs: u32,
+    ) -> Result<Option<JobStatus>, StorageError> {
+        let affected = sqlx::query(
+            "UPDATE queueflow.jobs \
+             SET locked_until = now() + make_interval(secs => $3) \
+             WHERE id = $1 AND status = 'running' AND lease_token::text = $2",
+        )
+        .bind(job_id)
+        .bind(token)
+        .bind(lease_secs as f64)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if affected > 0 {
+            return Ok(Some(JobStatus::Running));
+        }
+        // Not extended: missing, finished/cancelled, or reclaimed. Load the
+        // status so the caller (heartbeat) can tell the worker what happened.
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM queueflow.jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?;
+        match status {
+            None => Err(StorageError::JobNotFound(job_id.to_string())),
+            Some(s) => {
+                let status: JobStatus = enum_from_str(&s)?;
+                if status == JobStatus::Running {
+                    Ok(None) // still running, but under someone else's token
+                } else {
+                    Ok(Some(status))
+                }
+            }
+        }
+    }
+
+    async fn finish_if_leased(
+        &self,
+        job_id: &str,
+        token: &str,
         status: JobStatus,
         error: Option<&str>,
         result: Option<&Json>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
+        debug_assert!(status.is_terminal());
         let affected = sqlx::query(
-            "UPDATE queueflow.jobs SET status = $2, \
-             error_message = COALESCE($3, error_message), \
-             result = COALESCE($4, result), \
-             started_at = CASE WHEN $2 = 'running' AND started_at IS NULL THEN now() ELSE started_at END, \
-             completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN now() ELSE completed_at END \
-             WHERE id = $1",
+            "UPDATE queueflow.jobs \
+             SET status = $3, \
+                 error_message = COALESCE($4, error_message), \
+                 result = COALESCE($5, result), \
+                 completed_at = now(), \
+                 locked_until = NULL, lease_token = NULL \
+             WHERE id = $1 AND status = 'running' AND lease_token::text = $2",
         )
-        .bind(id)
+        .bind(job_id)
+        .bind(token)
         .bind(status.as_str())
         .bind(error)
         .bind(result.cloned())
@@ -256,18 +408,21 @@ impl JobStore for PostgresJobStore {
         .await
         .map_err(db)?
         .rows_affected();
-        if affected == 0 {
-            return Err(StorageError::JobNotFound(id.to_string()));
-        }
+        Ok(affected > 0)
+    }
+
+    async fn await_work(&self, queue: &str, max_wait: Duration) -> Result<(), StorageError> {
+        self.hub.await_work(queue, max_wait).await;
         Ok(())
     }
 
     async fn cancel_job_if_active(&self, id: &str, reason: &str) -> Result<bool, StorageError> {
         // Check-and-cancel in one statement so a concurrently completing
-        // worker can never have its terminal status overwritten.
+        // worker can never have its terminal status overwritten. The lease is
+        // cleared but the status flip alone already blocks finish_if_leased.
         let affected = sqlx::query(
             "UPDATE queueflow.jobs SET status = 'cancelled', error_message = $2, \
-             completed_at = now() \
+             completed_at = now(), locked_until = NULL, lease_token = NULL \
              WHERE id = $1 AND status NOT IN ('completed','failed','cancelled')",
         )
         .bind(id)
@@ -282,28 +437,36 @@ impl JobStore for PostgresJobStore {
     async fn mark_retrying(
         &self,
         id: &str,
+        token: &str,
         retry_count: u32,
         next_retry_at: DateTime<Utc>,
         error: &str,
-    ) -> Result<(), StorageError> {
-        sqlx::query(
-            "UPDATE queueflow.jobs SET status = 'retrying', retry_count = $2, \
-             next_retry_at = $3, error_message = $4 WHERE id = $1",
+    ) -> Result<bool, StorageError> {
+        // One row update is the whole durable retry: the backoff delay lives
+        // in scheduled_at, and releasing the lease happens in the same write.
+        // Lease-guarded so a retry can never resurrect a cancelled job.
+        let affected = sqlx::query(
+            "UPDATE queueflow.jobs SET status = 'retrying', retry_count = $3, \
+             next_retry_at = $4, scheduled_at = $4, error_message = $5, \
+             locked_until = NULL, lease_token = NULL \
+             WHERE id = $1 AND status = 'running' AND lease_token::text = $2",
         )
         .bind(id)
+        .bind(token)
         .bind(retry_count as i32)
         .bind(next_retry_at)
         .bind(error)
         .execute(&self.pool)
         .await
-        .map_err(db)?;
-        Ok(())
+        .map_err(db)?
+        .rows_affected();
+        Ok(affected > 0)
     }
 
     async fn move_to_dlq(&self, id: &str, reason: &str, error: &str) -> Result<(), StorageError> {
         sqlx::query(
-            "INSERT INTO queueflow.dead_letters (job_id, queue_name, task_name, reason, error_message) \
-             SELECT id, queue_name, task_name, $2, $3 FROM queueflow.jobs WHERE id = $1",
+            "INSERT INTO queueflow.dead_letters (job_id, queue_name, task_name, reason, error_message, tenant_id) \
+             SELECT id, queue_name, task_name, $2, $3, tenant_id FROM queueflow.jobs WHERE id = $1",
         )
         .bind(id)
         .bind(reason)
@@ -329,6 +492,128 @@ impl JobStore for PostgresJobStore {
             .map_err(db)?;
         Ok(())
     }
+
+    // ---- Janitor sweeps -----------------------------------------------------
+
+    async fn claim_expired_leases(
+        &self,
+        limit: usize,
+        lease_secs: u32,
+    ) -> Result<Vec<LeasedJob>, StorageError> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "WITH c AS (\
+                 SELECT id FROM queueflow.jobs \
+                 WHERE status = 'running' AND locked_until < now() \
+                 ORDER BY locked_until \
+                 FOR UPDATE SKIP LOCKED \
+                 LIMIT $1\
+             ) \
+             UPDATE queueflow.jobs j \
+             SET lease_token = gen_random_uuid(), \
+                 locked_until = now() + make_interval(secs => $2) \
+             FROM c WHERE j.id = c.id \
+             RETURNING {}, j.lease_token::text AS lease_token",
+            job_columns_prefixed("j")
+        )))
+        .bind(limit as i64)
+        .bind(lease_secs as f64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(LeasedJob {
+                job: job_from_row(row)?,
+                lease_token: row.try_get("lease_token").map_err(db)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn stalled_step_jobs(&self, limit: usize) -> Result<Vec<Job>, StorageError> {
+        // Driven from the (few) non-terminal steps: the positive status list
+        // is exhaustive and keeps idx_workflow_steps_status usable, so this
+        // sweep stays cheap however much terminal history accumulates.
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM queueflow.workflow_steps s \
+             JOIN queueflow.jobs j ON j.id = s.job_id \
+             WHERE s.status IN ('pending','running') \
+               AND j.status IN ('completed','failed','cancelled') \
+             LIMIT $1",
+            job_columns_prefixed("j")
+        )))
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter().map(job_from_row).collect()
+    }
+
+    async fn stalled_workflow_ids(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        // Positive status lists (exhaustive per the enums) keep the status
+        // indexes usable; NOT IN forms would force scans as history grows.
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT w.id FROM queueflow.workflows w \
+             WHERE w.status IN ('created','running') \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM queueflow.workflow_steps s \
+                   JOIN queueflow.jobs j ON j.id = s.job_id \
+                   WHERE s.workflow_id = w.id \
+                     AND j.status IN ('pending','running','retrying')\
+               ) \
+             LIMIT $1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows)
+    }
+
+    async fn purge_terminal(&self, older_than: DateTime<Utc>) -> Result<u64, StorageError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        // xact-scoped advisory lock: released automatically on commit/rollback,
+        // so a crashed janitor can never wedge retention.
+        let won: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(RETENTION_LOCK_KEY)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+        if !won {
+            tx.rollback().await.map_err(db)?;
+            return Ok(0);
+        }
+        let purged = sqlx::query(
+            "DELETE FROM queueflow.jobs \
+             WHERE status IN ('completed','failed','cancelled') \
+               AND COALESCE(completed_at, created_at) < $1",
+        )
+        .bind(older_than)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        // Steps go with their workflow via ON DELETE CASCADE.
+        sqlx::query(
+            "DELETE FROM queueflow.workflows \
+             WHERE status IN ('completed','failed','partially_failed','cancelled') \
+               AND COALESCE(completed_at, created_at) < $1",
+        )
+        .bind(older_than)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        sqlx::query("DELETE FROM queueflow.dead_letters WHERE created_at < $1")
+            .bind(older_than)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(purged)
+    }
+
+    // ---- Workflows ----------------------------------------------------------
 
     async fn create_workflow(&self, wf: &Workflow) -> Result<(), StorageError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
@@ -521,6 +806,32 @@ impl JobStore for PostgresJobStore {
         .map_err(db)?
         .rows_affected();
         Ok(affected > 0)
+    }
+
+    async fn create_step_job(&self, job: &Job) -> Result<bool, StorageError> {
+        let wf_id = job.workflow_id.as_deref().unwrap_or_default();
+        let step_name = job.workflow_step_id.as_deref().unwrap_or_default();
+        // Claim and insert commit together: the job only ever exists linked
+        // to the step it won, and a loser persists nothing.
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let claimed = sqlx::query(
+            "UPDATE queueflow.workflow_steps SET job_id = $3 \
+             WHERE workflow_id = $1 AND name = $2 AND job_id IS NULL",
+        )
+        .bind(wf_id)
+        .bind(step_name)
+        .bind(&job.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if claimed == 0 {
+            tx.rollback().await.map_err(db)?;
+            return Ok(false);
+        }
+        insert_job(&mut *tx, job).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
     }
 
     async fn set_step_status(

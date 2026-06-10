@@ -8,16 +8,15 @@ use std::time::Duration;
 
 use queueflow_api::{build_router, ApiState};
 use queueflow_client::{Client, CreateJobOptions, ListQuery};
-use queueflow_core::{Engine, InMemoryJobStore, InMemoryMessageQueue, JobStatus, Map, SystemClock};
+use queueflow_core::{Engine, InMemoryJobStore, JobStatus, Map, SystemClock};
 
 /// Start an API server on an ephemeral port; returns a connected client.
 /// No local workers are spawned: these tests drive execution through the
 /// remote worker protocol, exactly like an out-of-process worker would.
 async fn start_server() -> Client {
     let clock = Arc::new(SystemClock);
-    let store = Arc::new(InMemoryJobStore::new());
-    let queue = Arc::new(InMemoryMessageQueue::new(clock.clone()));
-    let engine = Engine::builder(store, queue, clock).build();
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    let engine = Engine::builder(store, clock).build();
     engine.mark_running();
 
     let app = build_router(ApiState::new(engine));
@@ -46,8 +45,11 @@ async fn remote_worker_leases_completes_and_propagates_result() {
     assert_eq!(leases[0].job.id, id);
     assert_eq!(leases[0].job.status, JobStatus::Running);
 
-    // Heartbeat, then complete with a result.
-    client.heartbeat_job(&leases[0], 60).await.unwrap();
+    // Heartbeat (which now reports the live status), then complete.
+    assert_eq!(
+        client.heartbeat_job(&leases[0], 60).await.unwrap(),
+        JobStatus::Running
+    );
     let mut result = Map::new();
     result.insert("ok".into(), serde_json::json!(true));
     client.complete_job(&leases[0], result).await.unwrap();
@@ -85,7 +87,7 @@ async fn remote_failure_is_retried_then_replayable() {
         .await
         .unwrap();
 
-    // Retry is scheduled with a delayed redelivery; status reflects it.
+    // Retry is rescheduled in the row (future scheduled_at); status reflects it.
     let job = client.get_job(&id).await.unwrap();
     assert_eq!(job.status, JobStatus::Retrying);
     assert_eq!(job.retry_count, 1);
@@ -167,6 +169,39 @@ async fn list_pagination_reports_has_more_and_optional_total() {
         .await
         .unwrap();
     assert_eq!(page.total, Some(5));
+}
+
+#[tokio::test]
+async fn health_ready_and_watch_job_stream() {
+    let client = start_server().await;
+    assert_eq!(client.health().await.unwrap().status, "healthy");
+    assert_eq!(client.ready().await.unwrap().status, "ready");
+
+    let id = client
+        .create_job("watched", Map::new(), Default::default())
+        .await
+        .unwrap();
+
+    // The stream opens on a pending job and emits the current status first.
+    let mut events = client.watch_job(&id).await.unwrap();
+    let first = events.next().await.unwrap().expect("first event");
+    assert_eq!(first.status, JobStatus::Pending);
+
+    // A "worker" completes the job; the stream must deliver the terminal
+    // transition and then end.
+    let leases = client.lease_jobs("default", 1, 30, 0).await.unwrap();
+    client.complete_job(&leases[0], Map::new()).await.unwrap();
+    loop {
+        match events.next().await.unwrap() {
+            Some(job) if job.status.is_terminal() => {
+                assert_eq!(job.status, JobStatus::Completed);
+                break;
+            }
+            Some(_) => continue, // intermediate transition (e.g. running)
+            None => panic!("stream ended before a terminal event"),
+        }
+    }
+    assert!(events.next().await.unwrap().is_none(), "stream must close");
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
-//! The job-processing engine: enqueue, worker loop, durable retries, and
-//! workflow delegation.
+//! The job-processing engine: enqueue, worker loop, durable retries, the
+//! janitor, and workflow delegation.
 
+pub mod janitor;
 pub mod retry;
 
 use std::collections::HashMap;
@@ -8,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
+use chrono::{DateTime, Utc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -19,6 +21,8 @@ use crate::stats::EngineStats;
 use crate::task::{handler_fn, TaskHandler};
 use crate::workflow::scheduler::WorkflowScheduler;
 
+pub use janitor::JanitorConfig;
+
 /// Options for [`Engine::enqueue`].
 #[derive(Clone, Debug, Default)]
 pub struct EnqueueOptions {
@@ -29,48 +33,52 @@ pub struct EnqueueOptions {
     /// Makes the enqueue idempotent per tenant: a second enqueue with the same
     /// key returns the original job's id instead of creating a duplicate.
     pub idempotency_key: Option<String>,
+    /// Don't run before this instant. The job is persisted immediately but
+    /// invisible to claims until then (durable scheduling, survives restarts).
+    pub run_at: Option<DateTime<Utc>>,
 }
 
 /// Headroom added on top of a job's timeout when extending its lease, covering
-/// post-handler bookkeeping (status write, workflow advance, ack).
+/// post-handler bookkeeping (terminal write, workflow advance).
 const LEASE_GRACE_SECS: u64 = 30;
 
-/// How long a worker's long-poll read blocks server-side before re-looping.
-const WORKER_POLL_SECS: u32 = 5;
+/// Upper bound on a single idle wait. NOTIFY wakes waiters instantly; this is
+/// the missed-notification safety net, so it can be generous without making
+/// idle workers chatty.
+const WORKER_POLL_SECS: u64 = 5;
 
-/// The core engine, generic over the storage and queue ports.
+/// The core engine, generic over the storage port.
 ///
 /// Construct via [`Engine::builder`]. The engine is wrapped in an `Arc` so
 /// worker tasks can be spawned cheaply.
-pub struct Engine<JS, MQ> {
+pub struct Engine<JS> {
     store: Arc<JS>,
-    queue: Arc<MQ>,
     clock: Arc<dyn Clock>,
     handlers: HashMap<String, Arc<dyn TaskHandler>>,
-    scheduler: WorkflowScheduler<JS, MQ>,
+    scheduler: WorkflowScheduler<JS>,
     default_queue: String,
     worker_count: usize,
-    read_vt_secs: u32,
+    lease_secs: u32,
+    janitor: JanitorConfig,
     stats: Arc<EngineStats>,
     shutdown: CancellationToken,
     running: AtomicBool,
 }
 
 /// Fluent constructor for [`Engine`].
-pub struct EngineBuilder<JS, MQ> {
+pub struct EngineBuilder<JS> {
     store: Arc<JS>,
-    queue: Arc<MQ>,
     clock: Arc<dyn Clock>,
     handlers: HashMap<String, Arc<dyn TaskHandler>>,
     default_queue: String,
     worker_count: usize,
-    read_vt_secs: u32,
+    lease_secs: u32,
+    janitor: JanitorConfig,
 }
 
-impl<JS, MQ> EngineBuilder<JS, MQ>
+impl<JS> EngineBuilder<JS>
 where
     JS: JobStore + 'static,
-    MQ: MessageQueue + 'static,
 {
     /// Default queue name (also used for workflow steps).
     pub fn default_queue(mut self, q: impl Into<String>) -> Self {
@@ -84,9 +92,16 @@ where
         self
     }
 
-    /// Visibility timeout (seconds) applied when leasing a message.
-    pub fn visibility_timeout_secs(mut self, secs: u32) -> Self {
-        self.read_vt_secs = secs.max(1);
+    /// Lease duration (seconds) applied when claiming a job. Extended
+    /// automatically to cover the job's configured timeout.
+    pub fn lease_secs(mut self, secs: u32) -> Self {
+        self.lease_secs = secs.max(1);
+        self
+    }
+
+    /// Tune the janitor (sweep cadence, batch size, retention).
+    pub fn janitor(mut self, config: JanitorConfig) -> Self {
+        self.janitor = config;
         self
     }
 
@@ -105,24 +120,23 @@ where
         self.register(name, handler_fn(f))
     }
 
-    pub fn build(self) -> Arc<Engine<JS, MQ>> {
+    pub fn build(self) -> Arc<Engine<JS>> {
         let stats = Arc::new(EngineStats::default());
         let scheduler = WorkflowScheduler::new(
             self.store.clone(),
-            self.queue.clone(),
             self.clock.clone(),
             self.default_queue.clone(),
             stats.clone(),
         );
         Arc::new(Engine {
             store: self.store,
-            queue: self.queue,
             clock: self.clock,
             handlers: self.handlers,
             scheduler,
             default_queue: self.default_queue,
             worker_count: self.worker_count,
-            read_vt_secs: self.read_vt_secs,
+            lease_secs: self.lease_secs,
+            janitor: self.janitor,
             stats,
             shutdown: CancellationToken::new(),
             running: AtomicBool::new(false),
@@ -130,29 +144,24 @@ where
     }
 }
 
-impl<JS, MQ> Engine<JS, MQ>
+impl<JS> Engine<JS>
 where
     JS: JobStore + 'static,
-    MQ: MessageQueue + 'static,
 {
-    pub fn builder(store: Arc<JS>, queue: Arc<MQ>, clock: Arc<dyn Clock>) -> EngineBuilder<JS, MQ> {
+    pub fn builder(store: Arc<JS>, clock: Arc<dyn Clock>) -> EngineBuilder<JS> {
         EngineBuilder {
             store,
-            queue,
             clock,
             handlers: HashMap::new(),
             default_queue: "default".to_string(),
             worker_count: 8,
-            read_vt_secs: 30,
+            lease_secs: 30,
+            janitor: JanitorConfig::default(),
         }
     }
 
     pub fn stats(&self) -> Arc<EngineStats> {
         self.stats.clone()
-    }
-
-    pub fn default_queue(&self) -> &str {
-        &self.default_queue
     }
 
     /// A child token that fires when the engine shuts down.
@@ -169,7 +178,9 @@ where
 
     // ---- Enqueue ----------------------------------------------------------
 
-    /// Enqueue a single job.
+    /// Enqueue a single job. The insert is the publish: once the row is
+    /// committed the job is claimable (or scheduled, if `run_at` is set), so
+    /// there is no crash window between "recorded" and "queued".
     pub async fn enqueue(
         &self,
         task_name: &str,
@@ -177,16 +188,19 @@ where
         opts: EnqueueOptions,
     ) -> Result<String, EngineError> {
         let queue = opts.queue.unwrap_or_else(|| self.default_queue.clone());
+        let now = self.clock.now();
         let job = Job {
             id: Uuid::new_v4().to_string(),
-            queue_name: queue.clone(),
+            queue_name: queue,
             task_name: task_name.to_string(),
             payload,
             config: opts.config.unwrap_or_default(),
             status: JobStatus::Pending,
-            created_at: self.clock.now(),
+            created_at: now,
+            scheduled_at: opts.run_at.unwrap_or(now),
             started_at: None,
             completed_at: None,
+            delivery_count: 0,
             error_message: None,
             retry_count: 0,
             next_retry_at: None,
@@ -198,11 +212,9 @@ where
             idempotency_key: opts.idempotency_key,
         };
 
-        // Persist the row first (durable record), then publish to the queue, so
-        // a crash in between leaves a queryable job, never a phantom message.
         let inserted = self.store.create_job(&job).await?;
         if !inserted {
-            // Idempotent replay: hand back the original job, enqueue nothing.
+            // Idempotent replay: hand back the original job.
             let key = job.idempotency_key.as_deref().unwrap_or_default();
             let existing = self
                 .store
@@ -213,13 +225,11 @@ where
                 })?;
             return Ok(existing.id);
         }
-        let msg = QueueMessage::for_job(&job);
-        self.queue.send(&queue, &msg, job.config.priority).await?;
         EngineStats::incr(&self.stats.jobs_created);
         Ok(job.id)
     }
 
-    /// Enqueue many jobs efficiently.
+    /// Enqueue many jobs efficiently (one multi-row insert).
     pub async fn enqueue_batch(
         &self,
         requests: Vec<(String, Map, Option<JobConfig>)>,
@@ -236,8 +246,10 @@ where
                 config: config.unwrap_or_default(),
                 status: JobStatus::Pending,
                 created_at: now,
+                scheduled_at: now,
                 started_at: None,
                 completed_at: None,
+                delivery_count: 0,
                 error_message: None,
                 retry_count: 0,
                 next_retry_at: None,
@@ -251,9 +263,6 @@ where
             .collect();
 
         let ids = self.store.batch_create_jobs(&jobs).await?;
-        // All batch jobs target the default queue, so one batched publish.
-        let msgs: Vec<QueueMessage> = jobs.iter().map(QueueMessage::for_job).collect();
-        self.queue.send_batch(&self.default_queue, &msgs, 0).await?;
         for _ in &jobs {
             EngineStats::incr(&self.stats.jobs_created);
         }
@@ -268,10 +277,11 @@ where
         Ok(self.store.list_jobs(filter).await?)
     }
 
-    /// Cancel a job. Running work is signalled via status; pending/retrying
-    /// work simply won't run once it is marked cancelled. Cancelling a job
-    /// that already reached a terminal state is a 409 Conflict — history is
-    /// never rewritten.
+    /// Cancel a job. Pending/retrying work simply becomes unclaimable; running
+    /// work keeps its handler alive but every lease-guarded write (heartbeat,
+    /// complete, fail, retry) is refused from then on. Cancelling a job that
+    /// already reached a terminal state is a 409 Conflict — history is never
+    /// rewritten.
     pub async fn cancel_job(&self, id: &str) -> Result<(), EngineError> {
         let cancelled = self
             .store
@@ -324,6 +334,16 @@ where
                         Some("cancelled by user"),
                     )
                     .await?;
+                // Cancel the step's live job too, or a worker would still
+                // execute work for a dead workflow: a pending job stays
+                // claimable, and a running one could land its completion.
+                // The status flip blocks both (claims filter on status;
+                // outcome writes are lease-guarded against non-running rows).
+                if let Some(job_id) = &rec.job_id {
+                    self.store
+                        .cancel_job_if_active(job_id, "workflow cancelled")
+                        .await?;
+                }
             }
         }
         // The guarded transition is a no-op if a concurrent advance already
@@ -376,28 +396,26 @@ where
             if self.shutdown.is_cancelled() {
                 break;
             }
-            tokio::select! {
-                biased;
-                _ = self.shutdown.cancelled() => break,
-                // Long-poll: an empty queue blocks (server-side on PGMQ) for up
-                // to WORKER_POLL_SECS instead of returning instantly, so an
-                // idle worker costs one query per poll window, not five per
-                // second.
-                read = self.queue.read_with_poll(&queue, self.read_vt_secs, 1, WORKER_POLL_SECS) => {
-                    match read {
-                        Ok(mut msgs) => {
-                            if let Some(rm) = msgs.pop() {
-                                self.process_message(&queue, rm).await;
-                            }
-                            // Empty result: the poll already waited; loop again.
+            match self.store.claim_jobs(&queue, 1, self.lease_secs).await {
+                Ok(mut claimed) => {
+                    if let Some(lease) = claimed.jobs.pop() {
+                        self.process_job(lease).await;
+                    } else {
+                        // Idle: park until NOTIFY wakes us, the next delayed
+                        // job comes due, or the safety-net window passes.
+                        let wait = self.idle_wait(claimed.next_due);
+                        tokio::select! {
+                            biased;
+                            _ = self.shutdown.cancelled() => break,
+                            _ = self.store.await_work(&queue, wait) => {}
                         }
-                        Err(e) => {
-                            tracing::warn!(worker_id, error = %e, "queue read error");
-                            tokio::select! {
-                                _ = self.shutdown.cancelled() => break,
-                                _ = tokio::time::sleep(StdDuration::from_secs(1)) => {}
-                            }
-                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(worker_id, error = %e, "claim error");
+                    tokio::select! {
+                        _ = self.shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(StdDuration::from_secs(1)) => {}
                     }
                 }
             }
@@ -405,94 +423,72 @@ where
         tracing::info!(worker_id, queue = %queue, "worker stopped");
     }
 
-    /// Lease and process at most one message. Returns whether a message was
-    /// handled. Primarily used to drive the engine deterministically in tests.
+    /// How long an idle worker should park: until the next delayed job is due,
+    /// capped by the missed-NOTIFY safety window.
+    fn idle_wait(&self, next_due: Option<DateTime<Utc>>) -> StdDuration {
+        let cap = StdDuration::from_secs(WORKER_POLL_SECS);
+        match next_due {
+            Some(due) => {
+                let until = (due - self.clock.now()).num_milliseconds().max(0) as u64;
+                StdDuration::from_millis(until).min(cap)
+            }
+            None => cap,
+        }
+    }
+
+    /// Claim and process at most one job. Returns whether a job was handled.
+    /// Primarily used to drive the engine deterministically in tests.
     pub async fn process_once(&self, queue: &str) -> Result<bool, EngineError> {
-        let mut msgs = self.queue.read(queue, self.read_vt_secs, 1).await?;
-        match msgs.pop() {
-            Some(rm) => {
-                self.process_message(queue, rm).await;
+        let mut claimed = self.store.claim_jobs(queue, 1, self.lease_secs).await?;
+        match claimed.jobs.pop() {
+            Some(lease) => {
+                self.process_job(lease).await;
                 Ok(true)
             }
             None => Ok(false),
         }
     }
 
-    /// Acknowledge (remove) a processed message, logging — never silently
-    /// swallowing — failures. A failed ack means the message will be redelivered
-    /// after its visibility timeout; the terminal-state guard in
-    /// [`Engine::process_message`] then makes that redelivery idempotent.
-    async fn ack(&self, queue: &str, msg_id: i64) {
-        if let Err(e) = self.queue.delete(queue, msg_id).await {
-            tracing::warn!(queue, msg_id, error = %e, "failed to ack message; it may be redelivered");
-        }
-    }
-
-    /// Execute one leased message end to end: load the job, run its handler with
-    /// a timeout, then complete / retry / dead-letter and advance any workflow.
+    /// Execute one claimed job end to end: run its handler with a timeout,
+    /// then complete / retry / dead-letter and advance any workflow.
     ///
-    /// Delivery is **at-least-once**: a message may be redelivered (an ack
-    /// failed, or a worker crashed after finishing). Handlers should therefore
-    /// be idempotent. The engine adds two safety nets: a terminal-state guard so
-    /// a finished job's handler is never re-run, and "advance the workflow
-    /// before acking" so a failed advance is retried rather than lost.
-    pub async fn process_message(&self, queue: &str, rm: ReadMessage) {
-        let job_id = rm.message.job_id.clone();
-
-        let job = match self.store.get_job(&job_id).await {
-            Ok(j) => j,
-            Err(_) => {
-                // The durable row is gone; drop the orphaned message.
-                self.ack(queue, rm.msg_id).await;
-                return;
-            }
-        };
-
-        // Idempotency guard: never re-run a terminal job (completed / failed /
-        // cancelled). Instead re-drive any workflow advancement — which is
-        // idempotent — so a step whose post-completion advance failed before
-        // ack can self-heal, then ack.
-        if job.status.is_terminal() {
-            self.resume_workflow(&job).await;
-            self.ack(queue, rm.msg_id).await;
-            return;
-        }
-
-        // Extend the lease to cover the job's full timeout (plus grace for
-        // bookkeeping). Without this, any job running longer than the read
-        // visibility timeout would reappear and be executed concurrently by a
-        // second worker.
-        let needed = job.config.timeout_secs.saturating_add(LEASE_GRACE_SECS);
-        if needed > self.read_vt_secs as u64 {
-            let vt = needed.min(u32::MAX as u64) as u32;
-            if let Err(e) = self.queue.set_vt(queue, rm.msg_id, vt).await {
-                tracing::warn!(
-                    job_id = %job_id, error = %e,
-                    "failed to extend lease; a long-running job may be redelivered while still running"
-                );
-            }
-        }
+    /// Delivery is **at-least-once**: a worker can crash after the handler
+    /// finished but before the terminal write, and the janitor will route the
+    /// expired lease through the retry policy — so handlers should be
+    /// idempotent. Every outcome write is lease-guarded, so a job that was
+    /// cancelled mid-run or reclaimed after lease expiry is never overwritten
+    /// by this worker.
+    pub async fn process_job(&self, lease: LeasedJob) {
+        let LeasedJob { job, lease_token } = lease;
 
         let Some(handler) = self.handlers.get(&job.task_name).cloned() else {
             let err = format!("no handler registered for task '{}'", job.task_name);
-            let _ = self
-                .store
-                .move_to_dlq(&job_id, "handler_not_found", &err)
+            self.fail_terminally(&job, &lease_token, "handler_not_found", &err)
                 .await;
-            let _ = self
-                .store
-                .update_status(&job_id, JobStatus::Failed, Some(&err), None)
-                .await;
-            EngineStats::incr(&self.stats.jobs_failed);
-            EngineStats::incr(&self.stats.jobs_dead_lettered);
-            self.advance_or_keep(queue, rm.msg_id, &job, &err).await;
             return;
         };
 
-        let _ = self
-            .store
-            .update_status(&job_id, JobStatus::Running, None, None)
-            .await;
+        // Extend the lease to cover the job's full timeout (plus grace for
+        // bookkeeping). Without this, any job running longer than the claim
+        // lease would be reaped by the janitor and retried concurrently.
+        let needed = job.config.timeout_secs.saturating_add(LEASE_GRACE_SECS);
+        if needed > self.lease_secs as u64 {
+            let secs = needed.min(u32::MAX as u64) as u32;
+            match self.store.extend_lease(&job.id, &lease_token, secs).await {
+                Ok(Some(JobStatus::Running)) => {}
+                Ok(_) => {
+                    // Cancelled or reclaimed between claim and here: not ours.
+                    tracing::info!(job_id = %job.id, "job lost its lease before starting; skipping");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        job_id = %job.id, error = %e,
+                        "failed to extend lease; a long-running job may be reaped while still running"
+                    );
+                }
+            }
+        }
 
         let timeout = StdDuration::from_secs(job.config.timeout_secs.max(1));
         let outcome = tokio::time::timeout(timeout, handler.handle(job.payload.clone())).await;
@@ -500,77 +496,84 @@ where
         match outcome {
             Ok(Ok(result)) => {
                 let result_value = serde_json::to_value(&result).unwrap_or(Json::Null);
-                let _ = self
+                match self
                     .store
-                    .update_status(&job_id, JobStatus::Completed, None, Some(&result_value))
-                    .await;
-                EngineStats::incr(&self.stats.jobs_completed);
-
-                // Advance the workflow BEFORE acking so a failed advance leaves
-                // the message to be redelivered and self-healed by the guard.
-                if let (Some(wf), Some(step)) = (&job.workflow_id, &job.workflow_step_id) {
-                    if let Err(e) = self.scheduler.on_step_completed(wf, step, &result).await {
-                        tracing::error!(error = %e, job_id = %job_id, "workflow advance failed; message will be redelivered");
-                        return; // do NOT ack — redelivery self-heals
+                    .finish_if_leased(
+                        &job.id,
+                        &lease_token,
+                        JobStatus::Completed,
+                        None,
+                        Some(&result_value),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        EngineStats::incr(&self.stats.jobs_completed);
+                        // Advance the workflow after the terminal write; if
+                        // this fails (or we crash), the janitor's stalled-step
+                        // sweep re-drives it.
+                        if let (Some(wf), Some(step)) = (&job.workflow_id, &job.workflow_step_id) {
+                            if let Err(e) =
+                                self.scheduler.on_step_completed(wf, step, &result).await
+                            {
+                                tracing::error!(error = %e, job_id = %job.id, "workflow advance failed; janitor will self-heal");
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        tracing::info!(job_id = %job.id, "lease lost before completion (cancelled or reclaimed); result dropped");
+                    }
+                    Err(e) => {
+                        tracing::error!(job_id = %job.id, error = %e, "failed to record completion; lease will expire and the janitor will retry");
                     }
                 }
-                self.ack(queue, rm.msg_id).await;
             }
             Ok(Err(handler_err)) => {
                 self.handle_failure(
-                    queue,
-                    rm.msg_id,
                     &job,
+                    &lease_token,
                     &handler_err.message,
                     handler_err.retryable,
                 )
                 .await;
             }
             Err(_elapsed) => {
-                self.handle_failure(queue, rm.msg_id, &job, "job exceeded its timeout", true)
+                self.handle_failure(&job, &lease_token, "job exceeded its timeout", true)
                     .await;
             }
         }
     }
 
     /// Apply failure policy to a leased job: schedule a durable retry, or
-    /// dead-letter and advance any workflow. `msg_id` is the lease being held.
-    /// Shared by the local worker loop and the remote-worker `fail` endpoint.
-    async fn handle_failure(
-        &self,
-        queue: &str,
-        msg_id: i64,
-        job: &Job,
-        error: &str,
-        retryable: bool,
-    ) {
+    /// dead-letter and advance any workflow. Shared by the local worker loop,
+    /// the remote-worker `fail` endpoint, and the janitor's expired-lease
+    /// sweep. Returns whether the outcome was recorded (false = lease lost).
+    async fn handle_failure(&self, job: &Job, token: &str, error: &str, retryable: bool) -> bool {
         let cfg = &job.config;
         if retryable && job.retry_count < cfg.max_retries {
             let attempt = job.retry_count;
             let now = self.clock.now();
             let next = cfg.retry_backoff.next_retry_at(cfg, attempt, now);
-            let delay = (next - now).num_seconds().max(0) as u64;
 
-            let _ = self
-                .store
-                .mark_retrying(&job.id, attempt + 1, next, error)
-                .await;
-            // Durable retry: the delay lives in the queue, surviving restarts.
-            // Only ack the original once the delayed copy is safely enqueued, so
-            // a send failure can't drop the job entirely.
-            let msg = QueueMessage::for_job(job);
+            // One lease-guarded row update is the entire durable retry; there
+            // is no longer a mark-retrying / re-enqueue pair that can tear.
             match self
-                .queue
-                .send_delayed(queue, &msg, cfg.priority, delay)
+                .store
+                .mark_retrying(&job.id, token, attempt + 1, next, error)
                 .await
             {
-                Ok(_) => {
-                    self.ack(queue, msg_id).await;
+                Ok(true) => {
                     EngineStats::incr(&self.stats.jobs_retried);
-                    tracing::info!(job_id = %job.id, attempt = attempt + 1, delay_secs = delay, "job scheduled for retry");
+                    tracing::info!(job_id = %job.id, attempt = attempt + 1, next_retry_at = %next, "job scheduled for retry");
+                    true
+                }
+                Ok(false) => {
+                    tracing::info!(job_id = %job.id, "lease lost before retry could be recorded (cancelled or reclaimed)");
+                    false
                 }
                 Err(e) => {
-                    tracing::error!(job_id = %job.id, error = %e, "failed to enqueue retry; original message will be redelivered");
+                    tracing::error!(job_id = %job.id, error = %e, "failed to record retry; lease will expire and the janitor will retry");
+                    false
                 }
             }
         } else {
@@ -579,33 +582,48 @@ where
             } else {
                 "non_retryable"
             };
-            let _ = self.store.move_to_dlq(&job.id, reason, error).await;
-            let _ = self
-                .store
-                .update_status(&job.id, JobStatus::Failed, Some(error), None)
-                .await;
-            EngineStats::incr(&self.stats.jobs_failed);
-            EngineStats::incr(&self.stats.jobs_dead_lettered);
-            self.advance_or_keep(queue, msg_id, job, error).await;
+            self.fail_terminally(job, token, reason, error).await
         }
     }
 
-    /// Advance a workflow after a terminal failure, then ack — but if the
-    /// advance fails, leave the message so it is redelivered and self-healed by
-    /// the terminal-state guard. Non-workflow jobs are simply acked.
-    async fn advance_or_keep(&self, queue: &str, msg_id: i64, job: &Job, error: &str) {
-        if let (Some(wf), Some(step)) = (&job.workflow_id, &job.workflow_step_id) {
-            if let Err(e) = self.scheduler.on_step_failed(wf, step, error).await {
-                tracing::error!(error = %e, job_id = %job.id, "workflow failure handling failed; message will be redelivered");
-                return; // do NOT ack — redelivery self-heals
+    /// Lease-guarded permanent failure: terminal write first, then the DLQ
+    /// record and workflow advancement (both re-drivable; the DLQ row is
+    /// advisory). Returns whether the failure was recorded.
+    async fn fail_terminally(&self, job: &Job, token: &str, reason: &str, error: &str) -> bool {
+        match self
+            .store
+            .finish_if_leased(&job.id, token, JobStatus::Failed, Some(error), None)
+            .await
+        {
+            Ok(true) => {
+                EngineStats::incr(&self.stats.jobs_failed);
+                if let Err(e) = self.store.move_to_dlq(&job.id, reason, error).await {
+                    tracing::error!(job_id = %job.id, error = %e, "failed to record dead letter");
+                } else {
+                    EngineStats::incr(&self.stats.jobs_dead_lettered);
+                }
+                if let (Some(wf), Some(step)) = (&job.workflow_id, &job.workflow_step_id) {
+                    if let Err(e) = self.scheduler.on_step_failed(wf, step, error).await {
+                        tracing::error!(error = %e, job_id = %job.id, "workflow failure handling failed; janitor will self-heal");
+                    }
+                }
+                true
+            }
+            Ok(false) => {
+                tracing::info!(job_id = %job.id, "lease lost before failure could be recorded (cancelled or reclaimed)");
+                false
+            }
+            Err(e) => {
+                tracing::error!(job_id = %job.id, error = %e, "failed to record failure; lease will expire and the janitor will retry");
+                false
             }
         }
-        self.ack(queue, msg_id).await;
     }
 
     /// Re-drive workflow advancement for an already-terminal job (idempotent).
-    /// Used by the redelivery guard to recover an advance that failed before ack.
-    async fn resume_workflow(&self, job: &Job) {
+    /// Used by the janitor to recover an advance that failed after the
+    /// terminal write.
+    pub(crate) async fn resume_workflow(&self, job: &Job) {
         let (Some(wf), Some(step)) = (&job.workflow_id, &job.workflow_step_id) else {
             return;
         };
@@ -623,6 +641,13 @@ where
                 let err = job.error_message.clone().unwrap_or_default();
                 self.scheduler.on_step_failed(wf, step, &err).await
             }
+            // A step job cancelled directly (not via cancel_workflow) follows
+            // the step's failure policy so the workflow can settle.
+            JobStatus::Cancelled => {
+                self.scheduler
+                    .on_step_failed(wf, step, "job was cancelled")
+                    .await
+            }
             _ => Ok(()),
         };
         if let Err(e) = outcome {
@@ -634,14 +659,12 @@ where
     //
     // These four methods are the polyglot worker surface: lease, heartbeat,
     // complete, fail. They reuse exactly the machinery of the local worker
-    // loop (terminal-state guard, retry policy, DLQ, workflow advancement), so
-    // a handler written in any language gets the same at-least-once semantics
+    // loop (lease guards, retry policy, DLQ, workflow advancement), so a
+    // handler written in any language gets the same at-least-once semantics
     // as one compiled into this binary.
 
     /// Lease up to `count` jobs from `queue` for `lease_secs`, waiting up to
-    /// `wait_secs` for work to arrive. Each leased job is marked running.
-    /// Messages whose job row is terminal or gone are self-healed exactly as
-    /// in the local worker path and not returned.
+    /// `wait_secs` for work to arrive.
     pub async fn lease_jobs(
         &self,
         queue: &str,
@@ -649,103 +672,115 @@ where
         lease_secs: u32,
         wait_secs: u32,
     ) -> Result<Vec<LeasedJob>, EngineError> {
-        let msgs = if wait_secs == 0 {
-            self.queue.read(queue, lease_secs, count).await?
-        } else {
-            self.queue
-                .read_with_poll(queue, lease_secs, count, wait_secs)
-                .await?
-        };
-
-        let mut out = Vec::with_capacity(msgs.len());
-        for rm in msgs {
-            match self.store.get_job(&rm.message.job_id).await {
-                Ok(job) if job.status.is_terminal() => {
-                    self.resume_workflow(&job).await;
-                    self.ack(queue, rm.msg_id).await;
-                }
-                Ok(mut job) => {
-                    let _ = self
-                        .store
-                        .update_status(&job.id, JobStatus::Running, None, None)
-                        .await;
-                    job.status = JobStatus::Running;
-                    out.push(LeasedJob {
-                        job,
-                        lease_id: rm.msg_id,
-                        queue: queue.to_string(),
-                    });
-                }
-                Err(_) => {
-                    // Orphaned message: durable row is gone.
-                    self.ack(queue, rm.msg_id).await;
-                }
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(wait_secs as u64);
+        loop {
+            let claimed = self.store.claim_jobs(queue, count, lease_secs).await?;
+            if !claimed.jobs.is_empty() {
+                return Ok(claimed.jobs);
             }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(vec![]);
+            }
+            let wait = self.idle_wait(claimed.next_due).min(remaining);
+            self.store.await_work(queue, wait).await?;
         }
-        Ok(out)
     }
 
-    /// Extend a lease so a still-running remote job is not redelivered.
+    /// Extend a lease so a still-running remote job is not reaped. Returns the
+    /// job's current status: `Running` means extended; anything else means the
+    /// job finished or was cancelled mid-run and the worker should stop.
     pub async fn heartbeat_lease(
         &self,
-        queue: &str,
-        lease_id: i64,
+        job_id: &str,
+        lease_token: &str,
         extend_secs: u32,
-    ) -> Result<(), EngineError> {
-        Ok(self.queue.set_vt(queue, lease_id, extend_secs).await?)
+    ) -> Result<JobStatus, EngineError> {
+        match self
+            .store
+            .extend_lease(job_id, lease_token, extend_secs)
+            .await?
+        {
+            Some(status) => Ok(status),
+            None => Err(EngineError::Conflict(
+                "lease is no longer held (it expired and the job was reclaimed)".into(),
+            )),
+        }
     }
 
-    /// Complete a leased job with a result, advancing any owning workflow
-    /// before the ack (same ordering as the local worker: a failed advance
-    /// leaves the lease to be redelivered and self-healed).
+    /// Complete a leased job with a result. Replaying a finished job is an
+    /// idempotent success; reporting against a lost lease is a conflict.
     pub async fn complete_leased(
         &self,
-        queue: &str,
-        lease_id: i64,
         job_id: &str,
+        lease_token: &str,
         result: Map,
     ) -> Result<(), EngineError> {
-        let job = self.store.get_job(job_id).await?;
-        if job.status.is_terminal() {
-            // Replay of an already-finished lease (e.g. client retried after a
-            // network error): drop the message, report success.
-            self.ack(queue, lease_id).await;
+        let result_value = serde_json::to_value(&result).unwrap_or(Json::Null);
+        let finished = self
+            .store
+            .finish_if_leased(
+                job_id,
+                lease_token,
+                JobStatus::Completed,
+                None,
+                Some(&result_value),
+            )
+            .await?;
+        if finished {
+            EngineStats::incr(&self.stats.jobs_completed);
+            let job = self.store.get_job(job_id).await?;
+            if let (Some(wf), Some(step)) = (&job.workflow_id, &job.workflow_step_id) {
+                if let Err(e) = self.scheduler.on_step_completed(wf, step, &result).await {
+                    // The completion is recorded; the janitor re-drives the
+                    // advance. Failing the request would only provoke a
+                    // pointless client retry.
+                    tracing::error!(error = %e, job_id = %job_id, "workflow advance failed; janitor will self-heal");
+                }
+            }
             return Ok(());
         }
-
-        let result_value = serde_json::to_value(&result).unwrap_or(Json::Null);
-        self.store
-            .update_status(job_id, JobStatus::Completed, None, Some(&result_value))
-            .await?;
-        EngineStats::incr(&self.stats.jobs_completed);
-
-        if let (Some(wf), Some(step)) = (&job.workflow_id, &job.workflow_step_id) {
-            self.scheduler.on_step_completed(wf, step, &result).await?;
+        // Guard failed: missing (404), idempotent replay of a finished job
+        // (ok), or a genuinely lost lease (409).
+        let job = self.store.get_job(job_id).await?;
+        if job.status.is_terminal() {
+            return Ok(());
         }
-        self.ack(queue, lease_id).await;
-        Ok(())
+        Err(EngineError::Conflict(
+            "lease is no longer held; the job was reclaimed".into(),
+        ))
     }
 
     /// Fail a leased job, applying the normal retry / dead-letter policy.
     pub async fn fail_leased(
         &self,
-        queue: &str,
-        lease_id: i64,
         job_id: &str,
+        lease_token: &str,
         error: &str,
         retryable: bool,
     ) -> Result<(), EngineError> {
         let job = self.store.get_job(job_id).await?;
         if job.status.is_terminal() {
-            self.ack(queue, lease_id).await;
+            return Ok(()); // idempotent replay
+        }
+        if self
+            .handle_failure(&job, lease_token, error, retryable)
+            .await
+        {
             return Ok(());
         }
-        self.handle_failure(queue, lease_id, &job, error, retryable)
-            .await;
-        Ok(())
+        // Nothing was recorded; distinguish a racing finish from a lost lease.
+        let job = self.store.get_job(job_id).await?;
+        if job.status.is_terminal() {
+            return Ok(());
+        }
+        Err(EngineError::Conflict(
+            "lease is no longer held; the job was reclaimed".into(),
+        ))
     }
 
-    /// Signal all workers to stop. They drain in-flight work, then exit.
+    /// Signal all workers (and the janitor) to stop. They drain in-flight
+    /// work, then exit.
     pub fn shutdown(&self) {
         self.running.store(false, Ordering::SeqCst);
         self.shutdown.cancel();

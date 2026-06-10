@@ -21,10 +21,9 @@ fn to_map(v: serde_json::Value) -> Map {
 #[tokio::main]
 async fn main() -> Result<(), EngineError> {
     let clock = Arc::new(SystemClock);
-    let store = Arc::new(InMemoryJobStore::new());
-    let queue = Arc::new(InMemoryMessageQueue::new(clock.clone()));
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
 
-    let engine = Engine::builder(store, queue, clock)
+    let engine = Engine::builder(store, clock)
         .register("echo", builtin::echo())
         .register_fn("sum", |p: Map| async move {
             let a = p.get("a").and_then(|v| v.as_i64()).unwrap_or(0);

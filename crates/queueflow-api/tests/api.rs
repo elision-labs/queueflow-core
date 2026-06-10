@@ -15,9 +15,8 @@ use tower::ServiceExt;
 
 fn app() -> axum::Router {
     let clock = Arc::new(SystemClock);
-    let store = Arc::new(InMemoryJobStore::new());
-    let queue = Arc::new(InMemoryMessageQueue::new(clock.clone()));
-    let engine = Engine::builder(store, queue, clock)
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    let engine = Engine::builder(store, clock)
         .register("echo", builtin::echo())
         .build();
     // Pretend workers are running so /ready reports ready.
@@ -210,9 +209,8 @@ async fn workflow_diagram_is_mermaid() {
 async fn cannot_cancel_another_tenants_job() {
     // Seed a job owned by a different tenant directly through the engine.
     let clock = Arc::new(SystemClock);
-    let store = Arc::new(InMemoryJobStore::new());
-    let queue = Arc::new(InMemoryMessageQueue::new(clock.clone()));
-    let engine = Engine::builder(store, queue, clock)
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    let engine = Engine::builder(store, clock)
         .register("echo", builtin::echo())
         .build();
     let id = engine
@@ -246,9 +244,8 @@ async fn job_events_stream_emits_status_and_closes_on_terminal() {
     // Build an engine we can drive directly: complete the job first, then the
     // SSE stream must emit one terminal `status` event and close.
     let clock = Arc::new(SystemClock);
-    let store = Arc::new(InMemoryJobStore::new());
-    let queue = Arc::new(InMemoryMessageQueue::new(clock.clone()));
-    let engine = Engine::builder(store, queue, clock)
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    let engine = Engine::builder(store, clock)
         .register("echo", builtin::echo())
         .build();
     let id = engine

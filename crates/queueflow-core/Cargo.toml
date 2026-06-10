@@ -1,6 +1,6 @@
 [package]
 name = "queueflow-core"
-description = "Core engine for QueueFlow: a PostgreSQL/PGMQ-native distributed job queue and workflow engine."
+description = "Core engine for QueueFlow: a PostgreSQL-native distributed job queue and workflow engine."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,6 @@ authors.workspace = true
 [dependencies]
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-futures = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,7 +28,7 @@ sqlx = { workspace = true, optional = true }
 
 [features]
 default = []
-# Enables the Postgres + PGMQ adapters (PostgresJobStore / PostgresMessageQueue).
+# Enables the Postgres adapter (PostgresJobStore).
 postgres = ["dep:sqlx"]
 
 [dev-dependencies]

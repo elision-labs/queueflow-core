@@ -11,7 +11,7 @@ use utoipa::{IntoParams, ToSchema};
 /// Optional per-job configuration overrides.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct JobConfigRequest {
-    /// Higher is dequeued first (FIFO within a priority on PGMQ).
+    /// Higher is claimed first within a queue (ties: oldest first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,6 +59,10 @@ pub struct CreateJobRequest {
     pub payload: Map,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<JobConfigRequest>,
+    /// Don't run before this instant (RFC 3339). The job is created
+    /// immediately but stays invisible to workers until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -217,10 +221,8 @@ pub struct LeaseJobsResponse {
 /// Body for `POST /api/v1/jobs/{id}/complete`.
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 pub struct CompleteJobRequest {
-    /// Queue the lease was taken from.
-    pub queue: String,
-    /// The lease handle returned by the lease call.
-    pub lease_id: i64,
+    /// The lease token returned by the lease call.
+    pub lease_token: String,
     /// Handler result, recorded on the job and merged into workflow context.
     #[serde(default)]
     #[schema(value_type = Object)]
@@ -230,8 +232,8 @@ pub struct CompleteJobRequest {
 /// Body for `POST /api/v1/jobs/{id}/fail`.
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 pub struct FailJobRequest {
-    pub queue: String,
-    pub lease_id: i64,
+    /// The lease token returned by the lease call.
+    pub lease_token: String,
     /// Human-readable failure reason.
     pub error: String,
     /// Whether the engine may retry (subject to the job's max_retries).
@@ -247,8 +249,17 @@ fn default_true() -> bool {
 /// Body for `POST /api/v1/jobs/{id}/heartbeat`.
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 pub struct HeartbeatRequest {
-    pub queue: String,
-    pub lease_id: i64,
+    /// The lease token returned by the lease call.
+    pub lease_token: String,
     /// New lease duration in seconds, measured from now (1..=3600).
     pub extend_secs: u32,
+}
+
+/// Response for `POST /api/v1/jobs/{id}/heartbeat`.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct HeartbeatResponse {
+    /// The job's current status. `running` means the lease was extended;
+    /// anything else (`cancelled`, `completed`, ...) means it was not, and
+    /// the worker should stop working on the job.
+    pub status: queueflow_core::JobStatus,
 }

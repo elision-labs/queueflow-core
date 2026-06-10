@@ -74,6 +74,7 @@ pub async fn create_job(
             queue,
             Some(t.0),
             idempotency_key,
+            req.run_at,
         )
         .await?;
     Ok((StatusCode::CREATED, Json(CreateJobResponse { job_id: id })).into_response())
@@ -416,9 +417,10 @@ pub async fn lease_jobs(
     params(("id" = String, Path, description = "Job id")),
     request_body = CompleteJobRequest,
     responses(
-        (status = 204, description = "Completed (idempotent: replaying a finished lease also succeeds)"),
+        (status = 204, description = "Completed (idempotent: replaying against an already-finished job also succeeds)"),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
+        (status = 409, description = "Lease no longer held (expired and reclaimed)", body = ErrorBody),
     ),
     security(("bearerAuth" = []))
 )]
@@ -428,7 +430,7 @@ pub async fn complete_job(
     Json(req): Json<CompleteJobRequest>,
 ) -> Result<StatusCode, ApiError> {
     s.engine
-        .complete_leased(&req.queue, req.lease_id, &id, req.result)
+        .complete_leased(&id, &req.lease_token, req.result)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -441,6 +443,7 @@ pub async fn complete_job(
         (status = 204, description = "Failure recorded; the job is retried or dead-lettered per its config"),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
+        (status = 409, description = "Lease no longer held (expired and reclaimed)", body = ErrorBody),
     ),
     security(("bearerAuth" = []))
 )]
@@ -450,7 +453,7 @@ pub async fn fail_job(
     Json(req): Json<FailJobRequest>,
 ) -> Result<StatusCode, ApiError> {
     s.engine
-        .fail_leased(&req.queue, req.lease_id, &id, &req.error, req.retryable)
+        .fail_leased(&id, &req.lease_token, &req.error, req.retryable)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -460,21 +463,26 @@ pub async fn fail_job(
     params(("id" = String, Path, description = "Job id")),
     request_body = HeartbeatRequest,
     responses(
-        (status = 204, description = "Lease extended"),
+        (status = 200, description = "Current job status. `running` = lease extended; anything else \
+                                      (e.g. `cancelled`) = not extended, stop working on the job.",
+         body = HeartbeatResponse),
         (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+        (status = 409, description = "Lease no longer held (expired and reclaimed)", body = ErrorBody),
     ),
     security(("bearerAuth" = []))
 )]
 pub async fn heartbeat_job(
     State(s): State<ApiState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     Json(req): Json<HeartbeatRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<HeartbeatResponse>, ApiError> {
     let extend = req.extend_secs.clamp(1, 3600);
-    s.engine
-        .heartbeat_lease(&req.queue, req.lease_id, extend)
+    let status = s
+        .engine
+        .heartbeat_lease(&id, &req.lease_token, extend)
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(HeartbeatResponse { status }))
 }
 
 // ---- System ----------------------------------------------------------------

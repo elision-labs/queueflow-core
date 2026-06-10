@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use queueflow_core::*;
 use serde_json::json;
 
-type Mem = Engine<InMemoryJobStore, InMemoryMessageQueue>;
+type Mem = Engine<InMemoryJobStore>;
 
 fn map(v: serde_json::Value) -> Map {
     v.as_object()
@@ -36,14 +36,13 @@ struct Ctx {
 /// behaviours selected by payload.
 fn ctx(ctx_seen: Arc<AtomicBool>) -> Ctx {
     let clock = Arc::new(TestClock::epoch());
-    let store = Arc::new(InMemoryJobStore::new());
-    let queue = Arc::new(InMemoryMessageQueue::new(clock));
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
     let order = Arc::new(Mutex::new(Vec::<String>::new()));
 
     let o1 = order.clone();
     let o2 = order.clone();
 
-    let engine = Engine::builder(store.clone(), queue, Arc::new(SystemClock))
+    let engine = Engine::builder(store.clone(), clock)
         // Records its `who`, returns `{"who": who}`.
         .register_fn("ok", move |p: Map| {
             let o = o1.clone();
@@ -361,6 +360,160 @@ async fn step_claim_is_atomic() {
         .await
         .unwrap();
     assert!(!claimed, "a second claim on a linked step must lose");
+}
+
+#[tokio::test]
+async fn janitor_heals_a_completed_job_with_unfinished_step() {
+    // Simulate a worker that crashed after the job's terminal write but
+    // before the workflow advance: finish the step job directly through the
+    // store, bypassing the scheduler entirely.
+    let c = ctx(Arc::new(AtomicBool::new(false)));
+    let req = WorkflowBuilder::new("stall")
+        .step(StepBuilder::new("a").task("ok"))
+        .step(StepBuilder::new("b").task("ok").after("a"))
+        .build()
+        .unwrap();
+    let id = c.engine.create_workflow(req, None).await.unwrap();
+
+    let claimed = c.store.claim_jobs("default", 1, 30).await.unwrap();
+    let lease = &claimed.jobs[0];
+    assert!(c
+        .store
+        .finish_if_leased(
+            &lease.job.id,
+            &lease.lease_token,
+            JobStatus::Completed,
+            None,
+            None
+        )
+        .await
+        .unwrap());
+    assert_eq!(step_status(&c.store, &id, "a").await, StepStatus::Pending);
+
+    // Job terminal + step non-terminal = exactly what the janitor heals.
+    let report = c.engine.janitor_sweep().await;
+    assert!(report.healed_steps >= 1, "got: {report:?}");
+    assert_eq!(step_status(&c.store, &id, "a").await, StepStatus::Completed);
+
+    // The heal re-drove the advance, so b is claimable; drain to the end.
+    drain(&c.engine).await;
+    assert_eq!(
+        c.engine.get_workflow(&id).await.unwrap().status,
+        WorkflowStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn janitor_advances_a_stalled_workflow() {
+    // Simulate a crash *after* the step-status write but before dependents
+    // were enqueued: the step is terminal, the workflow has no live jobs, and
+    // nothing will ever advance it without the janitor.
+    let c = ctx(Arc::new(AtomicBool::new(false)));
+    let req = WorkflowBuilder::new("stall2")
+        .step(StepBuilder::new("a").task("ok"))
+        .step(StepBuilder::new("b").task("ok").after("a"))
+        .build()
+        .unwrap();
+    let id = c.engine.create_workflow(req, None).await.unwrap();
+
+    let claimed = c.store.claim_jobs("default", 1, 30).await.unwrap();
+    let lease = &claimed.jobs[0];
+    assert!(c
+        .store
+        .finish_if_leased(
+            &lease.job.id,
+            &lease.lease_token,
+            JobStatus::Completed,
+            None,
+            None
+        )
+        .await
+        .unwrap());
+    c.store
+        .set_step_status(&id, "a", StepStatus::Completed, None)
+        .await
+        .unwrap();
+
+    let report = c.engine.janitor_sweep().await;
+    assert!(report.advanced_workflows >= 1, "got: {report:?}");
+
+    drain(&c.engine).await;
+    assert_eq!(
+        c.engine.get_workflow(&id).await.unwrap().status,
+        WorkflowStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_workflow_cancels_its_inflight_jobs() {
+    let c = ctx(Arc::new(AtomicBool::new(false)));
+    let req = WorkflowBuilder::new("cancel-live")
+        .step(step("a", "ok", &[]))
+        .step(step("b", "ok", &["a"]))
+        .build()
+        .unwrap();
+    let id = c.engine.create_workflow(req, None).await.unwrap();
+
+    // a's job is pending; cancel the workflow before any worker claims it.
+    c.engine.cancel_workflow(&id).await.unwrap();
+
+    // The step job was cancelled with its workflow, so it is not claimable
+    // and no handler ever runs for the dead workflow.
+    assert!(!c.engine.process_once("default").await.unwrap());
+    assert!(c.order.lock().unwrap().is_empty());
+
+    let job_id = c
+        .store
+        .workflow_step_statuses(&id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "a")
+        .unwrap()
+        .job_id
+        .unwrap();
+    assert_eq!(
+        c.engine.get_job(&job_id).await.unwrap().status,
+        JobStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn cancelled_step_job_settles_the_workflow_via_janitor() {
+    // Cancelling an individual step *job* (not the whole workflow) leaves a
+    // terminal job under a non-terminal step; the janitor routes it through
+    // the step's failure policy so the workflow still reaches a terminal
+    // state instead of hanging forever.
+    let c = ctx(Arc::new(AtomicBool::new(false)));
+    let req = WorkflowBuilder::new("cancel-step-job")
+        .step(step("a", "ok", &[]))
+        .step(step("b", "ok", &["a"]))
+        .build()
+        .unwrap();
+    let id = c.engine.create_workflow(req, None).await.unwrap();
+
+    let job_id = c
+        .store
+        .workflow_step_statuses(&id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "a")
+        .unwrap()
+        .job_id
+        .unwrap();
+    c.engine.cancel_job(&job_id).await.unwrap();
+
+    let report = c.engine.janitor_sweep().await;
+    assert!(report.healed_steps >= 1, "got: {report:?}");
+
+    // Default policy is halt: a is failed ("job was cancelled"), b cancelled.
+    assert_eq!(
+        c.engine.get_workflow(&id).await.unwrap().status,
+        WorkflowStatus::Failed
+    );
+    assert_eq!(step_status(&c.store, &id, "a").await, StepStatus::Failed);
+    assert_eq!(step_status(&c.store, &id, "b").await, StepStatus::Cancelled);
 }
 
 #[tokio::test]

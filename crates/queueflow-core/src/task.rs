@@ -13,11 +13,11 @@ use crate::error::HandlerError;
 /// Implement this trait for stateful handlers, or use [`handler_fn`] to wrap an
 /// async closure.
 ///
-/// **Idempotency.** Delivery is at-least-once: a job may, in rare failure
-/// scenarios (a worker crash after the handler finished, or a failed
-/// acknowledgement), be delivered to a handler more than once. The engine guards
-/// against re-running a job that already reached a terminal state, but handlers
-/// that have external side effects should still be written to be idempotent.
+/// **Idempotency.** Delivery is at-least-once: if a worker crashes after the
+/// handler finished but before the terminal write landed, the janitor reaps
+/// the expired lease and the job is retried — so the handler runs again. A
+/// job that already reached a terminal state is never re-run, but handlers
+/// with external side effects should still be written to be idempotent.
 #[async_trait]
 pub trait TaskHandler: Send + Sync {
     async fn handle(&self, payload: Map) -> Result<Map, HandlerError>;

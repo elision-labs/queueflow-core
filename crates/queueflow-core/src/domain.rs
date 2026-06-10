@@ -135,9 +135,8 @@ pub struct JobConfig {
     pub max_retries: u32,
     pub retry_delay_secs: u64,
     pub timeout_secs: u64,
-    /// Recorded on the job for inspection. The Postgres/PGMQ backend dequeues
-    /// strictly FIFO, so priority does not affect ordering there; use separate
-    /// queues for priority classes. The in-memory adapter honours it.
+    /// Higher is claimed first within a queue; ties break on `scheduled_at`,
+    /// then `created_at`.
     pub priority: i32,
     #[serde(default)]
     pub retry_backoff: BackoffStrategy,
@@ -176,15 +175,24 @@ pub struct Job {
     pub config: JobConfig,
     pub status: JobStatus,
     pub created_at: DateTime<Utc>,
+    /// When the job becomes claimable. `created_at` for immediate jobs, the
+    /// requested `run_at` for scheduled jobs, and the next backoff instant
+    /// while retrying — the durable delay lives in the row itself.
+    pub scheduled_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// How many times this job has been claimed (delivered to a worker).
+    /// Greater than `retry_count + 1` means a lease expired without a report —
+    /// i.e. a worker crashed mid-run.
+    #[serde(default)]
+    pub delivery_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     pub retry_count: u32,
-    /// When this job becomes visible again for a retry. Audit/inspection only —
-    /// the actual scheduling is owned by the message queue's delayed delivery.
+    /// When this job's next retry becomes claimable (mirrors `scheduled_at`
+    /// while the job is `retrying`; kept for audit/inspection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_retry_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,16 +215,15 @@ pub struct Job {
     pub idempotency_key: Option<String>,
 }
 
-/// A job leased to a (possibly remote) worker, together with the lease handle
+/// A job leased to a (possibly remote) worker, together with the lease token
 /// needed to heartbeat, complete, or fail it.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct LeasedJob {
     pub job: Job,
-    /// Opaque lease handle (the queue message id). Pass it back on
-    /// heartbeat/complete/fail together with the queue name.
-    pub lease_id: i64,
-    /// The queue the lease was taken from.
-    pub queue: String,
+    /// Opaque, unguessable proof of lease ownership, regenerated on every
+    /// claim. Pass it back on heartbeat/complete/fail; a stale token (the
+    /// lease expired and the job was reclaimed) is rejected.
+    pub lease_token: String,
 }
 
 /// What to do with downstream steps when a step fails.
@@ -349,8 +356,10 @@ mod tests {
             config: JobConfig::default(),
             status: JobStatus::Pending,
             created_at: Utc::now(),
+            scheduled_at: Utc::now(),
             started_at: None,
             completed_at: None,
+            delivery_count: 0,
             error_message: None,
             retry_count: 0,
             next_retry_at: None,
