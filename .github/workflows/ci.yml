@@ -20,7 +20,7 @@
 #     runs-on: ubuntu-latest
 #     steps:
 #       - uses: actions/checkout@v4
-#       - uses: dtolnay/rust-toolchain@1.83.0
+#       - uses: dtolnay/rust-toolchain@1.96.0
 #         with:
 #           components: rustfmt, clippy
 #       - uses: Swatinem/rust-cache@v2
@@ -36,7 +36,7 @@
 #     runs-on: ubuntu-latest
 #     steps:
 #       - uses: actions/checkout@v4
-#       - uses: dtolnay/rust-toolchain@1.83.0
+#       - uses: dtolnay/rust-toolchain@1.96.0
 #       - uses: Swatinem/rust-cache@v2
 #       - name: Generate spec
 #         run: cargo run -q -p queueflow-server -- spec --output-dir spec
@@ -44,6 +44,15 @@
 #         run: |
 #           docker run --rm -v "${{ github.workspace }}/spec:/spec:ro" \
 #             openapitools/openapi-generator-cli:v7.10.0 validate -i /spec/openapi.json
+#       # The hand-written TypeScript SDK lives in a sibling repo; check it out
+#       # next to this one so the drift guard can compare it against the spec.
+#       - name: Checkout hand-written TS SDK
+#         uses: actions/checkout@v4
+#         with:
+#           repository: queue-flow/sdk-typescript
+#           path: ../queueflow-sdk-nodejs
+#       - name: Check hand-written TS SDK drift
+#         run: node ./scripts/check-ts-sdk.mjs
 #       - name: Upload spec artifact
 #         uses: actions/upload-artifact@v4
 #         with:
@@ -69,7 +78,7 @@
 #           --health-retries 5
 #     steps:
 #       - uses: actions/checkout@v4
-#       - uses: dtolnay/rust-toolchain@1.83.0
+#       - uses: dtolnay/rust-toolchain@1.96.0
 #       - uses: Swatinem/rust-cache@v2
 #       - name: Integration tests
 #         run: cargo test -p queueflow-core --features postgres --test pg_integration

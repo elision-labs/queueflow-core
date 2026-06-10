@@ -78,7 +78,8 @@ where
         };
 
         self.store.create_workflow(&wf).await?;
-        self.store
+        let _ = self
+            .store
             .set_workflow_status(&wf.id, WorkflowStatus::Running)
             .await?;
         EngineStats::incr(&self.stats.workflows_created);
@@ -142,10 +143,15 @@ where
                             .await?;
                     }
                 }
-                self.store
+                // Count the failure only if this call performed the transition
+                // (a concurrent halt may have already finished the workflow).
+                if self
+                    .store
                     .set_workflow_status(workflow_id, WorkflowStatus::Failed)
-                    .await?;
-                EngineStats::incr(&self.stats.workflows_failed);
+                    .await?
+                {
+                    EngineStats::incr(&self.stats.workflows_failed);
+                }
                 Ok(())
             }
             OnFailure::Skip => {
@@ -272,10 +278,14 @@ where
             WorkflowStatus::PartiallyFailed
         };
 
-        self.store.set_workflow_status(workflow_id, status).await?;
-        match status {
-            WorkflowStatus::Completed => EngineStats::incr(&self.stats.workflows_completed),
-            _ => EngineStats::incr(&self.stats.workflows_failed),
+        // The guarded transition returns false when another worker's aggregate
+        // already finalized the workflow, so each terminal transition is
+        // counted exactly once.
+        if self.store.set_workflow_status(workflow_id, status).await? {
+            match status {
+                WorkflowStatus::Completed => EngineStats::incr(&self.stats.workflows_completed),
+                _ => EngineStats::incr(&self.stats.workflows_failed),
+            }
         }
         Ok(())
     }
@@ -313,16 +323,33 @@ where
             result: None,
             metadata: step.metadata.clone(),
             tenant_id: wf.tenant_id.clone(),
+            idempotency_key: None,
         };
 
-        // Persist the job and the step->job link BEFORE publishing the message.
-        // `advance()` treats a step with a linked job as already scheduled, so
-        // linking first means a crash before `send` can at worst stall this step
+        // Persist the job, then CLAIM the step->job link, and only publish if
+        // the claim won. Two workers completing sibling steps concurrently both
+        // run `advance` and can both see a join step as unscheduled; the atomic
+        // claim guarantees exactly one of them enqueues it. Linking before
+        // `send` also means a crash here can at worst stall this step
         // (recoverable) rather than enqueue it twice (duplicate execution).
         self.store.create_job(&job).await?;
-        self.store
+        let claimed = self
+            .store
             .link_step_job(&wf.id, &step.name, &job.id)
             .await?;
+        if !claimed {
+            // Lost the race: retire our duplicate job row and enqueue nothing.
+            let _ = self
+                .store
+                .update_status(
+                    &job.id,
+                    JobStatus::Cancelled,
+                    Some("superseded: step was scheduled by a concurrent advance"),
+                    None,
+                )
+                .await;
+            return Ok(job.id);
+        }
         let msg = QueueMessage::for_job(&job);
         self.queue
             .send(&job.queue_name, &msg, job.config.priority)

@@ -24,6 +24,140 @@ pub enum Command {
     Spec(SpecArgs),
     /// Apply database migrations and exit.
     Migrate(DbArgs),
+    /// Create, inspect, cancel, or await jobs on a running server.
+    #[command(subcommand)]
+    Job(JobCommand),
+    /// Create, inspect, or cancel workflows on a running server.
+    #[command(subcommand)]
+    Workflow(WorkflowCommand),
+    /// List the task handlers registered in the server.
+    Tasks(ClientArgs),
+    /// Show the server's engine counters.
+    Stats(ClientArgs),
+}
+
+/// How to reach a running QueueFlow server.
+#[derive(Args, Debug, Clone)]
+pub struct ClientArgs {
+    /// Base URL of the QueueFlow API.
+    #[arg(
+        long,
+        env = "QUEUEFLOW_SERVER_URL",
+        default_value = "http://localhost:8000",
+        global = false
+    )]
+    pub server_url: String,
+
+    /// Bearer token for the API.
+    #[arg(long, env = "QUEUEFLOW_TOKEN", default_value = "dev")]
+    pub token: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum JobCommand {
+    /// Enqueue a job; prints its id (or the original id on an idempotent replay).
+    Create {
+        #[command(flatten)]
+        client: ClientArgs,
+        /// Task handler name.
+        #[arg(long)]
+        task: String,
+        /// JSON object payload.
+        #[arg(long, default_value = "{}")]
+        payload: String,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long)]
+        max_retries: Option<u32>,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+        /// Idempotency key: re-running the same command returns the same job.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Block until the job reaches a terminal state, then print it.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Fetch one job as JSON.
+    Get {
+        #[command(flatten)]
+        client: ClientArgs,
+        id: String,
+    },
+    /// List jobs as JSON.
+    List {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long)]
+        limit: Option<i64>,
+        #[arg(long)]
+        offset: Option<i64>,
+        /// Also compute the exact total (extra count query server-side).
+        #[arg(long)]
+        include_total: bool,
+    },
+    /// Cancel a job (409 if it already finished).
+    Cancel {
+        #[command(flatten)]
+        client: ClientArgs,
+        id: String,
+    },
+    /// Wait for a job to finish and print it.
+    Watch {
+        #[command(flatten)]
+        client: ClientArgs,
+        id: String,
+        /// Give up after this many seconds.
+        #[arg(long, default_value_t = 600)]
+        timeout_secs: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WorkflowCommand {
+    /// Create a workflow from a JSON definition; prints its id.
+    Create {
+        #[command(flatten)]
+        client: ClientArgs,
+        /// Path to a JSON file with the CreateWorkflowRequest body ('-' for stdin).
+        #[arg(long)]
+        file: String,
+    },
+    /// Fetch one workflow as JSON.
+    Get {
+        #[command(flatten)]
+        client: ClientArgs,
+        id: String,
+    },
+    /// List workflows as JSON.
+    List {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        limit: Option<i64>,
+        #[arg(long)]
+        offset: Option<i64>,
+        #[arg(long)]
+        include_total: bool,
+    },
+    /// Cancel a workflow and its unscheduled steps.
+    Cancel {
+        #[command(flatten)]
+        client: ClientArgs,
+        id: String,
+    },
+    /// Print the workflow DAG as a Mermaid document.
+    Diagram {
+        #[command(flatten)]
+        client: ClientArgs,
+        id: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]

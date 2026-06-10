@@ -21,6 +21,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match &self.0 {
             e if e.is_not_found() => (StatusCode::NOT_FOUND, e.to_string()),
             e if e.is_bad_request() => (StatusCode::BAD_REQUEST, e.to_string()),
+            EngineError::Conflict(_) => (StatusCode::CONFLICT, self.0.to_string()),
             EngineError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             EngineError::Forbidden => (StatusCode::FORBIDDEN, "access denied".to_string()),
             other => {

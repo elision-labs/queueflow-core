@@ -1,10 +1,15 @@
 //! axum handlers. Each is annotated with `#[utoipa::path]` so the OpenAPI spec
 //! is generated from the same source of truth that serves the requests.
 
+use std::convert::Infallible;
+use std::time::Duration;
+
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use futures::stream::Stream;
 use queueflow_core::{CreateWorkflowRequest, EngineError, Job, Workflow};
 
 use crate::auth::Tenant;
@@ -13,6 +18,10 @@ use crate::error::ApiError;
 use crate::ApiState;
 
 const MAX_BATCH: usize = 1000;
+
+/// How often the SSE job stream re-reads the job, and its maximum lifetime.
+const SSE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SSE_MAX_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
 /// Enforce tenant ownership of a resource. A resource with no tenant is treated
 /// as accessible (e.g. created out-of-band); a mismatched tenant is forbidden.
@@ -28,8 +37,13 @@ fn ensure_owner(owner: Option<&str>, tenant: &Tenant) -> Result<(), ApiError> {
 #[utoipa::path(
     post, path = "/api/v1/jobs", tag = "jobs", operation_id = "createJob",
     request_body = CreateJobRequest,
+    params(
+        ("Idempotency-Key" = Option<String>, Header,
+         description = "Optional client-supplied key making this create idempotent per tenant: \
+                        retrying with the same key returns the original job instead of creating a duplicate."),
+    ),
     responses(
-        (status = 201, description = "Job created", body = CreateJobResponse),
+        (status = 201, description = "Job created (or replayed idempotently)", body = CreateJobResponse),
         (status = 400, description = "Invalid request", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
     ),
@@ -38,15 +52,29 @@ fn ensure_owner(owner: Option<&str>, tenant: &Tenant) -> Result<(), ApiError> {
 pub async fn create_job(
     State(s): State<ApiState>,
     Extension(t): Extension<Tenant>,
+    headers: HeaderMap,
     Json(req): Json<CreateJobRequest>,
 ) -> Result<Response, ApiError> {
     if req.task_name.trim().is_empty() {
         return Err(EngineError::Validation("task_name is required".into()).into());
     }
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(String::from);
     let (config, queue) = req.config.unwrap_or_default().resolve();
     let id = s
         .engine
-        .enqueue(&req.task_name, req.payload, config, queue, Some(t.0))
+        .enqueue(
+            &req.task_name,
+            req.payload,
+            config,
+            queue,
+            Some(t.0),
+            idempotency_key,
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(CreateJobResponse { job_id: id })).into_response())
 }
@@ -109,14 +137,13 @@ pub async fn list_jobs(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListJobsResponse>, ApiError> {
     let filter = q.into_filter(Some(t.0));
-    let (jobs, total) = s.engine.list_jobs(filter.clone()).await?;
-    let has_more = filter.offset + (jobs.len() as i64) < total;
+    let page = s.engine.list_jobs(filter.clone()).await?;
     Ok(Json(ListJobsResponse {
-        jobs,
-        total,
+        jobs: page.items,
+        total: page.total,
         limit: filter.limit,
         offset: filter.offset,
-        has_more,
+        has_more: page.has_more,
     }))
 }
 
@@ -210,14 +237,13 @@ pub async fn list_workflows(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListWorkflowsResponse>, ApiError> {
     let filter = q.into_filter(Some(t.0));
-    let (workflows, total) = s.engine.list_workflows(filter.clone()).await?;
-    let has_more = filter.offset + (workflows.len() as i64) < total;
+    let page = s.engine.list_workflows(filter.clone()).await?;
     Ok(Json(ListWorkflowsResponse {
-        workflows,
-        total,
+        workflows: page.items,
+        total: page.total,
         limit: filter.limit,
         offset: filter.offset,
-        has_more,
+        has_more: page.has_more,
     }))
 }
 
@@ -293,6 +319,164 @@ pub async fn get_workflow_diagram(
     }))
 }
 
+/// Stream a job's status transitions as Server-Sent Events until it reaches a
+/// terminal state. Lets clients await completion without polling the REST
+/// endpoint themselves.
+#[utoipa::path(
+    get, path = "/api/v1/jobs/{id}/events", tag = "jobs", operation_id = "streamJobEvents",
+    params(("id" = String, Path, description = "Job id")),
+    responses(
+        (status = 200, description = "SSE stream; each `status` event carries the full job JSON. \
+                                      Closes after the job reaches a terminal state.",
+         content_type = "text/event-stream", body = String),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn stream_job_events(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    // Validate existence and ownership up front so errors are proper HTTP
+    // statuses rather than a silently empty stream.
+    let job = s.engine.get_job(&id).await?;
+    ensure_owner(job.tenant_id.as_deref(), &t)?;
+
+    let engine = s.engine.clone();
+    let stream = futures::stream::unfold(
+        (engine, id, None::<String>, std::time::Instant::now(), false),
+        |(engine, id, last_status, started, done)| async move {
+            if done || started.elapsed() > SSE_MAX_LIFETIME {
+                return None;
+            }
+            loop {
+                match engine.get_job(&id).await {
+                    Ok(job) => {
+                        let status = job.status.as_str().to_string();
+                        if last_status.as_deref() != Some(&status) {
+                            let event = Event::default()
+                                .event("status")
+                                .data(serde_json::to_string(&job).unwrap_or_default());
+                            let terminal = job.status.is_terminal();
+                            return Some((
+                                Ok(event),
+                                (engine, id, Some(status), started, terminal),
+                            ));
+                        }
+                    }
+                    Err(_) => return None, // job deleted: end the stream
+                }
+                if started.elapsed() > SSE_MAX_LIFETIME {
+                    return None;
+                }
+                tokio::time::sleep(SSE_POLL_INTERVAL).await;
+            }
+        },
+    );
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+// ---- Remote worker protocol --------------------------------------------------
+//
+// Workers in any language lease jobs, heartbeat while running, and report
+// completion/failure. Leasing is queue-scoped, not tenant-scoped: workers are
+// deployment infrastructure (they execute arbitrary tenants' jobs), unlike the
+// tenant-scoped producer endpoints above.
+
+#[utoipa::path(
+    post, path = "/api/v1/queues/{queue}/lease", tag = "worker", operation_id = "leaseJobs",
+    params(("queue" = String, Path, description = "Queue to lease from")),
+    request_body = LeaseJobsRequest,
+    responses(
+        (status = 200, description = "Zero or more leased jobs (empty if none became available within wait_secs)", body = LeaseJobsResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn lease_jobs(
+    State(s): State<ApiState>,
+    Path(queue): Path<String>,
+    Json(req): Json<LeaseJobsRequest>,
+) -> Result<Json<LeaseJobsResponse>, ApiError> {
+    let count = req.max_jobs.unwrap_or(1).clamp(1, 100);
+    let lease_secs = req.lease_secs.unwrap_or(30).clamp(1, 3600);
+    let wait_secs = req.wait_secs.unwrap_or(0).min(30);
+    let jobs = s
+        .engine
+        .lease_jobs(&queue, count, lease_secs, wait_secs)
+        .await?;
+    Ok(Json(LeaseJobsResponse { jobs }))
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/jobs/{id}/complete", tag = "worker", operation_id = "completeJob",
+    params(("id" = String, Path, description = "Job id")),
+    request_body = CompleteJobRequest,
+    responses(
+        (status = 204, description = "Completed (idempotent: replaying a finished lease also succeeds)"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn complete_job(
+    State(s): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<CompleteJobRequest>,
+) -> Result<StatusCode, ApiError> {
+    s.engine
+        .complete_leased(&req.queue, req.lease_id, &id, req.result)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/jobs/{id}/fail", tag = "worker", operation_id = "failJob",
+    params(("id" = String, Path, description = "Job id")),
+    request_body = FailJobRequest,
+    responses(
+        (status = 204, description = "Failure recorded; the job is retried or dead-lettered per its config"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn fail_job(
+    State(s): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<FailJobRequest>,
+) -> Result<StatusCode, ApiError> {
+    s.engine
+        .fail_leased(&req.queue, req.lease_id, &id, &req.error, req.retryable)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/jobs/{id}/heartbeat", tag = "worker", operation_id = "heartbeatJob",
+    params(("id" = String, Path, description = "Job id")),
+    request_body = HeartbeatRequest,
+    responses(
+        (status = 204, description = "Lease extended"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn heartbeat_job(
+    State(s): State<ApiState>,
+    Path(_id): Path<String>,
+    Json(req): Json<HeartbeatRequest>,
+) -> Result<StatusCode, ApiError> {
+    let extend = req.extend_secs.clamp(1, 3600);
+    s.engine
+        .heartbeat_lease(&req.queue, req.lease_id, extend)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---- System ----------------------------------------------------------------
 
 #[utoipa::path(
@@ -308,7 +492,11 @@ pub async fn list_tasks(State(s): State<ApiState>) -> Json<TasksResponse> {
 
 #[utoipa::path(
     get, path = "/api/v1/stats", tag = "system", operation_id = "getStats",
-    responses((status = 200, description = "Engine counters", body = queueflow_core::StatsSnapshot)),
+    responses((status = 200,
+        description = "Engine counters. Process-local and reset on restart: in a split \
+                       api/worker deployment this reflects only the process serving the \
+                       request; query the database for fleet-wide history.",
+        body = queueflow_core::StatsSnapshot)),
     security(("bearerAuth" = []))
 )]
 pub async fn get_stats(State(s): State<ApiState>) -> Json<queueflow_core::StatsSnapshot> {

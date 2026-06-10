@@ -20,16 +20,22 @@ pub fn build_router(state: ApiState) -> Router {
     let v1 = Router::new()
         .route("/jobs", post(handlers::create_job).get(handlers::list_jobs))
         .route("/jobs/batch", post(handlers::create_batch_jobs))
-        .route("/jobs/:id", get(handlers::get_job))
-        .route("/jobs/:id/cancel", post(handlers::cancel_job))
+        .route("/jobs/{id}", get(handlers::get_job))
+        .route("/jobs/{id}/cancel", post(handlers::cancel_job))
+        .route("/jobs/{id}/events", get(handlers::stream_job_events))
+        // Remote worker protocol: lease / heartbeat / complete / fail.
+        .route("/queues/{queue}/lease", post(handlers::lease_jobs))
+        .route("/jobs/{id}/complete", post(handlers::complete_job))
+        .route("/jobs/{id}/fail", post(handlers::fail_job))
+        .route("/jobs/{id}/heartbeat", post(handlers::heartbeat_job))
         .route(
             "/workflows",
             post(handlers::create_workflow).get(handlers::list_workflows),
         )
-        .route("/workflows/:id", get(handlers::get_workflow))
-        .route("/workflows/:id/cancel", post(handlers::cancel_workflow))
+        .route("/workflows/{id}", get(handlers::get_workflow))
+        .route("/workflows/{id}/cancel", post(handlers::cancel_workflow))
         .route(
-            "/workflows/:id/diagram",
+            "/workflows/{id}/diagram",
             get(handlers::get_workflow_diagram),
         )
         .route("/tasks", get(handlers::list_tasks))

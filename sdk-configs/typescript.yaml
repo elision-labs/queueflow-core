@@ -1,3 +1,8 @@
+# DEPRECATED / UNUSED: the TypeScript SDK (../queueflow-sdk-nodejs) is now
+# hand-written for better ergonomics and is no longer produced by
+# openapi-generator. This config is kept only for reference; `make sdks` and
+# scripts/generate-sdks.sh skip the `typescript` target.
+#
 # openapi-generator config for the TypeScript SDK (Fetch API, no axios).
 generatorName: typescript-fetch
 additionalProperties:

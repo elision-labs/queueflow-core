@@ -42,7 +42,17 @@ impl EngineStats {
 }
 
 /// Plain snapshot of [`EngineStats`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 pub struct StatsSnapshot {
     pub jobs_created: u64,
     pub jobs_completed: u64,

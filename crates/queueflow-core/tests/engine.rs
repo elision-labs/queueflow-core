@@ -374,6 +374,136 @@ async fn redelivered_terminal_job_is_not_reprocessed() {
 }
 
 #[tokio::test]
+async fn long_running_job_is_not_redelivered_mid_flight() {
+    // The default visibility timeout (30s) is shorter than this job's timeout.
+    // The engine must extend the lease when it starts the job, otherwise a
+    // second worker would lease and run the same job concurrently.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let g = gate.clone();
+    let h = harness(move |b| {
+        b.register_fn("slow", move |_p| {
+            let g = g.clone();
+            async move {
+                g.notified().await;
+                Ok(Map::new())
+            }
+        })
+    });
+
+    let id = h
+        .engine
+        .enqueue(
+            "slow",
+            Map::new(),
+            EnqueueOptions {
+                config: Some(JobConfig {
+                    timeout_secs: 600,
+                    ..deterministic_cfg(0)
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let eng = h.engine.clone();
+    let worker = tokio::spawn(async move { eng.process_once("default").await.unwrap() });
+    // Let the worker lease the message and enter the handler.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // 31 virtual seconds later, the original 30s lease would have expired; the
+    // extended lease (timeout + grace) keeps the message invisible.
+    h.clock.advance_secs(31);
+    assert!(
+        h.queue.read("default", 1, 1).await.unwrap().is_empty(),
+        "in-flight job must not be redeliverable"
+    );
+
+    gate.notify_one();
+    assert!(worker.await.unwrap());
+    assert_eq!(
+        h.engine.get_job(&id).await.unwrap().status,
+        JobStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_finished_job_is_a_conflict_and_keeps_history() {
+    let h = harness(|b| b.register("echo", builtin::echo()));
+    let id = h
+        .engine
+        .enqueue("echo", Map::new(), Default::default())
+        .await
+        .unwrap();
+    assert!(h.engine.process_once("default").await.unwrap());
+    assert_eq!(
+        h.engine.get_job(&id).await.unwrap().status,
+        JobStatus::Completed
+    );
+
+    let err = h.engine.cancel_job(&id).await.unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "got: {err}");
+    // The terminal status must be untouched.
+    assert_eq!(
+        h.engine.get_job(&id).await.unwrap().status,
+        JobStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn idempotency_key_dedupes_enqueue() {
+    let h = harness(|b| b.register("echo", builtin::echo()));
+    let opts = || EnqueueOptions {
+        idempotency_key: Some("once-please".into()),
+        tenant_id: Some("t1".into()),
+        ..Default::default()
+    };
+    let first = h.engine.enqueue("echo", Map::new(), opts()).await.unwrap();
+    let second = h.engine.enqueue("echo", Map::new(), opts()).await.unwrap();
+    assert_eq!(first, second);
+
+    // Exactly one message was published.
+    assert!(h.engine.process_once("default").await.unwrap());
+    assert!(!h.engine.process_once("default").await.unwrap());
+    assert_eq!(h.engine.stats().snapshot().jobs_created, 1);
+}
+
+#[tokio::test]
+async fn remote_lease_complete_and_fail_roundtrip() {
+    // The remote worker protocol must share the local loop's semantics:
+    // lease marks running, complete records the result, fail applies retry
+    // policy, and a replayed complete is a no-op.
+    let h = harness(|b| b);
+    let id = h
+        .engine
+        .enqueue("external-task", Map::new(), Default::default())
+        .await
+        .unwrap();
+
+    let leases = h.engine.lease_jobs("default", 5, 30, 0).await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].job.id, id);
+    assert_eq!(leases[0].job.status, JobStatus::Running);
+
+    let mut result = Map::new();
+    result.insert("answer".into(), json!(42));
+    h.engine
+        .complete_leased("default", leases[0].lease_id, &id, result.clone())
+        .await
+        .unwrap();
+    let job = h.engine.get_job(&id).await.unwrap();
+    assert_eq!(job.status, JobStatus::Completed);
+    assert_eq!(job.result.unwrap()["answer"], json!(42));
+
+    // Replaying the completion (client retry after a network blip) is fine.
+    h.engine
+        .complete_leased("default", leases[0].lease_id, &id, result)
+        .await
+        .unwrap();
+    assert_eq!(h.engine.stats().snapshot().jobs_completed, 1);
+}
+
+#[tokio::test]
 async fn batch_enqueue_creates_all_jobs() {
     let h = harness(|b| b.register("echo", builtin::echo()));
     let ids = h
@@ -390,9 +520,18 @@ async fn batch_enqueue_creates_all_jobs() {
         .unwrap();
     assert_eq!(ids.len(), 3);
 
-    let (jobs, total) = h.engine.list_jobs(&ListFilter::default()).await.unwrap();
-    assert_eq!(total, 3);
-    assert!(jobs
+    let page = h
+        .engine
+        .list_jobs(&ListFilter {
+            include_total: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.total, Some(3));
+    assert!(!page.has_more);
+    assert!(page
+        .items
         .iter()
         .all(|j| j.tenant_id.as_deref() == Some("tenant-a")));
 }

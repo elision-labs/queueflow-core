@@ -80,7 +80,11 @@ pub struct CreateBatchJobsResponse {
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ListJobsResponse {
     pub jobs: Vec<Job>,
-    pub total: i64,
+    /// Exact total match count. Only present when the request set
+    /// `include_total=true`; computing it costs a full count over the filtered
+    /// set, so it is opt-in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<i64>,
     pub limit: i64,
     pub offset: i64,
     pub has_more: bool,
@@ -94,7 +98,9 @@ pub struct CreateWorkflowResponse {
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ListWorkflowsResponse {
     pub workflows: Vec<Workflow>,
-    pub total: i64,
+    /// Exact total match count; only present when `include_total=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<i64>,
     pub limit: i64,
     pub offset: i64,
     pub has_more: bool,
@@ -164,6 +170,9 @@ pub struct ListQuery {
     pub offset: Option<i64>,
     /// `created_at ASC` or `created_at DESC` (default DESC).
     pub order_by: Option<String>,
+    /// Include the exact `total` count in the response (default false; the
+    /// count is an extra full scan over the filtered set).
+    pub include_total: Option<bool>,
 }
 
 impl ListQuery {
@@ -179,6 +188,67 @@ impl ListQuery {
             limit,
             offset,
             order_desc,
+            include_total: self.include_total.unwrap_or(false),
         }
     }
+}
+
+// ---- Remote worker protocol --------------------------------------------------
+
+/// Body for `POST /api/v1/queues/{queue}/lease`.
+#[derive(Clone, Debug, Default, Deserialize, ToSchema)]
+pub struct LeaseJobsRequest {
+    /// Maximum jobs to lease in one call (1..=100, default 1).
+    #[serde(default)]
+    pub max_jobs: Option<usize>,
+    /// Lease duration in seconds (1..=3600, default 30). Heartbeat to extend.
+    #[serde(default)]
+    pub lease_secs: Option<u32>,
+    /// Long-poll wait when the queue is empty, in seconds (0..=30, default 0).
+    #[serde(default)]
+    pub wait_secs: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct LeaseJobsResponse {
+    pub jobs: Vec<queueflow_core::LeasedJob>,
+}
+
+/// Body for `POST /api/v1/jobs/{id}/complete`.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct CompleteJobRequest {
+    /// Queue the lease was taken from.
+    pub queue: String,
+    /// The lease handle returned by the lease call.
+    pub lease_id: i64,
+    /// Handler result, recorded on the job and merged into workflow context.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub result: Map,
+}
+
+/// Body for `POST /api/v1/jobs/{id}/fail`.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct FailJobRequest {
+    pub queue: String,
+    pub lease_id: i64,
+    /// Human-readable failure reason.
+    pub error: String,
+    /// Whether the engine may retry (subject to the job's max_retries).
+    /// Defaults to true; send false for permanent failures (e.g. bad input).
+    #[serde(default = "default_true")]
+    pub retryable: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Body for `POST /api/v1/jobs/{id}/heartbeat`.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct HeartbeatRequest {
+    pub queue: String,
+    pub lease_id: i64,
+    /// New lease duration in seconds, measured from now (1..=3600).
+    pub extend_secs: u32,
 }

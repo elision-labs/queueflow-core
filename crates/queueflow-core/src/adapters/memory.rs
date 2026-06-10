@@ -60,6 +60,24 @@ impl InMemoryJobStore {
     }
 }
 
+/// Slice a sorted, fully-matched result set into a [`Page`] honouring the
+/// filter's offset/limit and `include_total`.
+fn paginate<T>(matched: Vec<T>, filter: &ListFilter, total: i64) -> Page<T> {
+    let start = filter.offset.max(0) as usize;
+    let lim = if filter.limit <= 0 {
+        50
+    } else {
+        filter.limit as usize
+    };
+    let has_more = matched.len() > start + lim;
+    let items = matched.into_iter().skip(start).take(lim).collect();
+    Page {
+        items,
+        has_more,
+        total: filter.include_total.then_some(total),
+    }
+}
+
 fn matches_filter(job: &Job, f: &ListFilter) -> bool {
     if let Some(t) = &f.tenant_id {
         if job.tenant_id.as_deref() != Some(t.as_str()) {
@@ -81,13 +99,35 @@ fn matches_filter(job: &Job, f: &ListFilter) -> bool {
 
 #[async_trait]
 impl JobStore for InMemoryJobStore {
-    async fn create_job(&self, job: &Job) -> Result<(), StorageError> {
-        self.inner
+    async fn create_job(&self, job: &Job) -> Result<bool, StorageError> {
+        let mut guard = self.inner.jobs.lock().unwrap();
+        if let Some(key) = &job.idempotency_key {
+            let duplicate = guard.values().any(|j| {
+                j.idempotency_key.as_deref() == Some(key.as_str()) && j.tenant_id == job.tenant_id
+            });
+            if duplicate {
+                return Ok(false);
+            }
+        }
+        guard.insert(job.id.clone(), job.clone());
+        Ok(true)
+    }
+
+    async fn find_job_by_idempotency_key(
+        &self,
+        tenant_id: Option<&str>,
+        key: &str,
+    ) -> Result<Option<Job>, StorageError> {
+        Ok(self
+            .inner
             .jobs
             .lock()
             .unwrap()
-            .insert(job.id.clone(), job.clone());
-        Ok(())
+            .values()
+            .find(|j| {
+                j.idempotency_key.as_deref() == Some(key) && j.tenant_id.as_deref() == tenant_id
+            })
+            .cloned())
     }
 
     async fn batch_create_jobs(&self, jobs: &[Job]) -> Result<Vec<String>, StorageError> {
@@ -110,7 +150,7 @@ impl JobStore for InMemoryJobStore {
             .ok_or_else(|| StorageError::JobNotFound(id.to_string()))
     }
 
-    async fn list_jobs(&self, filter: &ListFilter) -> Result<(Vec<Job>, i64), StorageError> {
+    async fn list_jobs(&self, filter: &ListFilter) -> Result<Page<Job>, StorageError> {
         let guard = self.inner.jobs.lock().unwrap();
         let mut matched: Vec<Job> = guard
             .values()
@@ -125,14 +165,7 @@ impl JobStore for InMemoryJobStore {
                 a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id))
             }
         });
-        let start = filter.offset.max(0) as usize;
-        let lim = if filter.limit <= 0 {
-            50
-        } else {
-            filter.limit as usize
-        };
-        let page = matched.into_iter().skip(start).take(lim).collect();
-        Ok((page, total))
+        Ok(paginate(matched, filter, total))
     }
 
     async fn update_status(
@@ -161,6 +194,20 @@ impl JobStore for InMemoryJobStore {
             job.result = Some(r.clone());
         }
         Ok(())
+    }
+
+    async fn cancel_job_if_active(&self, id: &str, reason: &str) -> Result<bool, StorageError> {
+        let mut guard = self.inner.jobs.lock().unwrap();
+        let Some(job) = guard.get_mut(id) else {
+            return Ok(false);
+        };
+        if job.status.is_terminal() {
+            return Ok(false);
+        }
+        job.status = JobStatus::Cancelled;
+        job.error_message = Some(reason.to_string());
+        job.completed_at = Some(Utc::now());
+        Ok(true)
     }
 
     async fn mark_retrying(
@@ -228,10 +275,7 @@ impl JobStore for InMemoryJobStore {
             .ok_or_else(|| StorageError::WorkflowNotFound(id.to_string()))
     }
 
-    async fn list_workflows(
-        &self,
-        filter: &ListFilter,
-    ) -> Result<(Vec<Workflow>, i64), StorageError> {
+    async fn list_workflows(&self, filter: &ListFilter) -> Result<Page<Workflow>, StorageError> {
         let guard = self.inner.workflows.lock().unwrap();
         let mut matched: Vec<Workflow> = guard
             .values()
@@ -257,14 +301,7 @@ impl JobStore for InMemoryJobStore {
                 a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id))
             }
         });
-        let start = filter.offset.max(0) as usize;
-        let lim = if filter.limit <= 0 {
-            50
-        } else {
-            filter.limit as usize
-        };
-        let page = matched.into_iter().skip(start).take(lim).collect();
-        Ok((page, total))
+        Ok(paginate(matched, filter, total))
     }
 
     async fn workflow_step_statuses(
@@ -292,7 +329,7 @@ impl JobStore for InMemoryJobStore {
         workflow_id: &str,
         step_name: &str,
         job_id: &str,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         let mut steps = self.inner.steps.lock().unwrap();
         let st = steps
             .get_mut(&(workflow_id.to_string(), step_name.to_string()))
@@ -300,8 +337,11 @@ impl JobStore for InMemoryJobStore {
                 workflow: workflow_id.to_string(),
                 step: step_name.to_string(),
             })?;
+        if st.job_id.is_some() {
+            return Ok(false);
+        }
         st.job_id = Some(job_id.to_string());
-        Ok(())
+        Ok(true)
     }
 
     async fn set_step_status(
@@ -329,11 +369,15 @@ impl JobStore for InMemoryJobStore {
         &self,
         workflow_id: &str,
         status: WorkflowStatus,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         let mut guard = self.inner.workflows.lock().unwrap();
         let wf = guard
             .get_mut(workflow_id)
             .ok_or_else(|| StorageError::WorkflowNotFound(workflow_id.to_string()))?;
+        // A terminal workflow is never overwritten.
+        if wf.status.is_terminal() || wf.status == status {
+            return Ok(false);
+        }
         wf.status = status;
         let now = Utc::now();
         if status == WorkflowStatus::Running && wf.started_at.is_none() {
@@ -342,7 +386,7 @@ impl JobStore for InMemoryJobStore {
         if status.is_terminal() {
             wf.completed_at = Some(now);
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn merge_workflow_context(
@@ -421,6 +465,18 @@ impl MessageQueue for InMemoryMessageQueue {
         Ok(self.push(queue, msg, priority, 0))
     }
 
+    async fn send_batch(
+        &self,
+        queue: &str,
+        msgs: &[QueueMessage],
+        priority: i32,
+    ) -> Result<Vec<i64>, QueueError> {
+        Ok(msgs
+            .iter()
+            .map(|m| self.push(queue, m, priority, 0))
+            .collect())
+    }
+
     async fn send_delayed(
         &self,
         queue: &str,
@@ -471,6 +527,36 @@ impl MessageQueue for InMemoryMessageQueue {
             });
         }
         Ok(out)
+    }
+
+    async fn read_with_poll(
+        &self,
+        queue: &str,
+        vt_secs: u32,
+        count: usize,
+        poll_secs: u32,
+    ) -> Result<Vec<ReadMessage>, QueueError> {
+        // Wall-clock polling loop mirroring pgmq.read_with_poll. Message
+        // *visibility* still follows the injected clock; only the waiting is
+        // real time, so deterministic tests should use `read` directly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(poll_secs as u64);
+        loop {
+            let msgs = self.read(queue, vt_secs, count).await?;
+            if !msgs.is_empty() || std::time::Instant::now() >= deadline {
+                return Ok(msgs);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn set_vt(&self, queue: &str, msg_id: i64, vt_secs: u32) -> Result<(), QueueError> {
+        let now = self.clock.now();
+        if let Some(q) = self.queues.lock().unwrap().get_mut(queue) {
+            if let Some(m) = q.get_mut(&msg_id) {
+                m.visible_at = now + Duration::seconds(vt_secs as i64);
+            }
+        }
+        Ok(())
     }
 
     async fn delete(&self, queue: &str, msg_id: i64) -> Result<(), QueueError> {
@@ -555,6 +641,53 @@ mod tests {
         q.send("default", &msg("high"), 10).await.unwrap();
         let read = q.read("default", 30, 1).await.unwrap();
         assert_eq!(read[0].message.job_id, "high");
+    }
+
+    #[tokio::test]
+    async fn set_vt_extends_a_lease() {
+        let clock = Arc::new(TestClock::epoch());
+        let q = InMemoryMessageQueue::new(clock.clone());
+        let id = q.send("default", &msg("a"), 0).await.unwrap();
+
+        // Lease for 30s, then extend to 600s.
+        assert_eq!(q.read("default", 30, 1).await.unwrap().len(), 1);
+        q.set_vt("default", id, 600).await.unwrap();
+
+        // Past the original lease the message stays hidden...
+        clock.advance_secs(31);
+        assert!(q.read("default", 30, 1).await.unwrap().is_empty());
+        // ...until the extended lease elapses.
+        clock.advance_secs(600);
+        assert_eq!(q.read("default", 30, 1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_with_poll_returns_when_a_message_arrives() {
+        let clock = Arc::new(TestClock::epoch());
+        let q = InMemoryMessageQueue::new(clock.clone());
+
+        let q2 = q.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            q2.send("default", &msg("late"), 0).await.unwrap();
+        });
+
+        let got = q.read_with_poll("default", 30, 1, 5).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].message.job_id, "late");
+    }
+
+    #[tokio::test]
+    async fn send_batch_enqueues_in_order() {
+        let clock = Arc::new(TestClock::epoch());
+        let q = InMemoryMessageQueue::new(clock);
+        let ids = q
+            .send_batch("default", &[msg("a"), msg("b"), msg("c")], 0)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(q.queue_depth("default").await.unwrap(), 3);
     }
 
     #[tokio::test]

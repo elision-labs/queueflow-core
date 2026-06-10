@@ -7,7 +7,7 @@ use crate::workflow::dag::CycleError;
 ///
 /// The HTTP layer maps these to status codes (see `queueflow-api`):
 /// `NotFound` → 404, `Validation`/`Workflow` → 400, `Unauthorized` → 401,
-/// `Forbidden` → 403, everything else → 500.
+/// `Forbidden` → 403, `Conflict` → 409, everything else → 500.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error(transparent)]
@@ -24,6 +24,9 @@ pub enum EngineError {
 
     #[error("not found: {0}")]
     NotFound(String),
+
+    #[error("conflict: {0}")]
+    Conflict(String),
 
     #[error("unauthorized")]
     Unauthorized,

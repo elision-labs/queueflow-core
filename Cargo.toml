@@ -3,13 +3,14 @@ resolver = "2"
 members = [
     "crates/queueflow-core",
     "crates/queueflow-api",
+    "crates/queueflow-client",
     "crates/queueflow-server",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.96"
 license = "MIT"
 repository = "https://github.com/sjriddle/queueflow-core"
 homepage = "https://queueflow.dev"
@@ -25,14 +26,15 @@ futures = "0.3"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde", "clock"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-sqlx = { version = "0.8", default-features = false, features = [
-    "runtime-tokio-rustls",
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
     "postgres",
     "json",
     "uuid",
@@ -40,17 +42,18 @@ sqlx = { version = "0.8", default-features = false, features = [
     "macros",
     "migrate",
 ] }
-axum = "0.7"
+axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
 utoipa = { version = "5", features = ["axum_extras", "chrono", "yaml"] }
 clap = { version = "4", features = ["derive", "env"] }
-prometheus = "0.13"
-rand = "0.8"
+rand = "0.10"
+reqwest = { version = "0.13", features = ["json", "query"] }
 
 # Internal crates
 queueflow-core = { path = "crates/queueflow-core" }
 queueflow-api = { path = "crates/queueflow-api" }
+queueflow-client = { path = "crates/queueflow-client" }
 
 [profile.release]
 opt-level = 3

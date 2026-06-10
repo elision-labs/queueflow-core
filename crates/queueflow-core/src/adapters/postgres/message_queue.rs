@@ -42,6 +42,20 @@ fn dq<E: std::fmt::Display>(e: E) -> QueueError {
     QueueError::Delivery(e.to_string())
 }
 
+fn read_message_from_row(row: &sqlx::postgres::PgRow) -> Result<ReadMessage, QueueError> {
+    let msg_id: i64 = row.try_get("msg_id").map_err(dq)?;
+    let read_ct: i32 = row.try_get("read_ct").map_err(dq)?;
+    let enqueued_at: DateTime<Utc> = row.try_get("enqueued_at").map_err(dq)?;
+    let body: serde_json::Value = row.try_get("message").map_err(dq)?;
+    let message: QueueMessage = serde_json::from_value(body)?;
+    Ok(ReadMessage {
+        msg_id,
+        message,
+        read_count: read_ct.max(0) as u32,
+        enqueued_at,
+    })
+}
+
 #[async_trait]
 impl MessageQueue for PostgresMessageQueue {
     async fn send(
@@ -58,6 +72,30 @@ impl MessageQueue for PostgresMessageQueue {
             .await
             .map_err(dq)?;
         row.try_get::<i64, _>("msg_id").map_err(dq)
+    }
+
+    async fn send_batch(
+        &self,
+        queue: &str,
+        msgs: &[QueueMessage],
+        _priority: i32,
+    ) -> Result<Vec<i64>, QueueError> {
+        if msgs.is_empty() {
+            return Ok(vec![]);
+        }
+        let bodies = msgs
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows = sqlx::query("SELECT pgmq.send_batch($1, $2::jsonb[]) AS msg_id")
+            .bind(queue)
+            .bind(&bodies)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(dq)?;
+        rows.iter()
+            .map(|r| r.try_get::<i64, _>("msg_id").map_err(dq))
+            .collect()
     }
 
     async fn send_delayed(
@@ -93,22 +131,44 @@ impl MessageQueue for PostgresMessageQueue {
         .fetch_all(&self.pool)
         .await
         .map_err(dq)?;
+        rows.iter().map(read_message_from_row).collect()
+    }
 
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let msg_id: i64 = row.try_get("msg_id").map_err(dq)?;
-            let read_ct: i32 = row.try_get("read_ct").map_err(dq)?;
-            let enqueued_at: DateTime<Utc> = row.try_get("enqueued_at").map_err(dq)?;
-            let body: serde_json::Value = row.try_get("message").map_err(dq)?;
-            let message: QueueMessage = serde_json::from_value(body)?;
-            out.push(ReadMessage {
-                msg_id,
-                message,
-                read_count: read_ct.max(0) as u32,
-                enqueued_at,
-            });
-        }
-        Ok(out)
+    /// Server-side long poll: `pgmq.read_with_poll` blocks inside Postgres
+    /// until a message arrives or `poll_secs` elapses, so idle workers issue
+    /// one query per poll window instead of one every few hundred ms. Note the
+    /// connection is held for the duration; size the pool for `workers + api`.
+    async fn read_with_poll(
+        &self,
+        queue: &str,
+        vt_secs: u32,
+        count: usize,
+        poll_secs: u32,
+    ) -> Result<Vec<ReadMessage>, QueueError> {
+        let rows = sqlx::query(
+            "SELECT msg_id, read_ct, enqueued_at, message \
+             FROM pgmq.read_with_poll($1, $2::int, $3::int, $4::int, $5::int)",
+        )
+        .bind(queue)
+        .bind(vt_secs as i32)
+        .bind(count as i32)
+        .bind(poll_secs.max(1) as i32)
+        .bind(100i32) // internal poll interval, ms
+        .fetch_all(&self.pool)
+        .await
+        .map_err(dq)?;
+        rows.iter().map(read_message_from_row).collect()
+    }
+
+    async fn set_vt(&self, queue: &str, msg_id: i64, vt_secs: u32) -> Result<(), QueueError> {
+        sqlx::query("SELECT pgmq.set_vt($1, $2::bigint, $3::int)")
+            .bind(queue)
+            .bind(msg_id)
+            .bind(vt_secs as i32)
+            .execute(&self.pool)
+            .await
+            .map_err(dq)?;
+        Ok(())
     }
 
     async fn delete(&self, queue: &str, msg_id: i64) -> Result<(), QueueError> {

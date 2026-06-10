@@ -32,7 +32,7 @@
 #             target: aarch64-apple-darwin
 #     steps:
 #       - uses: actions/checkout@v4
-#       - uses: dtolnay/rust-toolchain@1.83.0
+#       - uses: dtolnay/rust-toolchain@1.96.0
 #         with:
 #           targets: ${{ matrix.target }}
 #       - uses: Swatinem/rust-cache@v2
@@ -47,7 +47,26 @@
 #         uses: softprops/action-gh-release@v2
 #         with:
 #           files: queueflow-${{ matrix.target }}.tar.gz
-# 
+#
+#   # The OpenAPI spec is a release artifact: consumers who want a Python/Go/etc.
+#   # client generate one themselves against this pinned spec (see README "SDKs"),
+#   # so every release ships the exact contract it serves.
+#   spec:
+#     name: OpenAPI spec artifact
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: dtolnay/rust-toolchain@1.96.0
+#       - uses: Swatinem/rust-cache@v2
+#       - name: Generate spec from code
+#         run: cargo run -q -p queueflow-server -- spec --output-dir spec
+#       - name: Upload to release
+#         uses: softprops/action-gh-release@v2
+#         with:
+#           files: |
+#             spec/openapi.json
+#             spec/openapi.yaml
+#
 #   docker:
 #     name: Container image
 #     runs-on: ubuntu-latest

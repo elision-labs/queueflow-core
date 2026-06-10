@@ -55,14 +55,14 @@ pub use adapters::clock::{SystemClock, TestClock};
 pub use adapters::memory::{InMemoryJobStore, InMemoryMessageQueue};
 pub use api::JobApi;
 pub use domain::{
-    BackoffStrategy, CreateWorkflowRequest, Job, JobConfig, JobStatus, Json, Map, OnFailure,
-    OnSuccess, StepStatus, Workflow, WorkflowStatus, WorkflowStep, CONTEXT_KEY,
+    BackoffStrategy, CreateWorkflowRequest, Job, JobConfig, JobStatus, Json, LeasedJob, Map,
+    OnFailure, OnSuccess, StepStatus, Workflow, WorkflowStatus, WorkflowStep, CONTEXT_KEY,
 };
 pub use engine::{Engine, EngineBuilder, EnqueueOptions};
 pub use error::{EngineError, HandlerError};
 pub use ports::{
-    Clock, JobStore, ListFilter, MessageQueue, QueueError, QueueMessage, ReadMessage, StepRecord,
-    StorageError,
+    Clock, JobStore, ListFilter, MessageQueue, Page, QueueError, QueueMessage, ReadMessage,
+    StepRecord, StorageError,
 };
 pub use stats::{EngineStats, StatsSnapshot};
 pub use task::{handler_fn, FnHandler, TaskHandler};

@@ -1,9 +1,0 @@
-# openapi-generator config for the Rust SDK (reqwest, async).
-generatorName: rust
-additionalProperties:
-  packageName: queueflow
-  packageVersion: 0.1.0
-  library: reqwest
-  supportAsync: true
-  preferUnsignedInt: true
-  hideGenerationTimestamp: true

@@ -135,6 +135,9 @@ pub struct JobConfig {
     pub max_retries: u32,
     pub retry_delay_secs: u64,
     pub timeout_secs: u64,
+    /// Recorded on the job for inspection. The Postgres/PGMQ backend dequeues
+    /// strictly FIFO, so priority does not affect ordering there; use separate
+    /// queues for priority classes. The in-memory adapter honours it.
     pub priority: i32,
     #[serde(default)]
     pub retry_backoff: BackoffStrategy,
@@ -197,6 +200,23 @@ pub struct Job {
     pub metadata: Map,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// Client-supplied key that makes job creation idempotent per tenant:
+    /// re-submitting the same key returns the original job instead of creating
+    /// a duplicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+/// A job leased to a (possibly remote) worker, together with the lease handle
+/// needed to heartbeat, complete, or fail it.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct LeasedJob {
+    pub job: Job,
+    /// Opaque lease handle (the queue message id). Pass it back on
+    /// heartbeat/complete/fail together with the queue name.
+    pub lease_id: i64,
+    /// The queue the lease was taken from.
+    pub queue: String,
 }
 
 /// What to do with downstream steps when a step fails.
@@ -339,6 +359,7 @@ mod tests {
             result: None,
             metadata: Map::new(),
             tenant_id: None,
+            idempotency_key: None,
         };
         let v = serde_json::to_value(&job).unwrap();
         assert!(v.get("started_at").is_none());

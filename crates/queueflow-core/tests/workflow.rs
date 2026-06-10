@@ -279,11 +279,114 @@ async fn cyclic_workflow_is_rejected_before_persisting() {
 
     let err = c.engine.create_workflow(req, None).await.unwrap_err();
     assert!(matches!(err, EngineError::Workflow(_)));
-    let (workflows, total) = c
+    let page = c
         .engine
-        .list_workflows(&ListFilter::default())
+        .list_workflows(&ListFilter {
+            include_total: true,
+            ..Default::default()
+        })
         .await
         .unwrap();
-    assert_eq!(total, 0);
-    assert!(workflows.is_empty());
+    assert_eq!(page.total, Some(0));
+    assert!(page.items.is_empty());
+}
+
+#[tokio::test]
+async fn fan_in_step_runs_exactly_once() {
+    // a and b fan in to c. Each completion re-runs `advance`, and only the
+    // claim (link_step_job) guards c from being enqueued twice.
+    let c = ctx(Arc::new(AtomicBool::new(false)));
+    let req = CreateWorkflowRequest {
+        name: "fan-in".into(),
+        steps: vec![
+            WorkflowStep {
+                name: "a".into(),
+                task_name: "ok".into(),
+                payload: map(json!({"who": "a"})),
+                ..Default::default()
+            },
+            WorkflowStep {
+                name: "b".into(),
+                task_name: "ok".into(),
+                payload: map(json!({"who": "b"})),
+                ..Default::default()
+            },
+            WorkflowStep {
+                name: "c".into(),
+                task_name: "ok".into(),
+                payload: map(json!({"who": "c"})),
+                depends_on: vec!["a".into(), "b".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let id = c.engine.create_workflow(req, None).await.unwrap();
+    drain(&c.engine).await;
+
+    let runs = c
+        .order
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|w| w.as_str() == "c")
+        .count();
+    assert_eq!(runs, 1, "join step must execute exactly once");
+    assert_eq!(
+        c.engine.get_workflow(&id).await.unwrap().status,
+        WorkflowStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn step_claim_is_atomic() {
+    // The storage-level guard behind the fan-in property: only the first
+    // link wins; the loser must not publish.
+    let c = ctx(Arc::new(AtomicBool::new(false)));
+    let req = CreateWorkflowRequest {
+        name: "claim".into(),
+        steps: vec![WorkflowStep {
+            name: "only".into(),
+            task_name: "ok".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let id = c.engine.create_workflow(req, None).await.unwrap();
+
+    // The scheduler already claimed "only" while starting the workflow.
+    let claimed = c
+        .store
+        .link_step_job(&id, "only", "intruder")
+        .await
+        .unwrap();
+    assert!(!claimed, "a second claim on a linked step must lose");
+}
+
+#[tokio::test]
+async fn cancelling_a_finished_workflow_is_a_conflict() {
+    let c = ctx(Arc::new(AtomicBool::new(false)));
+    let req = CreateWorkflowRequest {
+        name: "done".into(),
+        steps: vec![WorkflowStep {
+            name: "a".into(),
+            task_name: "ok".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let id = c.engine.create_workflow(req, None).await.unwrap();
+    drain(&c.engine).await;
+    assert_eq!(
+        c.engine.get_workflow(&id).await.unwrap().status,
+        WorkflowStatus::Completed
+    );
+
+    let err = c.engine.cancel_workflow(&id).await.unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)));
+    assert_eq!(
+        c.engine.get_workflow(&id).await.unwrap().status,
+        WorkflowStatus::Completed,
+        "terminal workflow status must never be rewritten"
+    );
 }

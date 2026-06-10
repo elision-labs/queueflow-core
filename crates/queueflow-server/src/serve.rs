@@ -27,9 +27,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 
     let store = Arc::new(PostgresJobStore::new(pool.clone()));
     let queue = Arc::new(PostgresMessageQueue::new(pool));
-    for q in [args.default_queue.as_str(), "priority", "retry"] {
-        queue.ensure_queue(q).await.ok();
-    }
+    queue.ensure_queue(&args.default_queue).await.ok();
 
     let engine = Engine::builder(store, queue, Arc::new(SystemClock))
         .default_queue(args.default_queue.clone())
@@ -63,9 +61,15 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         })
     };
 
-    // Workers (for `worker` and `all`).
+    // Workers (for `worker` and `all`). In API-only mode workers run in other
+    // processes (or as remote workers over the lease API); mark the engine
+    // running so /ready reflects this process's actual readiness instead of
+    // permanently reporting a missing local worker pool.
     let workers = match args.mode {
-        Mode::Api => None,
+        Mode::Api => {
+            engine.mark_running();
+            None
+        }
         _ => Some(engine.run_workers(args.default_queue.clone())),
     };
 

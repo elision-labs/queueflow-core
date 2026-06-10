@@ -1,6 +1,7 @@
 //! QueueFlow server binary.
 
 mod cli;
+mod client_cmds;
 mod metrics;
 mod serve;
 mod spec;
@@ -22,6 +23,10 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("migrations applied");
             Ok(())
         }
+        Command::Job(cmd) => client_cmds::job(cmd).await,
+        Command::Workflow(cmd) => client_cmds::workflow(cmd).await,
+        Command::Tasks(args) => client_cmds::tasks(args).await,
+        Command::Stats(args) => client_cmds::stats(args).await,
     }
 }
 
@@ -29,5 +34,10 @@ fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).json().init();
+    // Logs on stderr so the client subcommands' JSON output owns stdout.
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .json()
+        .init();
 }

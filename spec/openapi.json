@@ -77,6 +77,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "include_total",
+            "in": "query",
+            "description": "Include the exact `total` count in the response (default false; the\ncount is an extra full scan over the filtered set).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -112,6 +121,20 @@
           "jobs"
         ],
         "operationId": "createJob",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional client-supplied key making this create idempotent per tenant: retrying with the same key returns the original job instead of creating a duplicate.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -124,7 +147,7 @@
         },
         "responses": {
           "201": {
-            "description": "Job created",
+            "description": "Job created (or replayed idempotently)",
             "content": {
               "application/json": {
                 "schema": {
@@ -331,6 +354,296 @@
         ]
       }
     },
+    "/api/v1/jobs/{id}/complete": {
+      "post": {
+        "tags": [
+          "worker"
+        ],
+        "operationId": "completeJob",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompleteJobRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Completed (idempotent: replaying a finished lease also succeeds)"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/jobs/{id}/events": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Stream a job's status transitions as Server-Sent Events until it reaches a\nterminal state. Lets clients await completion without polling the REST\nendpoint themselves.",
+        "operationId": "streamJobEvents",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream; each `status` event carries the full job JSON. Closes after the job reaches a terminal state.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/jobs/{id}/fail": {
+      "post": {
+        "tags": [
+          "worker"
+        ],
+        "operationId": "failJob",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FailJobRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Failure recorded; the job is retried or dead-lettered per its config"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/jobs/{id}/heartbeat": {
+      "post": {
+        "tags": [
+          "worker"
+        ],
+        "operationId": "heartbeatJob",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeartbeatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Lease extended"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/queues/{queue}/lease": {
+      "post": {
+        "tags": [
+          "worker"
+        ],
+        "operationId": "leaseJobs",
+        "parameters": [
+          {
+            "name": "queue",
+            "in": "path",
+            "description": "Queue to lease from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeaseJobsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Zero or more leased jobs (empty if none became available within wait_secs)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseJobsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/stats": {
       "get": {
         "tags": [
@@ -339,7 +652,7 @@
         "operationId": "getStats",
         "responses": {
           "200": {
-            "description": "Engine counters",
+            "description": "Engine counters. Process-local and reset on restart: in a split api/worker deployment this reflects only the process serving the request; query the database for fleet-wide history.",
             "content": {
               "application/json": {
                 "schema": {
@@ -433,6 +746,15 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "include_total",
+            "in": "query",
+            "description": "Include the exact `total` count in the response (default false; the\ncount is an extra full scan over the filtered set).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -771,6 +1093,29 @@
           "exponential"
         ]
       },
+      "CompleteJobRequest": {
+        "type": "object",
+        "description": "Body for `POST /api/v1/jobs/{id}/complete`.",
+        "required": [
+          "queue",
+          "lease_id"
+        ],
+        "properties": {
+          "lease_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The lease handle returned by the lease call."
+          },
+          "queue": {
+            "type": "string",
+            "description": "Queue the lease was taken from."
+          },
+          "result": {
+            "type": "object",
+            "description": "Handler result, recorded on the job and merged into workflow context."
+          }
+        }
+      },
       "CreateBatchJobsRequest": {
         "type": "object",
         "required": [
@@ -893,6 +1238,32 @@
           }
         }
       },
+      "FailJobRequest": {
+        "type": "object",
+        "description": "Body for `POST /api/v1/jobs/{id}/fail`.",
+        "required": [
+          "queue",
+          "lease_id",
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Human-readable failure reason."
+          },
+          "lease_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "queue": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean",
+            "description": "Whether the engine may retry (subject to the job's max_retries).\nDefaults to true; send false for permanent failures (e.g. bad input)."
+          }
+        }
+      },
       "HealthStatus": {
         "type": "object",
         "required": [
@@ -909,6 +1280,30 @@
             "format": "date-time"
           },
           "version": {
+            "type": "string"
+          }
+        }
+      },
+      "HeartbeatRequest": {
+        "type": "object",
+        "description": "Body for `POST /api/v1/jobs/{id}/heartbeat`.",
+        "required": [
+          "queue",
+          "lease_id",
+          "extend_secs"
+        ],
+        "properties": {
+          "extend_secs": {
+            "type": "integer",
+            "format": "int32",
+            "description": "New lease duration in seconds, measured from now (1..=3600).",
+            "minimum": 0
+          },
+          "lease_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "queue": {
             "type": "string"
           }
         }
@@ -948,6 +1343,13 @@
           },
           "id": {
             "type": "string"
+          },
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client-supplied key that makes job creation idempotent per tenant:\nre-submitting the same key returns the original job instead of creating\na duplicate."
           },
           "metadata": {
             "type": "object"
@@ -1037,7 +1439,8 @@
           },
           "priority": {
             "type": "integer",
-            "format": "int32"
+            "format": "int32",
+            "description": "Recorded on the job for inspection. The Postgres/PGMQ backend dequeues\nstrictly FIFO, so priority does not affect ordering there; use separate\nqueues for priority classes. The in-memory adapter honours it."
           },
           "retry_backoff": {
             "$ref": "#/components/schemas/BackoffStrategy"
@@ -1109,11 +1512,79 @@
           "cancelled"
         ]
       },
+      "LeaseJobsRequest": {
+        "type": "object",
+        "description": "Body for `POST /api/v1/queues/{queue}/lease`.",
+        "properties": {
+          "lease_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Lease duration in seconds (1..=3600, default 30). Heartbeat to extend.",
+            "minimum": 0
+          },
+          "max_jobs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Maximum jobs to lease in one call (1..=100, default 1).",
+            "minimum": 0
+          },
+          "wait_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Long-poll wait when the queue is empty, in seconds (0..=30, default 0).",
+            "minimum": 0
+          }
+        }
+      },
+      "LeaseJobsResponse": {
+        "type": "object",
+        "required": [
+          "jobs"
+        ],
+        "properties": {
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LeasedJob"
+            }
+          }
+        }
+      },
+      "LeasedJob": {
+        "type": "object",
+        "description": "A job leased to a (possibly remote) worker, together with the lease handle\nneeded to heartbeat, complete, or fail it.",
+        "required": [
+          "job",
+          "lease_id",
+          "queue"
+        ],
+        "properties": {
+          "job": {
+            "$ref": "#/components/schemas/Job"
+          },
+          "lease_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Opaque lease handle (the queue message id). Pass it back on\nheartbeat/complete/fail together with the queue name."
+          },
+          "queue": {
+            "type": "string",
+            "description": "The queue the lease was taken from."
+          }
+        }
+      },
       "ListJobsResponse": {
         "type": "object",
         "required": [
           "jobs",
-          "total",
           "limit",
           "offset",
           "has_more"
@@ -1137,8 +1608,12 @@
             "format": "int64"
           },
           "total": {
-            "type": "integer",
-            "format": "int64"
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Exact total match count. Only present when the request set\n`include_total=true`; computing it costs a full count over the filtered\nset, so it is opt-in."
           }
         }
       },
@@ -1146,7 +1621,6 @@
         "type": "object",
         "required": [
           "workflows",
-          "total",
           "limit",
           "offset",
           "has_more"
@@ -1164,8 +1638,12 @@
             "format": "int64"
           },
           "total": {
-            "type": "integer",
-            "format": "int64"
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Exact total match count; only present when `include_total=true`."
           },
           "workflows": {
             "type": "array",
@@ -1425,6 +1903,10 @@
     {
       "name": "workflows",
       "description": "Workflow orchestration (DAG of steps)"
+    },
+    {
+      "name": "worker",
+      "description": "Remote worker protocol: lease jobs, heartbeat, report completion/failure. Lets handlers run in any language, outside the server binary."
     },
     {
       "name": "system",

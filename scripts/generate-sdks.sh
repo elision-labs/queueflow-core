@@ -8,10 +8,22 @@
 #
 # Requires: docker, and a generated spec at spec/openapi.json (run `make spec`).
 #
+# NOTE: Two SDKs are NOT generated here:
+#   - TypeScript (../queueflow-sdk-nodejs) is HAND-WRITTEN for a nicer developer
+#     experience; `scripts/check-ts-sdk.mjs` guards it against spec drift.
+#   - Rust ships as the native `queueflow-client` crate in this workspace,
+#     which reuses the engine's own domain types (no generation possible to
+#     beat that).
+# Both are no-ops if requested explicitly.
+#
+# Python and Go remain available as on-demand targets, but are NOT published or
+# maintained by default: each release attaches spec/openapi.json, and consumers
+# can self-generate against their own toolchain with:
+#   openapi-generator-cli generate -i openapi.json -g python -o ./queueflow-python
+#
 # Usage:
-#   scripts/generate-sdks.sh            # all SDKs
+#   scripts/generate-sdks.sh            # all generated SDKs (python, go)
 #   scripts/generate-sdks.sh python     # one
-#   scripts/generate-sdks.sh python typescript rust
 
 set -euo pipefail
 
@@ -20,13 +32,16 @@ SPEC="${ROOT}/spec/openapi.json"
 IMAGE="openapitools/openapi-generator-cli:v7.10.0"
 
 # language -> sibling output directory (relative to the repo root's parent).
-declare -A OUT_DIRS=(
-  [python]="${ROOT}/../queueflow-sdk-python"
-  [typescript]="${ROOT}/../queueflow-sdk-nodejs"
-  [rust]="${ROOT}/../queueflow-sdk-rust"
-  [go]="${ROOT}/../queueflow-sdk-go"
-  [java]="${ROOT}/../queueflow-sdk-java"
-)
+# A function (not an associative array) so this runs on the bash 3.2 that ships
+# with macOS as well as bash 4+.
+out_dir_for() {
+  case "$1" in
+    python)     echo "${ROOT}/../queueflow-sdk-python" ;;
+    typescript) echo "${ROOT}/../queueflow-sdk-nodejs" ;;
+    go)         echo "${ROOT}/../queueflow-sdk-go" ;;
+    *)          echo "" ;;
+  esac
+}
 
 if [[ ! -f "${SPEC}" ]]; then
   echo "spec not found: ${SPEC}" >&2
@@ -36,7 +51,20 @@ fi
 
 generate() {
   local name="$1"
-  local out="${OUT_DIRS[$name]:-}"
+
+  # The TypeScript SDK is hand-written; never regenerate (and never wipe) it.
+  if [[ "${name}" == "typescript" ]]; then
+    echo "==> Skipping typescript: ../queueflow-sdk-nodejs is hand-written, not generated."
+    return 0
+  fi
+  # The Rust SDK is the native queueflow-client crate in this workspace.
+  if [[ "${name}" == "rust" ]]; then
+    echo "==> Skipping rust: use the native crates/queueflow-client instead of a generated client."
+    return 0
+  fi
+
+  local out
+  out="$(out_dir_for "${name}")"
   local config="${ROOT}/sdk-configs/${name}.yaml"
 
   if [[ -z "${out}" ]]; then
@@ -71,7 +99,8 @@ generate() {
 
 targets=("$@")
 if [[ ${#targets[@]} -eq 0 || "${targets[0]}" == "all" ]]; then
-  targets=(python typescript rust go java)
+  # typescript (hand-written) and rust (native crate) intentionally omitted.
+  targets=(python go)
 fi
 
 for t in "${targets[@]}"; do

@@ -55,6 +55,10 @@ pub struct ListFilter {
     /// Order by `created_at` descending when true (the default), ascending when
     /// false.
     pub order_desc: bool,
+    /// Compute the exact total match count. Off by default: an exact count is a
+    /// full `COUNT(*)` over the filtered set on Postgres, which large tables
+    /// pay for on every page. `has_more` is always computed cheaply.
+    pub include_total: bool,
 }
 
 impl Default for ListFilter {
@@ -66,8 +70,19 @@ impl Default for ListFilter {
             limit: 50,
             offset: 0,
             order_desc: true,
+            include_total: false,
         }
     }
+}
+
+/// One page of list results. `has_more` is derived by fetching one row past
+/// `limit`, so it is exact and costs no extra count query. `total` is only
+/// present when [`ListFilter::include_total`] was set.
+#[derive(Clone, Debug, Default)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub has_more: bool,
+    pub total: Option<i64>,
 }
 
 /// The JSON body that travels on the queue. Deliberately small — the durable
@@ -106,10 +121,20 @@ pub struct ReadMessage {
 /// of truth; the in-memory adapter mirrors its observable behaviour.
 #[async_trait]
 pub trait JobStore: Send + Sync {
-    async fn create_job(&self, job: &Job) -> Result<(), StorageError>;
+    /// Persist a new job. Returns `false` when the job's idempotency key
+    /// already exists for its tenant (the existing row is left untouched and
+    /// nothing is inserted); `true` when the row was created.
+    async fn create_job(&self, job: &Job) -> Result<bool, StorageError>;
     async fn batch_create_jobs(&self, jobs: &[Job]) -> Result<Vec<String>, StorageError>;
     async fn get_job(&self, id: &str) -> Result<Job, StorageError>;
-    async fn list_jobs(&self, filter: &ListFilter) -> Result<(Vec<Job>, i64), StorageError>;
+    async fn list_jobs(&self, filter: &ListFilter) -> Result<Page<Job>, StorageError>;
+
+    /// Look up the job previously created with this idempotency key, if any.
+    async fn find_job_by_idempotency_key(
+        &self,
+        tenant_id: Option<&str>,
+        key: &str,
+    ) -> Result<Option<Job>, StorageError>;
 
     /// Update a job's status, optionally recording an error and/or result.
     /// Implementations stamp `started_at`/`completed_at` as appropriate.
@@ -120,6 +145,12 @@ pub trait JobStore: Send + Sync {
         error: Option<&str>,
         result: Option<&Json>,
     ) -> Result<(), StorageError>;
+
+    /// Atomically cancel a job that is not yet terminal. Returns `true` if the
+    /// job was cancelled, `false` if it was already terminal (or missing) — the
+    /// check and the write are a single operation so a completing worker can
+    /// never be raced into overwriting a terminal status.
+    async fn cancel_job_if_active(&self, id: &str, reason: &str) -> Result<bool, StorageError>;
 
     /// Record that a job is scheduled for retry.
     async fn mark_retrying(
@@ -142,10 +173,7 @@ pub trait JobStore: Send + Sync {
 
     async fn create_workflow(&self, wf: &Workflow) -> Result<(), StorageError>;
     async fn get_workflow(&self, id: &str) -> Result<Workflow, StorageError>;
-    async fn list_workflows(
-        &self,
-        filter: &ListFilter,
-    ) -> Result<(Vec<Workflow>, i64), StorageError>;
+    async fn list_workflows(&self, filter: &ListFilter) -> Result<Page<Workflow>, StorageError>;
 
     /// `(step_name, status, linked_job_id)` for every step of a workflow.
     async fn workflow_step_statuses(
@@ -153,14 +181,16 @@ pub trait JobStore: Send + Sync {
         workflow_id: &str,
     ) -> Result<Vec<StepRecord>, StorageError>;
 
-    /// Attach a created job to a step (also marks the step as scheduled so it is
-    /// never double-enqueued).
+    /// Claim a step by attaching a created job to it. Returns `true` if this
+    /// call won the claim, `false` if the step already had a linked job (a
+    /// concurrent `advance` got there first). The claim is atomic; it is the
+    /// guard that makes step scheduling race-free across workers.
     async fn link_step_job(
         &self,
         workflow_id: &str,
         step_name: &str,
         job_id: &str,
-    ) -> Result<(), StorageError>;
+    ) -> Result<bool, StorageError>;
 
     async fn set_step_status(
         &self,
@@ -170,11 +200,14 @@ pub trait JobStore: Send + Sync {
         error: Option<&str>,
     ) -> Result<(), StorageError>;
 
+    /// Transition a workflow's status. A workflow already in a terminal state
+    /// is never overwritten; returns `true` only when the status actually
+    /// changed (used to keep stats exact under concurrent aggregation).
     async fn set_workflow_status(
         &self,
         workflow_id: &str,
         status: WorkflowStatus,
-    ) -> Result<(), StorageError>;
+    ) -> Result<bool, StorageError>;
 
     /// Merge a single key/value into a workflow's accumulated context.
     async fn merge_workflow_context(
@@ -201,6 +234,15 @@ pub trait MessageQueue: Send + Sync {
     async fn send(&self, queue: &str, msg: &QueueMessage, priority: i32)
         -> Result<i64, QueueError>;
 
+    /// Enqueue many messages in one round trip. Returns the queue's message ids
+    /// in input order.
+    async fn send_batch(
+        &self,
+        queue: &str,
+        msgs: &[QueueMessage],
+        priority: i32,
+    ) -> Result<Vec<i64>, QueueError>;
+
     /// Enqueue but hide the message for `delay_secs`. This is the backbone of
     /// durable retries: the delay lives *in the queue*, so a retry survives a
     /// process restart.
@@ -220,6 +262,25 @@ pub trait MessageQueue: Send + Sync {
         vt_secs: u32,
         count: usize,
     ) -> Result<Vec<ReadMessage>, QueueError>;
+
+    /// Like [`MessageQueue::read`], but when the queue is empty, wait up to
+    /// `poll_secs` for a message to arrive instead of returning immediately.
+    /// On the Postgres adapter the wait happens server-side
+    /// (`pgmq.read_with_poll`), so an idle worker holds one quiet connection
+    /// rather than hammering the database with empty reads.
+    async fn read_with_poll(
+        &self,
+        queue: &str,
+        vt_secs: u32,
+        count: usize,
+        poll_secs: u32,
+    ) -> Result<Vec<ReadMessage>, QueueError>;
+
+    /// Reset a leased message's visibility timeout to `vt_secs` from now.
+    /// This is how a lease is extended to cover a job's full timeout (or
+    /// heartbeated by a remote worker) so a still-running job is never
+    /// redelivered to a second worker.
+    async fn set_vt(&self, queue: &str, msg_id: i64, vt_secs: u32) -> Result<(), QueueError>;
 
     /// Acknowledge (remove) a leased message.
     async fn delete(&self, queue: &str, msg_id: i64) -> Result<(), QueueError>;

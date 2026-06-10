@@ -8,9 +8,9 @@ Durable background jobs and real DAG workflows on a database you already run —
 
 [![CI](https://github.com/sjriddle/queueflow-core/actions/workflows/ci.yml/badge.svg)](https://github.com/sjriddle/queueflow-core/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Rust 1.83+](https://img.shields.io/badge/rust-1.83%2B-orange.svg)](./rust-toolchain.toml)
+[![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](./rust-toolchain.toml)
 [![OpenAPI 3.1](https://img.shields.io/badge/OpenAPI-3.1-6BA539.svg)](./spec/openapi.yaml)
-[![Tests](https://img.shields.io/badge/tests-56%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-77%20passing-brightgreen.svg)](#testing)
 
 [Quick start](#quick-start) · [Workflows](#workflows) · [How-to](#how-to-rest-api) · [Docs](#documentation) · [Roadmap](#roadmap)
 
@@ -18,20 +18,23 @@ Durable background jobs and real DAG workflows on a database you already run —
 
 ---
 
-QueueFlow Core runs durable background jobs and real DAG workflows directly on PostgreSQL + PGMQ,
-with an OpenAPI-driven SDK pipeline that ships clients in five languages.
+QueueFlow Core runs durable background jobs and real DAG workflows directly on PostgreSQL + PGMQ.
+Handlers can live in the server binary (Rust) or in any language via the HTTP worker protocol;
+the OpenAPI spec is generated from the code and ships with every release.
 
 ## Design highlights
 
 - **Workflows as a real DAG orchestrator** — dependency gating, context propagation, per-step failure policies, cycle detection, a builder DSL, and a Mermaid diagram endpoint.
-- **Thoroughly tested** — 56 tests; the entire engine, scheduler, and HTTP API run against deterministic in-memory adapters with **no database**, plus opt-in Postgres integration tests.
+- **Thoroughly tested** — 77 tests; the entire engine, scheduler, HTTP API, and Rust client run against deterministic in-memory adapters with **no database**, plus opt-in Postgres integration tests.
 - **Durable retries** — queue-native delayed redelivery (PGMQ `send` with delay) that survives restarts.
 - **Delivery safety** — logged acks, a terminal-state idempotency guard, and "advance-before-ack" so a failed workflow step self-heals on redelivery.
 - **Ports & adapters** — the engine depends on `JobStore`/`MessageQueue` traits; Postgres and in-memory adapters implement them.
 - **Code-generated OpenAPI** — the spec is generated **from the code** (utoipa), so it can't drift; emitted by `queueflow spec`.
 - **Ergonomic API** — durations are plain integer seconds; statuses and backoff are exhaustive enums, so illegal states are unrepresentable.
 - **Multi-tenancy** — tenant isolation enforced on every job/workflow endpoint.
-- **Five SDKs** — Python, TypeScript, Rust, Go, and Java.
+- **Polyglot workers** — a lease/heartbeat/complete/fail HTTP protocol lets handlers run in any language, with the same retry/DLQ/workflow semantics as in-process handlers.
+- **Idempotent enqueue** — an `Idempotency-Key` header makes client retries safe (no duplicate jobs).
+- **Clients** — a native Rust crate (`queueflow-client`), a hand-written TypeScript SDK, and self-serve generation for anything else from the released spec.
 
 ## Features
 
@@ -40,7 +43,7 @@ with an OpenAPI-driven SDK pipeline that ships clients in five languages.
 - ♻️ **Durable retries** — typed backoff (fixed / linear / exponential, capped, with jitter) scheduled *in the queue*, so retries outlive restarts.
 - 🪦 **Dead-letter queue** — exhausted, non-retryable, and unhandled jobs land somewhere you can inspect and replay.
 - 🧪 **Built to be tested** — a ports-and-adapters core means the whole system runs in memory, deterministically, with a controllable clock.
-- 📜 **Code-generated OpenAPI** — the spec is derived from the handlers, then drives client SDKs in five languages.
+- 📜 **Code-generated OpenAPI** — the spec is derived from the handlers and attached to every release; generate a client for any language against it.
 - 📈 **Observable** — Prometheus metrics, structured JSON logs (`tracing`), health/readiness probes.
 - 🛑 **Graceful shutdown** — drains in-flight work on `SIGINT`/`SIGTERM`.
 
@@ -60,9 +63,10 @@ queueflow-core/                    Cargo workspace
 │   │   ├── workflow/              DAG validation, builder DSL, scheduler
 │   │   └── api.rs                 object-safe JobApi facade
 │   ├── queueflow-api/             axum router + utoipa OpenAPI
-│   └── queueflow-server/          the `queueflow` binary (serve / spec / migrate)
+│   ├── queueflow-client/          native Rust client (REST + remote worker runtime)
+│   └── queueflow-server/          the `queueflow` binary (serve / spec / migrate / CLI)
 ├── migrations/                    sqlx migrations (schema + PGMQ)
-├── sdk-configs/                   per-language openapi-generator configs
+├── sdk-configs/                   openapi-generator configs (on-demand python/go)
 ├── scripts/generate-sdks.sh       drives openapi-generator
 └── Makefile
 ```
@@ -200,15 +204,73 @@ curl -s http://localhost:9090/metrics
 
 | Method & path | Description |
 | --- | --- |
-| `POST /api/v1/jobs` | Enqueue a job |
-| `POST /api/v1/jobs/batch` | Enqueue up to 1000 jobs |
-| `GET /api/v1/jobs` | List jobs (filter by status/queue, paginate) |
+| `POST /api/v1/jobs` | Enqueue a job (send `Idempotency-Key` to make retries safe) |
+| `POST /api/v1/jobs/batch` | Enqueue up to 1000 jobs in one round trip |
+| `GET /api/v1/jobs` | List jobs (filter by status/queue, paginate; `include_total=true` for exact counts) |
 | `GET /api/v1/jobs/{id}` | Fetch a job |
-| `POST /api/v1/jobs/{id}/cancel` | Cancel a job |
+| `GET /api/v1/jobs/{id}/events` | Server-Sent Events stream of status changes until terminal |
+| `POST /api/v1/jobs/{id}/cancel` | Cancel a job (409 if already finished) |
+| `POST /api/v1/queues/{queue}/lease` | Worker protocol: lease jobs (long-poll supported) |
+| `POST /api/v1/jobs/{id}/heartbeat` · `/complete` · `/fail` | Worker protocol: extend lease · report outcome |
 | `POST /api/v1/workflows` | Create a workflow |
 | `GET /api/v1/workflows` · `/{id}` · `/{id}/cancel` · `/{id}/diagram` | List / fetch / cancel / diagram |
-| `GET /api/v1/tasks` · `/stats` | Registered handlers · engine counters |
+| `GET /api/v1/tasks` · `/stats` | Registered handlers · engine counters (process-local) |
 | `GET /health` · `/ready` · `/docs` · `/openapi.json` | Probes · Swagger UI · spec |
+
+### Remote workers (any language)
+
+Handlers do not have to be compiled into the server. A worker in any language can drain a queue
+over HTTP with at-least-once semantics, durable retries, and workflow advancement handled
+server-side:
+
+```bash
+# 1. Lease (long-polls up to wait_secs when the queue is empty)
+curl -s -X POST http://localhost:8000/api/v1/queues/default/lease \
+  -H 'Authorization: Bearer dev' -H 'Content-Type: application/json' \
+  -d '{"max_jobs":1,"lease_secs":60,"wait_secs":20}'
+# => {"jobs":[{"job":{...},"lease_id":7,"queue":"default"}]}
+
+# 2. (while working) heartbeat to keep the lease
+curl -s -X POST http://localhost:8000/api/v1/jobs/<id>/heartbeat \
+  -H 'Authorization: Bearer dev' -H 'Content-Type: application/json' \
+  -d '{"queue":"default","lease_id":7,"extend_secs":60}'
+
+# 3. Report the outcome (or /fail with {"error":"...","retryable":true})
+curl -s -X POST http://localhost:8000/api/v1/jobs/<id>/complete \
+  -H 'Authorization: Bearer dev' -H 'Content-Type: application/json' \
+  -d '{"queue":"default","lease_id":7,"result":{"ok":true}}'
+```
+
+In Rust, `queueflow-client` wraps this in a worker runtime with automatic heartbeating:
+
+```rust
+use queueflow_client::{Client, Map};
+use queueflow_client::worker::{Worker, WorkerOptions};
+
+let client = Client::new("http://localhost:8000", "dev");
+Worker::new(client, "default", WorkerOptions::default())
+    .register("resize-image", |job| async move {
+        // ... do the work ...
+        Ok(Map::new())
+    })
+    .run()
+    .await;
+```
+
+### CLI
+
+The `queueflow` binary doubles as a client for a running server (`--server-url` /
+`QUEUEFLOW_SERVER_URL`, `--token` / `QUEUEFLOW_TOKEN`):
+
+```bash
+queueflow job create --task echo --payload '{"hello":"world"}' --wait
+queueflow job list --status pending --limit 20
+queueflow job watch <id>
+queueflow workflow create --file etl.json
+queueflow workflow diagram <id>
+queueflow tasks
+queueflow stats
+```
 
 ## Configuration
 
@@ -235,20 +297,31 @@ idempotency, and full workflow-orchestration behaviours are all verified determi
 `TestClock` and in-memory adapters — no Docker, no Postgres. The Postgres adapter is then checked for
 parity by the opt-in integration suite.
 
-## SDK generation
+## SDKs
 
-The OpenAPI spec is generated from the Rust handlers and types, so it always matches the server:
+The OpenAPI spec is generated from the Rust handlers and types (`make spec`), so it always matches
+the server, and it is attached to every GitHub release. The client strategy per language:
+
+- **Rust** — the native [`queueflow-client`](./crates/queueflow-client) crate in this workspace. It
+  reuses the engine's own domain types (so it cannot drift), covers the full producer surface and
+  the remote worker protocol, and is integration-tested against the real router on every CI run.
+- **TypeScript/Node.js** — the **[hand-written SDK](../queueflow-sdk-nodejs)** for a more ergonomic
+  developer experience: `qf.jobs.create({ task, payload })`, a `waitFor()` poller, a workflow
+  builder DSL, and typed errors. `make check-ts-sdk` guards it against spec drift in CI.
+- **Everything else** — generate on demand from the released spec with your own toolchain:
+
+  ```bash
+  openapi-generator-cli generate -i openapi.json -g python -o ./queueflow-python
+  ```
+
+  `make sdks` (python, go) remains available for maintained snapshots in the sibling repos, but
+  they are produced at release time rather than continuously published.
 
 ```bash
 make spec            # writes spec/openapi.{json,yaml} from the code
 make validate-spec   # validate via openapi-generator (Docker)
-make sdks            # regenerate Python, TypeScript, Rust, Go, and Java SDKs
-make sdks-python     # ...or one at a time
+make check-ts-sdk    # assert the hand-written TS SDK covers every spec operation
 ```
-
-Generated SDKs land in the sibling repos:
-[Python](../queueflow-sdk-python) · [Node.js/TS](../queueflow-sdk-nodejs) ·
-[Rust](../queueflow-sdk-rust) · [Go](../queueflow-sdk-go) · [Java](../queueflow-sdk-java).
 
 ## Documentation
 
@@ -263,7 +336,8 @@ Generated SDKs land in the sibling repos:
 Contributions welcome — these are the planned next steps, roughly in priority order:
 
 - [ ] **Real authentication** — replace the placeholder token check with JWT signature/claims validation
-      and an API-key store (the seam is `auth::validate_token`).
+      and an API-key store (the seam is `auth::validate_token`). Worker-protocol endpoints should get
+      their own credential class (they are deployment infrastructure, not tenant-scoped).
 - [ ] **Conditional steps** — evaluate a per-step predicate (the `condition` column is reserved but unread today).
 - [ ] **Scheduled / cron jobs** — recurring enqueues with a `next_run_at` scheduler.
 - [ ] **DLQ admin API** — list, inspect, and replay dead-lettered jobs.
@@ -287,7 +361,7 @@ against the in-memory adapters; new endpoints/types are reflected in the OpenAPI
 
 ## Requirements
 
-- Rust 1.83+
+- Rust 1.96+
 - PostgreSQL 15+ with the [PGMQ](https://github.com/tembo-io/pgmq) extension
 - Docker (only for `make validate-spec` / `make sdks` / `make docker`)
 

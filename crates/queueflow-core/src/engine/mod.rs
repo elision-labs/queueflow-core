@@ -26,7 +26,17 @@ pub struct EnqueueOptions {
     pub queue: Option<String>,
     pub tenant_id: Option<String>,
     pub metadata: Map,
+    /// Makes the enqueue idempotent per tenant: a second enqueue with the same
+    /// key returns the original job's id instead of creating a duplicate.
+    pub idempotency_key: Option<String>,
 }
+
+/// Headroom added on top of a job's timeout when extending its lease, covering
+/// post-handler bookkeeping (status write, workflow advance, ack).
+const LEASE_GRACE_SECS: u64 = 30;
+
+/// How long a worker's long-poll read blocks server-side before re-looping.
+const WORKER_POLL_SECS: u32 = 5;
 
 /// The core engine, generic over the storage and queue ports.
 ///
@@ -185,11 +195,24 @@ where
             result: None,
             metadata: opts.metadata,
             tenant_id: opts.tenant_id,
+            idempotency_key: opts.idempotency_key,
         };
 
         // Persist the row first (durable record), then publish to the queue, so
         // a crash in between leaves a queryable job, never a phantom message.
-        self.store.create_job(&job).await?;
+        let inserted = self.store.create_job(&job).await?;
+        if !inserted {
+            // Idempotent replay: hand back the original job, enqueue nothing.
+            let key = job.idempotency_key.as_deref().unwrap_or_default();
+            let existing = self
+                .store
+                .find_job_by_idempotency_key(job.tenant_id.as_deref(), key)
+                .await?
+                .ok_or_else(|| {
+                    EngineError::Conflict("job already exists for this idempotency key".into())
+                })?;
+            return Ok(existing.id);
+        }
         let msg = QueueMessage::for_job(&job);
         self.queue.send(&queue, &msg, job.config.priority).await?;
         EngineStats::incr(&self.stats.jobs_created);
@@ -223,15 +246,15 @@ where
                 result: None,
                 metadata: Map::new(),
                 tenant_id: tenant_id.clone(),
+                idempotency_key: None,
             })
             .collect();
 
         let ids = self.store.batch_create_jobs(&jobs).await?;
-        for job in &jobs {
-            let msg = QueueMessage::for_job(job);
-            self.queue
-                .send(&job.queue_name, &msg, job.config.priority)
-                .await?;
+        // All batch jobs target the default queue, so one batched publish.
+        let msgs: Vec<QueueMessage> = jobs.iter().map(QueueMessage::for_job).collect();
+        self.queue.send_batch(&self.default_queue, &msgs, 0).await?;
+        for _ in &jobs {
             EngineStats::incr(&self.stats.jobs_created);
         }
         Ok(ids)
@@ -241,17 +264,27 @@ where
         Ok(self.store.get_job(id).await?)
     }
 
-    pub async fn list_jobs(&self, filter: &ListFilter) -> Result<(Vec<Job>, i64), EngineError> {
+    pub async fn list_jobs(&self, filter: &ListFilter) -> Result<Page<Job>, EngineError> {
         Ok(self.store.list_jobs(filter).await?)
     }
 
     /// Cancel a job. Running work is signalled via status; pending/retrying
-    /// work simply won't run once it is marked cancelled.
+    /// work simply won't run once it is marked cancelled. Cancelling a job
+    /// that already reached a terminal state is a 409 Conflict — history is
+    /// never rewritten.
     pub async fn cancel_job(&self, id: &str) -> Result<(), EngineError> {
-        let _ = self.store.get_job(id).await?; // 404 if missing
-        self.store
-            .update_status(id, JobStatus::Cancelled, Some("cancelled by user"), None)
+        let cancelled = self
+            .store
+            .cancel_job_if_active(id, "cancelled by user")
             .await?;
+        if !cancelled {
+            // Either missing (404 via get_job) or already terminal (409).
+            let job = self.store.get_job(id).await?;
+            return Err(EngineError::Conflict(format!(
+                "job is already {}",
+                job.status.as_str()
+            )));
+        }
         Ok(())
     }
 
@@ -269,15 +302,18 @@ where
         Ok(self.store.get_workflow(id).await?)
     }
 
-    pub async fn list_workflows(
-        &self,
-        filter: &ListFilter,
-    ) -> Result<(Vec<Workflow>, i64), EngineError> {
+    pub async fn list_workflows(&self, filter: &ListFilter) -> Result<Page<Workflow>, EngineError> {
         Ok(self.store.list_workflows(filter).await?)
     }
 
     pub async fn cancel_workflow(&self, id: &str) -> Result<(), EngineError> {
-        let _ = self.store.get_workflow(id).await?; // 404 if missing
+        let wf = self.store.get_workflow(id).await?; // 404 if missing
+        if wf.status.is_terminal() {
+            return Err(EngineError::Conflict(format!(
+                "workflow is already {}",
+                wf.status.as_str()
+            )));
+        }
         for rec in self.store.workflow_step_statuses(id).await? {
             if !rec.status.is_terminal() {
                 self.store
@@ -290,6 +326,8 @@ where
                     .await?;
             }
         }
+        // The guarded transition is a no-op if a concurrent advance already
+        // finished the workflow; that race resolves in the workflow's favour.
         self.store
             .set_workflow_status(id, WorkflowStatus::Cancelled)
             .await?;
@@ -308,6 +346,13 @@ where
         self.running.load(Ordering::SeqCst)
     }
 
+    /// Mark the engine as accepting work without spawning local workers. Used
+    /// by API-only deployments (workers run in separate processes) so the
+    /// readiness probe does not report a permanently missing worker pool.
+    pub fn mark_running(&self) {
+        self.running.store(true, Ordering::SeqCst);
+    }
+
     // ---- Worker loop ------------------------------------------------------
 
     /// Spawn `worker_count` concurrent workers draining `queue`. The returned
@@ -315,7 +360,7 @@ where
     /// [`Engine::shutdown`] (or cancel via the token) to stop them.
     pub fn run_workers(self: &Arc<Self>, queue: impl Into<String>) -> JoinSet<()> {
         let queue = queue.into();
-        self.running.store(true, Ordering::SeqCst);
+        self.mark_running();
         let mut set = JoinSet::new();
         for worker_id in 0..self.worker_count {
             let engine = Arc::clone(self);
@@ -334,18 +379,17 @@ where
             tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => break,
-                read = self.queue.read(&queue, self.read_vt_secs, 1) => {
+                // Long-poll: an empty queue blocks (server-side on PGMQ) for up
+                // to WORKER_POLL_SECS instead of returning instantly, so an
+                // idle worker costs one query per poll window, not five per
+                // second.
+                read = self.queue.read_with_poll(&queue, self.read_vt_secs, 1, WORKER_POLL_SECS) => {
                     match read {
                         Ok(mut msgs) => {
                             if let Some(rm) = msgs.pop() {
                                 self.process_message(&queue, rm).await;
-                            } else {
-                                // No work: back off briefly, but stay cancellable.
-                                tokio::select! {
-                                    _ = self.shutdown.cancelled() => break,
-                                    _ = tokio::time::sleep(StdDuration::from_millis(200)) => {}
-                                }
                             }
+                            // Empty result: the poll already waited; loop again.
                         }
                         Err(e) => {
                             tracing::warn!(worker_id, error = %e, "queue read error");
@@ -414,6 +458,21 @@ where
             return;
         }
 
+        // Extend the lease to cover the job's full timeout (plus grace for
+        // bookkeeping). Without this, any job running longer than the read
+        // visibility timeout would reappear and be executed concurrently by a
+        // second worker.
+        let needed = job.config.timeout_secs.saturating_add(LEASE_GRACE_SECS);
+        if needed > self.read_vt_secs as u64 {
+            let vt = needed.min(u32::MAX as u64) as u32;
+            if let Err(e) = self.queue.set_vt(queue, rm.msg_id, vt).await {
+                tracing::warn!(
+                    job_id = %job_id, error = %e,
+                    "failed to extend lease; a long-running job may be redelivered while still running"
+                );
+            }
+        }
+
         let Some(handler) = self.handlers.get(&job.task_name).cloned() else {
             let err = format!("no handler registered for task '{}'", job.task_name);
             let _ = self
@@ -426,8 +485,7 @@ where
                 .await;
             EngineStats::incr(&self.stats.jobs_failed);
             EngineStats::incr(&self.stats.jobs_dead_lettered);
-            self.advance_or_keep(queue, &rm, &job, &err, JobStatus::Failed)
-                .await;
+            self.advance_or_keep(queue, rm.msg_id, &job, &err).await;
             return;
         };
 
@@ -461,7 +519,7 @@ where
             Ok(Err(handler_err)) => {
                 self.handle_failure(
                     queue,
-                    &rm,
+                    rm.msg_id,
                     &job,
                     &handler_err.message,
                     handler_err.retryable,
@@ -469,16 +527,19 @@ where
                 .await;
             }
             Err(_elapsed) => {
-                self.handle_failure(queue, &rm, &job, "job exceeded its timeout", true)
+                self.handle_failure(queue, rm.msg_id, &job, "job exceeded its timeout", true)
                     .await;
             }
         }
     }
 
+    /// Apply failure policy to a leased job: schedule a durable retry, or
+    /// dead-letter and advance any workflow. `msg_id` is the lease being held.
+    /// Shared by the local worker loop and the remote-worker `fail` endpoint.
     async fn handle_failure(
         &self,
         queue: &str,
-        rm: &ReadMessage,
+        msg_id: i64,
         job: &Job,
         error: &str,
         retryable: bool,
@@ -504,7 +565,7 @@ where
                 .await
             {
                 Ok(_) => {
-                    self.ack(queue, rm.msg_id).await;
+                    self.ack(queue, msg_id).await;
                     EngineStats::incr(&self.stats.jobs_retried);
                     tracing::info!(job_id = %job.id, attempt = attempt + 1, delay_secs = delay, "job scheduled for retry");
                 }
@@ -525,29 +586,21 @@ where
                 .await;
             EngineStats::incr(&self.stats.jobs_failed);
             EngineStats::incr(&self.stats.jobs_dead_lettered);
-            self.advance_or_keep(queue, rm, job, error, JobStatus::Failed)
-                .await;
+            self.advance_or_keep(queue, msg_id, job, error).await;
         }
     }
 
     /// Advance a workflow after a terminal failure, then ack — but if the
     /// advance fails, leave the message so it is redelivered and self-healed by
     /// the terminal-state guard. Non-workflow jobs are simply acked.
-    async fn advance_or_keep(
-        &self,
-        queue: &str,
-        rm: &ReadMessage,
-        job: &Job,
-        error: &str,
-        _terminal: JobStatus,
-    ) {
+    async fn advance_or_keep(&self, queue: &str, msg_id: i64, job: &Job, error: &str) {
         if let (Some(wf), Some(step)) = (&job.workflow_id, &job.workflow_step_id) {
             if let Err(e) = self.scheduler.on_step_failed(wf, step, error).await {
                 tracing::error!(error = %e, job_id = %job.id, "workflow failure handling failed; message will be redelivered");
                 return; // do NOT ack — redelivery self-heals
             }
         }
-        self.ack(queue, rm.msg_id).await;
+        self.ack(queue, msg_id).await;
     }
 
     /// Re-drive workflow advancement for an already-terminal job (idempotent).
@@ -575,6 +628,121 @@ where
         if let Err(e) = outcome {
             tracing::error!(error = %e, job_id = %job.id, "workflow resume failed");
         }
+    }
+
+    // ---- Remote worker protocol --------------------------------------------
+    //
+    // These four methods are the polyglot worker surface: lease, heartbeat,
+    // complete, fail. They reuse exactly the machinery of the local worker
+    // loop (terminal-state guard, retry policy, DLQ, workflow advancement), so
+    // a handler written in any language gets the same at-least-once semantics
+    // as one compiled into this binary.
+
+    /// Lease up to `count` jobs from `queue` for `lease_secs`, waiting up to
+    /// `wait_secs` for work to arrive. Each leased job is marked running.
+    /// Messages whose job row is terminal or gone are self-healed exactly as
+    /// in the local worker path and not returned.
+    pub async fn lease_jobs(
+        &self,
+        queue: &str,
+        count: usize,
+        lease_secs: u32,
+        wait_secs: u32,
+    ) -> Result<Vec<LeasedJob>, EngineError> {
+        let msgs = if wait_secs == 0 {
+            self.queue.read(queue, lease_secs, count).await?
+        } else {
+            self.queue
+                .read_with_poll(queue, lease_secs, count, wait_secs)
+                .await?
+        };
+
+        let mut out = Vec::with_capacity(msgs.len());
+        for rm in msgs {
+            match self.store.get_job(&rm.message.job_id).await {
+                Ok(job) if job.status.is_terminal() => {
+                    self.resume_workflow(&job).await;
+                    self.ack(queue, rm.msg_id).await;
+                }
+                Ok(mut job) => {
+                    let _ = self
+                        .store
+                        .update_status(&job.id, JobStatus::Running, None, None)
+                        .await;
+                    job.status = JobStatus::Running;
+                    out.push(LeasedJob {
+                        job,
+                        lease_id: rm.msg_id,
+                        queue: queue.to_string(),
+                    });
+                }
+                Err(_) => {
+                    // Orphaned message: durable row is gone.
+                    self.ack(queue, rm.msg_id).await;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Extend a lease so a still-running remote job is not redelivered.
+    pub async fn heartbeat_lease(
+        &self,
+        queue: &str,
+        lease_id: i64,
+        extend_secs: u32,
+    ) -> Result<(), EngineError> {
+        Ok(self.queue.set_vt(queue, lease_id, extend_secs).await?)
+    }
+
+    /// Complete a leased job with a result, advancing any owning workflow
+    /// before the ack (same ordering as the local worker: a failed advance
+    /// leaves the lease to be redelivered and self-healed).
+    pub async fn complete_leased(
+        &self,
+        queue: &str,
+        lease_id: i64,
+        job_id: &str,
+        result: Map,
+    ) -> Result<(), EngineError> {
+        let job = self.store.get_job(job_id).await?;
+        if job.status.is_terminal() {
+            // Replay of an already-finished lease (e.g. client retried after a
+            // network error): drop the message, report success.
+            self.ack(queue, lease_id).await;
+            return Ok(());
+        }
+
+        let result_value = serde_json::to_value(&result).unwrap_or(Json::Null);
+        self.store
+            .update_status(job_id, JobStatus::Completed, None, Some(&result_value))
+            .await?;
+        EngineStats::incr(&self.stats.jobs_completed);
+
+        if let (Some(wf), Some(step)) = (&job.workflow_id, &job.workflow_step_id) {
+            self.scheduler.on_step_completed(wf, step, &result).await?;
+        }
+        self.ack(queue, lease_id).await;
+        Ok(())
+    }
+
+    /// Fail a leased job, applying the normal retry / dead-letter policy.
+    pub async fn fail_leased(
+        &self,
+        queue: &str,
+        lease_id: i64,
+        job_id: &str,
+        error: &str,
+        retryable: bool,
+    ) -> Result<(), EngineError> {
+        let job = self.store.get_job(job_id).await?;
+        if job.status.is_terminal() {
+            self.ack(queue, lease_id).await;
+            return Ok(());
+        }
+        self.handle_failure(queue, lease_id, &job, error, retryable)
+            .await;
+        Ok(())
     }
 
     /// Signal all workers to stop. They drain in-flight work, then exit.

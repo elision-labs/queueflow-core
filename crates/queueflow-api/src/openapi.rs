@@ -4,8 +4,8 @@
 //! SDK generators consume — so the spec can never drift from the code.
 
 use queueflow_core::{
-    BackoffStrategy, CreateWorkflowRequest, Job, JobConfig, JobStatus, OnFailure, OnSuccess,
-    StatsSnapshot, Workflow, WorkflowStatus, WorkflowStep,
+    BackoffStrategy, CreateWorkflowRequest, Job, JobConfig, JobStatus, LeasedJob, OnFailure,
+    OnSuccess, StatsSnapshot, Workflow, WorkflowStatus, WorkflowStep,
 };
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
@@ -50,6 +50,11 @@ impl Modify for SecurityAddon {
         handlers::list_jobs,
         handlers::get_job,
         handlers::cancel_job,
+        handlers::stream_job_events,
+        handlers::lease_jobs,
+        handlers::complete_job,
+        handlers::fail_job,
+        handlers::heartbeat_job,
         handlers::create_workflow,
         handlers::list_workflows,
         handlers::get_workflow,
@@ -72,6 +77,12 @@ impl Modify for SecurityAddon {
         OnSuccess,
         CreateWorkflowRequest,
         StatsSnapshot,
+        LeasedJob,
+        LeaseJobsRequest,
+        LeaseJobsResponse,
+        CompleteJobRequest,
+        FailJobRequest,
+        HeartbeatRequest,
         JobConfigRequest,
         CreateJobRequest,
         CreateJobResponse,
@@ -91,6 +102,8 @@ impl Modify for SecurityAddon {
         (name = "health", description = "Liveness and readiness probes"),
         (name = "jobs", description = "Job lifecycle"),
         (name = "workflows", description = "Workflow orchestration (DAG of steps)"),
+        (name = "worker", description = "Remote worker protocol: lease jobs, heartbeat, report completion/failure. \
+                                         Lets handlers run in any language, outside the server binary."),
         (name = "system", description = "Introspection and metrics"),
     )
 )]

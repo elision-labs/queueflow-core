@@ -242,6 +242,110 @@ async fn cannot_cancel_another_tenants_job() {
 }
 
 #[tokio::test]
+async fn job_events_stream_emits_status_and_closes_on_terminal() {
+    // Build an engine we can drive directly: complete the job first, then the
+    // SSE stream must emit one terminal `status` event and close.
+    let clock = Arc::new(SystemClock);
+    let store = Arc::new(InMemoryJobStore::new());
+    let queue = Arc::new(InMemoryMessageQueue::new(clock.clone()));
+    let engine = Engine::builder(store, queue, clock)
+        .register("echo", builtin::echo())
+        .build();
+    let id = engine
+        .enqueue("echo", Map::new(), Default::default())
+        .await
+        .unwrap();
+    engine.process_once("default").await.unwrap();
+    let app = build_router(ApiState::new(engine));
+
+    let resp = app
+        .oneshot(req(
+            "GET",
+            &format!("/api/v1/jobs/{id}/events"),
+            Some("key"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["content-type"].to_str().unwrap(),
+        "text/event-stream"
+    );
+    // The stream closes after the terminal event, so the body is collectable.
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: status"), "got: {text}");
+    assert!(text.contains("\"completed\""), "got: {text}");
+}
+
+#[tokio::test]
+async fn list_jobs_has_more_and_opt_in_total() {
+    let app = app();
+    for i in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v1/jobs",
+                Some("key"),
+                Some(json!({"task_name": "echo", "payload": {"i": i}})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Default: no total, has_more derived from limit+1.
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/jobs?limit=2", Some("key"), None))
+        .await
+        .unwrap();
+    let body = json_body(resp).await;
+    assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+    assert_eq!(body["has_more"], json!(true));
+    assert!(body.get("total").is_none(), "total must be opt-in");
+
+    // Opt-in exact total.
+    let resp = app
+        .oneshot(req(
+            "GET",
+            "/api/v1/jobs?limit=2&include_total=true",
+            Some("key"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let body = json_body(resp).await;
+    assert_eq!(body["total"], json!(3));
+}
+
+#[tokio::test]
+async fn idempotency_key_header_replays_job() {
+    let app = app();
+    let send = |app: axum::Router| async move {
+        let mut r = req(
+            "POST",
+            "/api/v1/jobs",
+            Some("key"),
+            Some(json!({"task_name": "echo"})),
+        );
+        r.headers_mut()
+            .insert("idempotency-key", "abc-123".parse().unwrap());
+        let resp = app.oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        json_body(resp).await["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let first = send(app.clone()).await;
+    let second = send(app).await;
+    assert_eq!(first, second);
+}
+
+#[tokio::test]
 async fn openapi_json_is_served() {
     let resp = app()
         .oneshot(req("GET", "/openapi.json", None, None))
@@ -252,4 +356,10 @@ async fn openapi_json_is_served() {
     assert_eq!(spec["openapi"].as_str().unwrap().chars().next(), Some('3'));
     assert!(spec["paths"]["/api/v1/jobs"].is_object());
     assert!(spec["paths"]["/api/v1/workflows"].is_object());
+    // Worker protocol + SSE are part of the published contract.
+    assert!(spec["paths"]["/api/v1/queues/{queue}/lease"].is_object());
+    assert!(spec["paths"]["/api/v1/jobs/{id}/complete"].is_object());
+    assert!(spec["paths"]["/api/v1/jobs/{id}/fail"].is_object());
+    assert!(spec["paths"]["/api/v1/jobs/{id}/heartbeat"].is_object());
+    assert!(spec["paths"]["/api/v1/jobs/{id}/events"].is_object());
 }

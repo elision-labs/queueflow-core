@@ -1,5 +1,5 @@
 .PHONY: help build run test test-pg fmt fmt-check lint clippy clean docker spec validate-spec \
-        sdks sdks-python sdks-typescript sdks-rust sdks-go sdks-java
+        sdks sdks-python sdks-typescript sdks-go check-ts-sdk
 
 CARGO ?= cargo
 BIN := queueflow
@@ -49,20 +49,17 @@ validate-spec: spec ## Validate the generated spec with openapi-generator
 	docker run --rm -v "$(CURDIR)/$(SPEC_DIR):/spec:ro" \
 		$(OPENAPI_IMAGE) validate -i /spec/openapi.json
 
-sdks: validate-spec ## Regenerate all SDKs (python, typescript, rust, go, java)
+sdks: validate-spec ## Regenerate on-demand generated SDKs (python, go). Rust = crates/queueflow-client; TS = hand-written.
 	./scripts/generate-sdks.sh all
 
-sdks-python: validate-spec ## Regenerate the Python SDK
+sdks-python: validate-spec ## Regenerate the Python SDK (on demand)
 	./scripts/generate-sdks.sh python
 
-sdks-typescript: validate-spec ## Regenerate the TypeScript SDK
-	./scripts/generate-sdks.sh typescript
+sdks-typescript: ## (hand-written) build the TypeScript SDK in ../queueflow-sdk-nodejs
+	cd ../queueflow-sdk-nodejs && npm install && npm run build
 
-sdks-rust: validate-spec ## Regenerate the Rust SDK
-	./scripts/generate-sdks.sh rust
-
-sdks-go: validate-spec ## Regenerate the Go SDK
+sdks-go: validate-spec ## Regenerate the Go SDK (on demand)
 	./scripts/generate-sdks.sh go
 
-sdks-java: validate-spec ## Regenerate the Java SDK
-	./scripts/generate-sdks.sh java
+check-ts-sdk: spec ## Verify the hand-written TS SDK still matches the spec
+	node ./scripts/check-ts-sdk.mjs

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---- Build stage ----
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.96-bookworm AS builder
 WORKDIR /app
 
 # Copy the whole workspace and build the server binary in release mode.
