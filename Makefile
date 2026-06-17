@@ -49,17 +49,17 @@ validate-spec: spec ## Validate the generated spec with openapi-generator
 	docker run --rm -v "$(CURDIR)/$(SPEC_DIR):/spec:ro" \
 		$(OPENAPI_IMAGE) validate -i /spec/openapi.json
 
-sdks: validate-spec ## Regenerate on-demand generated SDKs (python, go). Rust = crates/queueflow-client; TS = hand-written.
+sdks: validate-spec ## Regenerate the Python + Go SDKs (generated core + injected facade). Rust = native crate; TS = own repo.
 	./scripts/generate-sdks.sh all
 
-sdks-python: validate-spec ## Regenerate the Python SDK (on demand)
+sdks-python: validate-spec ## Regenerate the Python SDK (generated core + facade supporting file)
 	./scripts/generate-sdks.sh python
 
-sdks-typescript: ## (hand-written) build the TypeScript SDK in ../queueflow-sdk-nodejs
-	cd ../queueflow-sdk-nodejs && npm install && npm run build
+sdks-typescript: ## Regenerate the TS core (../queueflow-sdk-nodejs) and build the facade
+	cd ../queueflow-sdk-nodejs && npm install && npm run generate-core && npm run build
 
-sdks-go: validate-spec ## Regenerate the Go SDK (on demand)
+sdks-go: validate-spec ## Regenerate the Go SDK (generated core + facade supporting file)
 	./scripts/generate-sdks.sh go
 
-check-ts-sdk: spec ## Verify the hand-written TS SDK still matches the spec
+check-ts-sdk: spec ## Verify the TS generated core + facade match the spec
 	node ./scripts/check-ts-sdk.mjs

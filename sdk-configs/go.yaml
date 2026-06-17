@@ -1,5 +1,24 @@
 # openapi-generator config for the Go SDK.
+#
+# Generates the core (APIClient + services + models) AND injects the
+# hand-written ergonomic facade as a supporting file
+# (sdk-templates/go/facade.mustache), so the package ships `NewQueueFlow`,
+# `WaitForJob`/`WaitForWorkflow`, and a workflow builder that raw codegen cannot
+# emit. templateDir holds only the facade template; every other template falls
+# back to the generator's built-in default.
 generatorName: go
+# Module path baked into go.mod; matches the import in FACADE.md.
+gitHost: github.com
+gitUserId: queueflow
+gitRepoId: queueflow-sdk-go
+templateDir: /templates
+files:
+  facade.mustache:
+    destinationFilename: facade.go
+    templateType: SupportingFiles
+  facade-readme.mustache:
+    destinationFilename: FACADE.md
+    templateType: SupportingFiles
 additionalProperties:
   packageName: queueflow
   packageVersion: 0.1.0

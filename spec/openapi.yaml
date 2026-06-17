@@ -703,6 +703,9 @@ components:
         result:
           type: object
           description: Handler result, recorded on the job and merged into workflow context.
+          additionalProperties: {}
+          propertyNames:
+            type: string
     CreateBatchJobsRequest:
       type: object
       required:
@@ -737,6 +740,9 @@ components:
         payload:
           type: object
           description: Arbitrary JSON object passed to the handler.
+          additionalProperties: {}
+          propertyNames:
+            type: string
         run_at:
           type:
           - string
@@ -766,8 +772,14 @@ components:
       properties:
         context:
           type: object
+          additionalProperties: {}
+          propertyNames:
+            type: string
         metadata:
           type: object
+          additionalProperties: {}
+          propertyNames:
+            type: string
         name:
           type: string
         steps:
@@ -898,6 +910,9 @@ components:
             a duplicate.
         metadata:
           type: object
+          additionalProperties: {}
+          propertyNames:
+            type: string
         next_retry_at:
           type:
           - string
@@ -908,12 +923,18 @@ components:
             while the job is `retrying`; kept for audit/inspection).
         payload:
           type: object
+          additionalProperties: {}
+          propertyNames:
+            type: string
         queue_name:
           type: string
         result:
           type:
           - object
           - 'null'
+          additionalProperties: {}
+          propertyNames:
+            type: string
         retry_count:
           type: integer
           format: int32
@@ -1225,6 +1246,9 @@ components:
           description: |-
             Accumulated step results, keyed by step name. Passed to downstream steps
             under the `_context` payload key.
+          additionalProperties: {}
+          propertyNames:
+            type: string
         created_at:
           type: string
           format: date-time
@@ -1232,6 +1256,9 @@ components:
           type: string
         metadata:
           type: object
+          additionalProperties: {}
+          propertyNames:
+            type: string
         name:
           type: string
         started_at:
@@ -1290,6 +1317,9 @@ components:
             type: string
         metadata:
           type: object
+          additionalProperties: {}
+          propertyNames:
+            type: string
         name:
           type: string
         on_failure:
@@ -1298,6 +1328,9 @@ components:
           $ref: '#/components/schemas/OnSuccess'
         payload:
           type: object
+          additionalProperties: {}
+          propertyNames:
+            type: string
         task_name:
           type: string
   securitySchemes:

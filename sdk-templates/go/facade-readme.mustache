@@ -1,0 +1,65 @@
+# QueueFlow Go facade
+
+This package ships an ergonomic facade (`facade.go`) layered over the generated client. It is the
+recommended entry point. The generated `APIClient` and its `*APIService` groups remain available for
+anything the helpers do not cover.
+
+## Quick start
+
+```go
+package main
+
+import (
+	"log"
+	"time"
+
+	queueflow "github.com/queueflow/queueflow-sdk-go"
+)
+
+func main() {
+	qf := queueflow.NewQueueFlow("http://localhost:8000", "dev")
+
+	// Enqueue a job and wait for the result.
+	job, err := qf.CreateJob("echo", map[string]interface{}{"hello": "world"})
+	if err != nil {
+		log.Fatal(err)
+	}
+	done, err := qf.WaitForJob(job.Id, 60*time.Second, 500*time.Millisecond)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println(done.Status, done.Result)
+
+	// Declare and run a DAG workflow.
+	dag := queueflow.NewWorkflowBuilder("etl").
+		Step("extract", "echo").
+		Step("transform", "echo", "extract").
+		Step("load", "echo", "transform")
+	wf, err := qf.CreateWorkflow(dag)
+	if err != nil {
+		log.Fatal(err)
+	}
+	finished, _ := qf.WaitForWorkflow(wf.Id, 60*time.Second, 500*time.Millisecond)
+	log.Println(finished.Status)
+}
+```
+
+## API
+
+`NewQueueFlow(baseURL, token) *QueueFlow` exposes:
+
+- `.Client` — the generated `*APIClient` (`.Client.JobsAPI`, `.Client.WorkflowsAPI`, ...), for
+  anything the helpers below do not cover.
+- `CreateJob(task string, payload map[string]interface{}) (*Job, error)`
+- `WaitForJob(jobID string, timeout, interval time.Duration) (*Job, error)`
+- `CreateWorkflow(b *WorkflowBuilder) (*Workflow, error)`
+- `WaitForWorkflow(workflowID string, timeout, interval time.Duration) (*Workflow, error)`
+
+`NewWorkflowBuilder(name)` builds a DAG; `Build()` validates locally (duplicate names, dangling
+dependencies, cycles) and returns an error before any network round-trip.
+
+## How this package is built
+
+The facade is injected at generation time from the queueflow-core-rs template
+(`sdk-templates/go/facade.mustache`), so it is regenerated alongside the generated core and can never
+drift from the server. Do not edit `facade.go` directly; edit the template.

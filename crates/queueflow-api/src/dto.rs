@@ -55,7 +55,7 @@ pub struct CreateJobRequest {
     pub task_name: String,
     /// Arbitrary JSON object passed to the handler.
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub payload: Map,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<JobConfigRequest>,
@@ -225,7 +225,7 @@ pub struct CompleteJobRequest {
     pub lease_token: String,
     /// Handler result, recorded on the job and merged into workflow context.
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub result: Map,
 }
 

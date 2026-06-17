@@ -1153,7 +1153,11 @@
           },
           "result": {
             "type": "object",
-            "description": "Handler result, recorded on the job and merged into workflow context."
+            "description": "Handler result, recorded on the job and merged into workflow context.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           }
         }
       },
@@ -1208,7 +1212,11 @@
           },
           "payload": {
             "type": "object",
-            "description": "Arbitrary JSON object passed to the handler."
+            "description": "Arbitrary JSON object passed to the handler.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "run_at": {
             "type": [
@@ -1244,10 +1252,18 @@
         ],
         "properties": {
           "context": {
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "metadata": {
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "name": {
             "type": "string"
@@ -1413,7 +1429,11 @@
             "description": "Client-supplied key that makes job creation idempotent per tenant:\nre-submitting the same key returns the original job instead of creating\na duplicate."
           },
           "metadata": {
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "next_retry_at": {
             "type": [
@@ -1424,7 +1444,11 @@
             "description": "When this job's next retry becomes claimable (mirrors `scheduled_at`\nwhile the job is `retrying`; kept for audit/inspection)."
           },
           "payload": {
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "queue_name": {
             "type": "string"
@@ -1433,7 +1457,11 @@
             "type": [
               "object",
               "null"
-            ]
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "retry_count": {
             "type": "integer",
@@ -1830,7 +1858,11 @@
           },
           "context": {
             "type": "object",
-            "description": "Accumulated step results, keyed by step name. Passed to downstream steps\nunder the `_context` payload key."
+            "description": "Accumulated step results, keyed by step name. Passed to downstream steps\nunder the `_context` payload key.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "created_at": {
             "type": "string",
@@ -1840,7 +1872,11 @@
             "type": "string"
           },
           "metadata": {
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "name": {
             "type": "string"
@@ -1923,7 +1959,11 @@
             }
           },
           "metadata": {
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "name": {
             "type": "string"
@@ -1935,7 +1975,11 @@
             "$ref": "#/components/schemas/OnSuccess"
           },
           "payload": {
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "task_name": {
             "type": "string"

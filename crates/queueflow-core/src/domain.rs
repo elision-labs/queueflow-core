@@ -170,7 +170,7 @@ pub struct Job {
     pub queue_name: String,
     pub task_name: String,
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = HashMap<String, serde_json::Value>)]
     pub payload: Map,
     pub config: JobConfig,
     pub status: JobStatus,
@@ -201,10 +201,10 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_step_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Object, nullable)]
+    #[schema(value_type = HashMap<String, serde_json::Value>, nullable)]
     pub result: Option<Json>,
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = HashMap<String, serde_json::Value>)]
     pub metadata: Map,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
@@ -255,7 +255,7 @@ pub struct WorkflowStep {
     pub name: String,
     pub task_name: String,
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = HashMap<String, serde_json::Value>)]
     pub payload: Map,
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -266,7 +266,7 @@ pub struct WorkflowStep {
     #[serde(default)]
     pub on_failure: OnFailure,
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = HashMap<String, serde_json::Value>)]
     pub metadata: Map,
 }
 
@@ -285,10 +285,10 @@ pub struct Workflow {
     /// Accumulated step results, keyed by step name. Passed to downstream steps
     /// under the `_context` payload key.
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = HashMap<String, serde_json::Value>)]
     pub context: Map,
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = HashMap<String, serde_json::Value>)]
     pub metadata: Map,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
@@ -301,10 +301,10 @@ pub struct CreateWorkflowRequest {
     pub name: String,
     pub steps: Vec<WorkflowStep>,
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = HashMap<String, serde_json::Value>)]
     pub context: Map,
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = HashMap<String, serde_json::Value>)]
     pub metadata: Map,
 }
 

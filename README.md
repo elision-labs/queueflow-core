@@ -304,28 +304,38 @@ parity by the opt-in integration suite.
 ## SDKs
 
 The OpenAPI spec is generated from the Rust handlers and types (`make spec`), so it always matches
-the server, and it is attached to every GitHub release. The client strategy per language:
+the server, and it is attached to every GitHub release.
 
-- **Rust** — the native [`queueflow-client`](./crates/queueflow-client) crate in this workspace. It
-  reuses the engine's own domain types (so it cannot drift), covers every spec operation — the
-  producer surface, the remote worker protocol, the SSE job-event stream, and the health/readiness
-  probes — and is integration-tested against the real router on every CI run.
-- **TypeScript/Node.js** — the **[hand-written SDK](../queueflow-sdk-nodejs)** for a more ergonomic
-  developer experience: `qf.jobs.create({ task, payload })`, a `waitFor()` poller, a workflow
-  builder DSL, and typed errors. `make check-ts-sdk` guards it against spec drift in CI.
-- **Everything else** — generate on demand from the released spec with your own toolchain:
+Every SDK except Rust uses the same two-layer shape: a **generated core** plus a thin
+**hand-written facade**.
 
-  ```bash
-  openapi-generator-cli generate -i openapi.json -g python -o ./queueflow-python
-  ```
+- **Generated core** (never hand-edited): models, per-tag API clients, and the HTTP transport,
+  produced from the spec by [openapi-generator](https://openapi-generator.tech). Because it is
+  regenerated, it cannot drift from the server.
+- **Facade** (small, hand-written): the ergonomics codegen cannot express. A `QueueFlow` client with
+  resource groups, `create()` (enqueue + fetch), `waitFor`/`wait_for` pollers, the `watch()` SSE
+  stream, the remote-worker run loop, a workflow builder with local cycle detection, and a typed
+  error hierarchy.
 
-  `make sdks` (python, go) remains available for maintained snapshots in the sibling repos, but
-  they are produced at release time rather than continuously published.
+Per language:
+
+- **Rust** [`queueflow-client`](./crates/queueflow-client) is the native crate in this workspace; it
+  reuses the engine's own domain types (so it cannot drift) and is integration-tested against the
+  real router on every CI run. No codegen can beat that, so Rust is not generated.
+- **TypeScript/Node.js** [`queueflow-sdk-nodejs`](../queueflow-sdk-nodejs): generated core in `core/`
+  (regenerate with `npm run generate-core`), hand-written facade in `src/`, bundled to dual ESM + CJS
+  with tsup. `make check-ts-sdk` asserts the core covers every spec operation and the facade surfaces
+  every tag group.
+- **Python / Go**: `make sdks` regenerates both. The facade ships as an openapi-generator supporting
+  file ([`sdk-templates/<lang>/facade.*`](./sdk-templates)) injected at generation time, so it lands
+  inside the generated package (`queueflow/facade.py`, `facade.go`) and is regenerated alongside the
+  core. CI compiles both facades against fresh codegen to catch drift.
 
 ```bash
 make spec            # writes spec/openapi.{json,yaml} from the code
 make validate-spec   # validate via openapi-generator (Docker)
-make check-ts-sdk    # assert the hand-written TS SDK covers every spec operation
+make sdks            # regenerate the Python + Go SDKs (generated core + injected facade)
+make check-ts-sdk    # assert the TS generated core + facade match the spec
 ```
 
 ## Documentation

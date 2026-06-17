@@ -1,21 +1,21 @@
-# =============================================================================
-# TEMPORARILY DISABLED — commented out until the repo and secrets are ready.
-# Re-enable by uncommenting the block below (remove the leading "# " on each
-# line after this banner).
-# =============================================================================
+# TEMPORARILY DISABLED - commenting out the entire file until we re-enable CI for the Rust core.
+# The CI workflow is currently configured to run on every push and PR to main and develop, but we want
+# to disable it for now while we focus on the Go SDK and stabilize the core.
+
 # name: QueueFlow Core (Rust) CI
-# 
 # on:
 #   push:
 #     branches: [main, develop]
 #   pull_request:
 #     branches: [main]
-# 
+
 # env:
 #   CARGO_TERM_COLOR: always
-# 
+#   # Pinned so codegen output is reproducible across local runs and CI.
+#   OPENAPI_GENERATOR_IMAGE: openapitools/openapi-generator-cli:v7.10.0
+
 # jobs:
-#   test:
+#   rust:
 #     name: fmt + clippy + tests
 #     runs-on: ubuntu-latest
 #     steps:
@@ -30,35 +30,96 @@
 #         run: cargo clippy --workspace --all-targets -- -D warnings
 #       - name: Tests (no database)
 #         run: cargo test --workspace
-# 
+
 #   spec:
-#     name: OpenAPI spec + validate
+#     name: OpenAPI spec (generate + no-drift + validate)
 #     runs-on: ubuntu-latest
 #     steps:
 #       - uses: actions/checkout@v4
 #       - uses: dtolnay/rust-toolchain@1.96.0
 #       - uses: Swatinem/rust-cache@v2
-#       - name: Generate spec
+#       - name: Generate spec from code
 #         run: cargo run -q -p queueflow-server -- spec --output-dir spec
+#       - name: Assert the committed spec is in sync with the code
+#         run: |
+#           if ! git diff --exit-code -- spec/; then
+#             echo "::error::spec/ is out of date. Run 'make spec' and commit the result." >&2
+#             exit 1
+#           fi
 #       - name: Validate spec
 #         run: |
 #           docker run --rm -v "${{ github.workspace }}/spec:/spec:ro" \
-#             openapitools/openapi-generator-cli:v7.10.0 validate -i /spec/openapi.json
-#       # The hand-written TypeScript SDK lives in a sibling repo; check it out
-#       # next to this one so the drift guard can compare it against the spec.
-#       - name: Checkout hand-written TS SDK
-#         uses: actions/checkout@v4
-#         with:
-#           repository: queue-flow/sdk-typescript
-#           path: ../queueflow-sdk-nodejs
-#       - name: Check hand-written TS SDK drift
-#         run: node ./scripts/check-ts-sdk.mjs
+#             "${OPENAPI_GENERATOR_IMAGE}" validate -i /spec/openapi.json
 #       - name: Upload spec artifact
 #         uses: actions/upload-artifact@v4
 #         with:
 #           name: openapi-spec
 #           path: spec/
-# 
+
+#   sdk-codegen:
+#     name: SDK codegen + facade compiles (python, go)
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: actions/setup-go@v5
+#         with:
+#           go-version: "1.24"
+#       # Regenerate the Python + Go SDKs (generated core + injected facade) from
+#       # the committed spec, templates, and configs, into throwaway dirs. This
+#       # guards the hand-written facade templates against codegen drift (e.g. a
+#       # facade symbol colliding with or renamed in the generated core).
+#       - name: Generate Go SDK and compile (core + facade)
+#         run: |
+#           out="$(mktemp -d)"
+#           docker run --rm \
+#             -v "${{ github.workspace }}/spec/openapi.json:/spec/openapi.json:ro" \
+#             -v "${{ github.workspace }}/sdk-configs/go.yaml:/config.yaml:ro" \
+#             -v "${{ github.workspace }}/sdk-templates/go:/templates:ro" \
+#             -v "${out}:/out" \
+#             "${OPENAPI_GENERATOR_IMAGE}" generate -i /spec/openapi.json -c /config.yaml -o /out
+#           test -f "${out}/facade.go" || { echo "::error::go facade was not generated" >&2; exit 1; }
+#           (cd "${out}" && go build ./...)
+#       - name: Generate Python SDK and byte-compile facade
+#         run: |
+#           out="$(mktemp -d)"
+#           docker run --rm \
+#             -v "${{ github.workspace }}/spec/openapi.json:/spec/openapi.json:ro" \
+#             -v "${{ github.workspace }}/sdk-configs/python.yaml:/config.yaml:ro" \
+#             -v "${{ github.workspace }}/sdk-templates/python:/templates:ro" \
+#             -v "${out}:/out" \
+#             "${OPENAPI_GENERATOR_IMAGE}" generate -i /spec/openapi.json -c /config.yaml -o /out
+#           test -f "${out}/queueflow/facade.py" || { echo "::error::python facade was not generated" >&2; exit 1; }
+#           python3 -m py_compile "${out}/queueflow/facade.py"
+
+#   ts-sdk-drift:
+#     name: TypeScript SDK drift guard
+#     runs-on: ubuntu-latest
+#     # The TS SDK is a separate repo (generated core/ + hand-written facade src/).
+#     # This job checks it out next to the spec and asserts the generated core
+#     # covers every spec operation and the facade surfaces every tag group.
+#     #
+#     # Requires:
+#     #   - the SDK repo to live under the same owner as this repo (adjust below);
+#     #   - its generated core/ committed;
+#     #   - secrets.SDK_REPO_TOKEN: a PAT with read access, IF the SDK repo is
+#     #     private. Omit for a public SDK repo.
+#     steps:
+#       - name: Checkout core (spec lives here)
+#         uses: actions/checkout@v4
+#       - name: Checkout TypeScript SDK
+#         uses: actions/checkout@v4
+#         with:
+#           repository: ${{ github.repository_owner }}/queueflow-sdk-nodejs
+#           token: ${{ secrets.SDK_REPO_TOKEN || github.token }}
+#           path: .sdk-ts
+#       - uses: actions/setup-node@v4
+#         with:
+#           node-version: "20"
+#       - name: Check generated core + facade against the spec
+#         env:
+#           QUEUEFLOW_SDK_DIR: ${{ github.workspace }}/.sdk-ts
+#         run: node ./scripts/check-ts-sdk.mjs
+
 #   postgres:
 #     name: Postgres integration
 #     runs-on: ubuntu-latest
@@ -84,11 +145,11 @@
 #         run: cargo test -p queueflow-core --features postgres --test pg_integration
 #         env:
 #           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/queueflow_test
-# 
+
 #   docker:
 #     name: Docker build
 #     runs-on: ubuntu-latest
-#     needs: [test]
+#     needs: [rust]
 #     steps:
 #       - uses: actions/checkout@v4
 #       - uses: docker/setup-buildx-action@v3

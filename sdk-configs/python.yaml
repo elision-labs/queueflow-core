@@ -1,5 +1,19 @@
 # openapi-generator config for the Python SDK (pydantic/urllib3).
+#
+# Generates the core (api clients + models) AND injects the hand-written
+# ergonomic facade as a supporting file (sdk-templates/python/facade.mustache),
+# so the published package ships `QueueFlow`, `wait_for_*`, and a workflow
+# builder that raw codegen cannot emit. templateDir holds only the facade
+# template; every other template falls back to the generator's built-in default.
 generatorName: python
+templateDir: /templates
+files:
+  facade.mustache:
+    destinationFilename: queueflow/facade.py
+    templateType: SupportingFiles
+  facade-readme.mustache:
+    destinationFilename: FACADE.md
+    templateType: SupportingFiles
 additionalProperties:
   packageName: queueflow
   projectName: queueflow
