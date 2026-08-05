@@ -69,6 +69,30 @@ func (q *QueueFlow) WaitForJob(jobID string, timeout, interval time.Duration) (*
 	}
 }
 
+// CreateCron registers a recurring enqueue (5-field crontab, evaluated in
+// UTC) and returns the schedule id. Use q.Client.CronAPI for list, pause,
+// resume, and delete.
+func (q *QueueFlow) CreateCron(name, cronExpr, task string) (string, error) {
+	req := CreateCronRequest{Name: name, CronExpr: cronExpr, TaskName: task}
+	resp, _, err := q.Client.CronAPI.CreateCron(q.ctx).CreateCronRequest(req).Execute()
+	if err != nil {
+		return "", err
+	}
+	return resp.CronId, nil
+}
+
+// ReplayDeadLetter re-runs a dead-lettered job as a fresh job and returns the
+// new job record. Each entry replays at most once (a second replay is a 409).
+// Use q.Client.DlqAPI to list and inspect entries.
+func (q *QueueFlow) ReplayDeadLetter(id int64) (*Job, error) {
+	resp, _, err := q.Client.DlqAPI.ReplayDeadLetter(q.ctx, id).Execute()
+	if err != nil {
+		return nil, err
+	}
+	job, _, err := q.Client.JobsAPI.GetJob(q.ctx, resp.JobId).Execute()
+	return job, err
+}
+
 // CreateWorkflow creates a workflow from a builder (or a raw request) and
 // returns the freshly-created record.
 func (q *QueueFlow) CreateWorkflow(b *WorkflowBuilder) (*Workflow, error) {

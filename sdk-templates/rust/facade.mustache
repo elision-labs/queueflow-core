@@ -13,7 +13,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::apis::configuration::Configuration;
-use crate::apis::{jobs_api, workflows_api};
+use crate::apis::{cron_api, dlq_api, jobs_api, workflows_api};
 use crate::models;
 
 /// Errors surfaced by the facade helpers.
@@ -150,6 +150,38 @@ impl QueueFlow {
             .await
             .map_err(api_err)?;
         workflows_api::get_workflow(&self.config, &created.workflow_id)
+            .await
+            .map_err(api_err)
+    }
+
+    /// Registers a recurring enqueue (5-field crontab, evaluated in UTC) and
+    /// returns the schedule id. Drop down to [`crate::apis::cron_api`] for
+    /// list, pause, resume, and delete.
+    pub async fn create_cron(
+        &self,
+        name: &str,
+        schedule: &str,
+        task: &str,
+    ) -> Result<String, FacadeError> {
+        let req = models::CreateCronRequest::new(
+            name.to_owned(),
+            schedule.to_owned(),
+            task.to_owned(),
+        );
+        let resp = cron_api::create_cron(&self.config, req)
+            .await
+            .map_err(api_err)?;
+        Ok(resp.cron_id)
+    }
+
+    /// Re-runs a dead-lettered job as a fresh job and returns the new job
+    /// record. Each entry replays at most once (a second replay is a 409).
+    /// Drop down to [`crate::apis::dlq_api`] to list and inspect entries.
+    pub async fn replay_dead_letter(&self, id: i64) -> Result<models::Job, FacadeError> {
+        let resp = dlq_api::replay_dead_letter(&self.config, id)
+            .await
+            .map_err(api_err)?;
+        jobs_api::get_job(&self.config, &resp.job_id)
             .await
             .map_err(api_err)
     }

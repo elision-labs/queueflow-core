@@ -32,7 +32,7 @@ print(finished.status, finished.context)
 
 `QueueFlow(base_url, token)` exposes:
 
-- `.jobs` / `.workflows` / `.worker` / `.system` — the generated api clients, for anything the
+- `.jobs` / `.workflows` / `.worker` / `.cron` / `.dlq` / `.system` — the generated api clients, for anything the
   helpers below do not cover.
 - `.create_job(task, payload=None, priority=None, max_retries=None, timeout=None, queue=None, idempotency_key=None) -> Job`
 - `.wait_for_job(job_id, timeout=60.0, interval=0.5) -> Job`

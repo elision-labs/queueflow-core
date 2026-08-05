@@ -71,13 +71,14 @@ jobs:
           path: spec/
 
   sdk-codegen:
-    name: SDK codegen + facade compiles (python, go)
+    name: SDK codegen + facade compiles (python, go, rust)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
+      - uses: dtolnay/rust-toolchain@1.96.0
       # Regenerate the Python + Go SDKs (generated core + injected facade) from
       # the committed spec, templates, and configs, into throwaway dirs. This
       # guards the hand-written facade templates against codegen drift (e.g. a
@@ -104,6 +105,17 @@ jobs:
             "${OPENAPI_GENERATOR_IMAGE}" generate -i /spec/openapi.json -c /config.yaml -o /out
           test -f "${out}/queueflow/facade.py" || { echo "::error::python facade was not generated" >&2; exit 1; }
           python3 -m py_compile "${out}/queueflow/facade.py"
+      - name: Generate Rust SDK and compile (core + facade)
+        run: |
+          out="$(mktemp -d)"
+          docker run --rm \
+            -v "${{ github.workspace }}/spec/openapi.json:/spec/openapi.json:ro" \
+            -v "${{ github.workspace }}/sdk-configs/rust.yaml:/config.yaml:ro" \
+            -v "${{ github.workspace }}/sdk-templates/rust:/templates:ro" \
+            -v "${out}:/out" \
+            "${OPENAPI_GENERATOR_IMAGE}" generate -i /spec/openapi.json -c /config.yaml -o /out
+          test -f "${out}/src/facade.rs" || { echo "::error::rust facade was not generated" >&2; exit 1; }
+          (cd "${out}" && cargo build)
 
   ts-sdk-drift:
     name: TypeScript SDK drift guard

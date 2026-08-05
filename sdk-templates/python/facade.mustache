@@ -18,9 +18,12 @@ from .api.workflows_api import WorkflowsApi
 from .api.worker_api import WorkerApi
 from .api.system_api import SystemApi
 from .api.health_api import HealthApi
+from .api.cron_api import CronApi
+from .api.dlq_api import DlqApi
 from .models.create_job_request import CreateJobRequest
 from .models.job_config_request import JobConfigRequest
 from .models.create_workflow_request import CreateWorkflowRequest
+from .models.create_cron_request import CreateCronRequest
 from .models.workflow_step import WorkflowStep
 from .models.job import Job
 from .models.workflow import Workflow
@@ -52,6 +55,8 @@ class QueueFlow:
         self.jobs = JobsApi(self._client)
         self.workflows = WorkflowsApi(self._client)
         self.worker = WorkerApi(self._client)
+        self.cron = CronApi(self._client)
+        self.dlq = DlqApi(self._client)
         self.system = SystemApi(self._client)
         self.health_api = HealthApi(self._client)
 
@@ -97,6 +102,30 @@ class QueueFlow:
             timeout,
             interval,
         )
+
+    # --- cron & dead letters ------------------------------------------------
+
+    def create_cron(
+        self,
+        name: str,
+        schedule: str,
+        task: str,
+        payload: Optional[Dict[str, Any]] = None,
+        queue: Optional[str] = None,
+    ) -> str:
+        """Register a recurring enqueue (5-field crontab, UTC); returns the schedule id."""
+        req = CreateCronRequest(
+            name=name, cron_expr=schedule, task_name=task, payload=payload or {}, queue=queue
+        )
+        return self.cron.create_cron(req).cron_id
+
+    def replay_dead_letter(self, dead_letter_id: int) -> Job:
+        """Re-run a dead-lettered job as a fresh job; returns the new job record.
+
+        Each entry replays at most once (a second replay is a 409).
+        """
+        replayed = self.dlq.replay_dead_letter(dead_letter_id)
+        return self.jobs.get_job(replayed.job_id)
 
     # --- internal -----------------------------------------------------------
 
