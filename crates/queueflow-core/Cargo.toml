@@ -1,6 +1,9 @@
 [package]
 name = "queueflow-core"
 description = "Core engine for QueueFlow: a PostgreSQL-native distributed job queue and workflow engine."
+readme = "README.md"
+keywords = ["queue", "jobs", "postgres", "workflow", "background-jobs"]
+categories = ["asynchronous", "database", "concurrency"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,15 +12,21 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
+[package.metadata.docs.rs]
+# Build docs with the Postgres adapter visible; default features exclude it.
+all-features = true
+
 [dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 tokio-util = { workspace = true }
+futures = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+cron = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 utoipa = { workspace = true }
@@ -32,5 +41,5 @@ default = []
 postgres = ["dep:sqlx"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 serde_json = { workspace = true }

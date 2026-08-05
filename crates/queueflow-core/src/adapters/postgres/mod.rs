@@ -25,8 +25,13 @@ pub async fn connect(database_url: &str, max_connections: u32) -> Result<PgPool,
 }
 
 /// Apply the embedded migrations (idempotent).
+///
+/// The migrations live inside this crate (`crates/queueflow-core/migrations`)
+/// so they are included in the published package; a path outside the crate
+/// root would be silently absent from crates.io and break this macro for
+/// downstream builds with the `postgres` feature.
 pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
-    sqlx::migrate!("../../migrations").run(pool).await
+    sqlx::migrate!("./migrations").run(pool).await
 }
 
 /// Serialize any value to a JSONB-compatible `serde_json::Value`.

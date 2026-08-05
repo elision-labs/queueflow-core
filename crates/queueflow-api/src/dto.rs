@@ -4,7 +4,7 @@
 //! every language.
 
 use chrono::{DateTime, Utc};
-use queueflow_core::{Job, JobConfig, Map, Workflow};
+use queueflow_core::{DeadLetter, Job, JobConfig, Map, Workflow};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -108,6 +108,39 @@ pub struct ListWorkflowsResponse {
     pub limit: i64,
     pub offset: i64,
     pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct CreateCronResponse {
+    pub cron_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct ListCronsResponse {
+    pub crons: Vec<queueflow_core::CronSchedule>,
+    /// Exact total match count; only present when `include_total=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<i64>,
+    pub limit: i64,
+    pub offset: i64,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct ListDeadLettersResponse {
+    pub dead_letters: Vec<DeadLetter>,
+    /// Exact total match count; only present when `include_total=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<i64>,
+    pub limit: i64,
+    pub offset: i64,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct ReplayDeadLetterResponse {
+    /// The fresh job created from the dead-lettered one.
+    pub job_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]

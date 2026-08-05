@@ -30,6 +30,8 @@ struct Ctx {
     engine: Arc<Mem>,
     store: Arc<InMemoryJobStore>,
     order: Arc<Mutex<Vec<String>>>,
+    /// Payload received by the last `grab` handler invocation.
+    grabbed: Arc<Mutex<Option<Map>>>,
 }
 
 /// Build an engine whose handlers record execution order and implement a few
@@ -38,6 +40,7 @@ fn ctx(ctx_seen: Arc<AtomicBool>) -> Ctx {
     let clock = Arc::new(TestClock::epoch());
     let store = Arc::new(InMemoryJobStore::new(clock.clone()));
     let order = Arc::new(Mutex::new(Vec::<String>::new()));
+    let grabbed = Arc::new(Mutex::new(None::<Map>));
 
     let o1 = order.clone();
     let o2 = order.clone();
@@ -86,12 +89,24 @@ fn ctx(ctx_seen: Arc<AtomicBool>) -> Ctx {
                 Ok(Map::new())
             }
         })
+        // Stores the payload it received, for asserting on injected context.
+        .register_fn("grab", {
+            let grabbed = grabbed.clone();
+            move |p: Map| {
+                let g = grabbed.clone();
+                async move {
+                    *g.lock().unwrap() = Some(p);
+                    Ok(Map::new())
+                }
+            }
+        })
         .build();
 
     Ctx {
         engine,
         store,
         order,
+        grabbed,
     }
 }
 
@@ -541,5 +556,431 @@ async fn cancelling_a_finished_workflow_is_a_conflict() {
         c.engine.get_workflow(&id).await.unwrap().status,
         WorkflowStatus::Completed,
         "terminal workflow status must never be rewritten"
+    );
+}
+
+#[tokio::test]
+async fn workflow_with_absurd_step_config_is_rejected_before_persisting() {
+    let c = ctx(Arc::new(AtomicBool::new(false)));
+    let req = WorkflowBuilder::new("bad-config")
+        .step(step("a", "ok", &[]).config(JobConfig {
+            retry_max_delay_secs: u64::MAX,
+            ..JobConfig::default()
+        }))
+        .build()
+        .unwrap();
+
+    let err = c.engine.create_workflow(req, None).await.unwrap_err();
+    assert!(matches!(err, EngineError::Validation(_)), "got: {err:?}");
+
+    let page = c
+        .engine
+        .list_workflows(&ListFilter {
+            include_total: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.total, Some(0), "nothing may be persisted");
+}
+
+#[tokio::test]
+async fn halt_cancels_already_scheduled_sibling_jobs() {
+    let c = ctx(Arc::new(AtomicBool::new(false)));
+    // Both roots are enqueued when the workflow starts; priority makes the
+    // failing step claimable first while its sibling's job is still pending.
+    let req = WorkflowBuilder::new("halt-siblings")
+        .step(step("boom", "fail", &[]).config(JobConfig {
+            priority: 10,
+            ..JobConfig::default()
+        }))
+        .step(step("slow", "ok", &[]))
+        .build()
+        .unwrap();
+    let id = c.engine.create_workflow(req, None).await.unwrap();
+
+    // One tick claims and permanently fails "boom", halting the workflow.
+    assert!(c.engine.process_once("default").await.unwrap());
+
+    assert_eq!(
+        c.engine.get_workflow(&id).await.unwrap().status,
+        WorkflowStatus::Failed
+    );
+    assert_eq!(
+        step_status(&c.store, &id, "slow").await,
+        StepStatus::Cancelled
+    );
+
+    // The sibling's already-enqueued job must not stay claimable: no worker
+    // should start fresh work for a halted workflow.
+    let slow_job = c
+        .store
+        .workflow_step_statuses(&id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "slow")
+        .unwrap()
+        .job_id
+        .expect("slow was scheduled at workflow start");
+    assert_eq!(
+        c.engine.get_job(&slow_job).await.unwrap().status,
+        JobStatus::Cancelled
+    );
+    assert!(!c.engine.process_once("default").await.unwrap());
+    assert!(!c.order.lock().unwrap().iter().any(|w| w == "slow"));
+}
+
+#[tokio::test]
+async fn fan_in_join_step_receives_context_from_all_dependencies() {
+    let c = ctx(Arc::new(AtomicBool::new(false)));
+    let req = WorkflowBuilder::new("fan-in-ctx")
+        .step(step("x", "ok", &[]))
+        .step(step("y", "ok", &[]))
+        .step(step("z", "grab", &["x", "y"]))
+        .build()
+        .unwrap();
+    let id = c.engine.create_workflow(req, None).await.unwrap();
+    drain(&c.engine).await;
+
+    assert_eq!(
+        c.engine.get_workflow(&id).await.unwrap().status,
+        WorkflowStatus::Completed
+    );
+    let payload = c.grabbed.lock().unwrap().clone().expect("z ran");
+    let ctx_val = payload.get(CONTEXT_KEY).expect("z received _context");
+    assert_eq!(
+        ctx_val.get("x").and_then(|v| v.get("who")),
+        Some(&json!("x"))
+    );
+    assert_eq!(
+        ctx_val.get("y").and_then(|v| v.get("who")),
+        Some(&json!("y"))
+    );
+}
+
+#[tokio::test]
+async fn janitor_heals_a_crash_between_context_merge_and_status_write() {
+    // `on_step_completed` merges the context first and marks the step
+    // Completed second. Simulate a worker that crashed between the two
+    // writes: the job is terminal, the context already holds its result, but
+    // the step is still pending. The stalled-step sweep must re-drive the
+    // completion so the join step is scheduled with a complete context.
+    let c = ctx(Arc::new(AtomicBool::new(false)));
+    let req = WorkflowBuilder::new("crash-window")
+        .step(step("x", "ok", &[]))
+        .step(step("y", "ok", &[]))
+        .step(step("z", "grab", &["x", "y"]))
+        .build()
+        .unwrap();
+    let id = c.engine.create_workflow(req, None).await.unwrap();
+
+    // Claim both root jobs; drive x through the engine normally.
+    let claimed = c.store.claim_jobs("default", 2, 30).await.unwrap().jobs;
+    let by_step = |name: &str| {
+        claimed
+            .iter()
+            .find(|l| l.job.workflow_step_id.as_deref() == Some(name))
+            .expect("both roots were claimed")
+            .clone()
+    };
+    c.engine.process_job(by_step("x")).await;
+
+    // y: terminal write and context merge land, then the "crash" (no status
+    // write, no advance).
+    let y = by_step("y");
+    let result = json!({"who": "y"});
+    assert!(c
+        .store
+        .finish_if_leased(
+            &y.job.id,
+            &y.lease_token,
+            JobStatus::Completed,
+            None,
+            Some(&result)
+        )
+        .await
+        .unwrap());
+    c.store
+        .merge_workflow_context(&id, "y", &result)
+        .await
+        .unwrap();
+
+    let report = c.engine.janitor_sweep().await;
+    assert!(report.healed_steps >= 1, "got: {report:?}");
+
+    drain(&c.engine).await;
+    assert_eq!(
+        c.engine.get_workflow(&id).await.unwrap().status,
+        WorkflowStatus::Completed
+    );
+    let payload = c.grabbed.lock().unwrap().clone().expect("z ran");
+    let ctx_val = payload.get(CONTEXT_KEY).expect("z received _context");
+    assert_eq!(
+        ctx_val.get("x").and_then(|v| v.get("who")),
+        Some(&json!("x")),
+        "context from x: {ctx_val:?}"
+    );
+    assert_eq!(
+        ctx_val.get("y").and_then(|v| v.get("who")),
+        Some(&json!("y")),
+        "y's result must survive the crash window: {ctx_val:?}"
+    );
+}
+
+// ---- Write-order probe -------------------------------------------------------
+
+/// A [`JobStore`] wrapper that records the relative order of workflow context
+/// merges and step-status writes, delegating everything else to the in-memory
+/// store. Guards the invariant that makes fan-in context propagation safe
+/// under concurrency: a step's result is merged into the context BEFORE the
+/// step is marked Completed, so an observer that sees a terminal dependency
+/// can trust that its context contribution is already visible.
+struct OrderProbe {
+    inner: InMemoryJobStore,
+    events: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl JobStore for OrderProbe {
+    async fn create_job(&self, job: &Job) -> Result<bool, StorageError> {
+        self.inner.create_job(job).await
+    }
+    async fn batch_create_jobs(&self, jobs: &[Job]) -> Result<Vec<String>, StorageError> {
+        self.inner.batch_create_jobs(jobs).await
+    }
+    async fn get_job(&self, id: &str) -> Result<Job, StorageError> {
+        self.inner.get_job(id).await
+    }
+    async fn list_jobs(&self, filter: &ListFilter) -> Result<Page<Job>, StorageError> {
+        self.inner.list_jobs(filter).await
+    }
+    async fn find_job_by_idempotency_key(
+        &self,
+        tenant_id: Option<&str>,
+        key: &str,
+    ) -> Result<Option<Job>, StorageError> {
+        self.inner.find_job_by_idempotency_key(tenant_id, key).await
+    }
+    async fn claim_jobs(
+        &self,
+        queue: &str,
+        count: usize,
+        lease_secs: u32,
+    ) -> Result<Claimed, StorageError> {
+        self.inner.claim_jobs(queue, count, lease_secs).await
+    }
+    async fn extend_lease(
+        &self,
+        job_id: &str,
+        token: &str,
+        lease_secs: u32,
+    ) -> Result<Option<JobStatus>, StorageError> {
+        self.inner.extend_lease(job_id, token, lease_secs).await
+    }
+    async fn finish_if_leased(
+        &self,
+        job_id: &str,
+        token: &str,
+        status: JobStatus,
+        error: Option<&str>,
+        result: Option<&Json>,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .finish_if_leased(job_id, token, status, error, result)
+            .await
+    }
+    async fn await_work(
+        &self,
+        queue: &str,
+        max_wait: std::time::Duration,
+    ) -> Result<(), StorageError> {
+        self.inner.await_work(queue, max_wait).await
+    }
+    async fn cancel_job_if_active(&self, id: &str, reason: &str) -> Result<bool, StorageError> {
+        self.inner.cancel_job_if_active(id, reason).await
+    }
+    async fn mark_retrying(
+        &self,
+        id: &str,
+        token: &str,
+        retry_count: u32,
+        next_retry_at: chrono::DateTime<chrono::Utc>,
+        error: &str,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .mark_retrying(id, token, retry_count, next_retry_at, error)
+            .await
+    }
+    async fn move_to_dlq(&self, id: &str, reason: &str, error: &str) -> Result<(), StorageError> {
+        self.inner.move_to_dlq(id, reason, error).await
+    }
+    async fn count_dead_letters(&self) -> Result<i64, StorageError> {
+        self.inner.count_dead_letters().await
+    }
+    async fn list_dead_letters(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<Page<DeadLetter>, StorageError> {
+        self.inner.list_dead_letters(filter).await
+    }
+    async fn get_dead_letter(&self, id: i64) -> Result<DeadLetter, StorageError> {
+        self.inner.get_dead_letter(id).await
+    }
+    async fn replay_dead_letter(&self, id: i64, replacement: &Job) -> Result<bool, StorageError> {
+        self.inner.replay_dead_letter(id, replacement).await
+    }
+    async fn create_cron(&self, cron: &CronSchedule) -> Result<bool, StorageError> {
+        self.inner.create_cron(cron).await
+    }
+    async fn get_cron(&self, id: &str) -> Result<CronSchedule, StorageError> {
+        self.inner.get_cron(id).await
+    }
+    async fn list_crons(&self, filter: &ListFilter) -> Result<Page<CronSchedule>, StorageError> {
+        self.inner.list_crons(filter).await
+    }
+    async fn delete_cron(&self, id: &str) -> Result<bool, StorageError> {
+        self.inner.delete_cron(id).await
+    }
+    async fn set_cron_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        next_run_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        self.inner.set_cron_enabled(id, enabled, next_run_at).await
+    }
+    async fn due_crons(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<CronSchedule>, StorageError> {
+        self.inner.due_crons(now, limit).await
+    }
+    async fn advance_cron(
+        &self,
+        id: &str,
+        fired_at: chrono::DateTime<chrono::Utc>,
+        next_run_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StorageError> {
+        self.inner.advance_cron(id, fired_at, next_run_at).await
+    }
+    async fn ping(&self) -> Result<(), StorageError> {
+        self.inner.ping().await
+    }
+    async fn claim_expired_leases(
+        &self,
+        limit: usize,
+        lease_secs: u32,
+    ) -> Result<Vec<LeasedJob>, StorageError> {
+        self.inner.claim_expired_leases(limit, lease_secs).await
+    }
+    async fn stalled_step_jobs(&self, limit: usize) -> Result<Vec<Job>, StorageError> {
+        self.inner.stalled_step_jobs(limit).await
+    }
+    async fn stalled_workflow_ids(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        self.inner.stalled_workflow_ids(limit).await
+    }
+    async fn purge_terminal(
+        &self,
+        older_than: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, StorageError> {
+        self.inner.purge_terminal(older_than).await
+    }
+    async fn create_workflow(&self, wf: &Workflow) -> Result<(), StorageError> {
+        self.inner.create_workflow(wf).await
+    }
+    async fn get_workflow(&self, id: &str) -> Result<Workflow, StorageError> {
+        self.inner.get_workflow(id).await
+    }
+    async fn list_workflows(&self, filter: &ListFilter) -> Result<Page<Workflow>, StorageError> {
+        self.inner.list_workflows(filter).await
+    }
+    async fn workflow_step_statuses(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<StepRecord>, StorageError> {
+        self.inner.workflow_step_statuses(workflow_id).await
+    }
+    async fn link_step_job(
+        &self,
+        workflow_id: &str,
+        step_name: &str,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .link_step_job(workflow_id, step_name, job_id)
+            .await
+    }
+    async fn create_step_job(&self, job: &Job) -> Result<bool, StorageError> {
+        self.inner.create_step_job(job).await
+    }
+    async fn set_step_status(
+        &self,
+        workflow_id: &str,
+        step_name: &str,
+        status: StepStatus,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("status:{step_name}:{}", status.as_str()));
+        self.inner
+            .set_step_status(workflow_id, step_name, status, error)
+            .await
+    }
+    async fn set_workflow_status(
+        &self,
+        workflow_id: &str,
+        status: WorkflowStatus,
+    ) -> Result<bool, StorageError> {
+        self.inner.set_workflow_status(workflow_id, status).await
+    }
+    async fn merge_workflow_context(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        value: &Json,
+    ) -> Result<(), StorageError> {
+        self.events.lock().unwrap().push(format!("merge:{key}"));
+        self.inner
+            .merge_workflow_context(workflow_id, key, value)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn step_result_merge_precedes_the_completed_status_write() {
+    let clock = Arc::new(TestClock::epoch());
+    let probe = Arc::new(OrderProbe {
+        inner: InMemoryJobStore::new(clock.clone()),
+        events: Mutex::new(Vec::new()),
+    });
+    let engine = Engine::builder(probe.clone(), clock)
+        .register_fn("emit", |_p: Map| async { Ok(map(json!({"value": 1}))) })
+        .build();
+
+    let req = WorkflowBuilder::new("ordering")
+        .step(StepBuilder::new("a").task("emit"))
+        .step(StepBuilder::new("b").task("emit").after("a"))
+        .build()
+        .unwrap();
+    engine.create_workflow(req, None).await.unwrap();
+    while engine.process_once("default").await.unwrap() {}
+
+    let events = probe.events.lock().unwrap().clone();
+    let merge = events
+        .iter()
+        .position(|e| e == "merge:a")
+        .expect("a's result was merged");
+    let done = events
+        .iter()
+        .position(|e| e == "status:a:completed")
+        .expect("a was completed");
+    assert!(
+        merge < done,
+        "a step's context merge must land before its Completed status write \
+         (observers treat Completed as proof the context is complete); got {events:?}"
     );
 }

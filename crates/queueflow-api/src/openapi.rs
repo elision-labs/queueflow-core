@@ -4,8 +4,9 @@
 //! SDK generators consume — so the spec can never drift from the code.
 
 use queueflow_core::{
-    BackoffStrategy, CreateWorkflowRequest, Job, JobConfig, JobStatus, LeasedJob, OnFailure,
-    OnSuccess, StatsSnapshot, Workflow, WorkflowStatus, WorkflowStep,
+    BackoffStrategy, CreateCronRequest, CreateWorkflowRequest, CronSchedule, DeadLetter, Job,
+    JobConfig, JobStatus, LeasedJob, OnFailure, OnSuccess, StatsSnapshot, Workflow, WorkflowStatus,
+    WorkflowStep,
 };
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
@@ -60,6 +61,15 @@ impl Modify for SecurityAddon {
         handlers::get_workflow,
         handlers::cancel_workflow,
         handlers::get_workflow_diagram,
+        handlers::create_cron,
+        handlers::list_crons,
+        handlers::get_cron,
+        handlers::delete_cron,
+        handlers::pause_cron,
+        handlers::resume_cron,
+        handlers::list_dead_letters,
+        handlers::get_dead_letter,
+        handlers::replay_dead_letter,
         handlers::list_tasks,
         handlers::get_stats,
         handlers::health,
@@ -92,6 +102,13 @@ impl Modify for SecurityAddon {
         ListJobsResponse,
         ListWorkflowsResponse,
         CreateWorkflowResponse,
+        DeadLetter,
+        ListDeadLettersResponse,
+        ReplayDeadLetterResponse,
+        CronSchedule,
+        CreateCronRequest,
+        CreateCronResponse,
+        ListCronsResponse,
         WorkflowDiagramResponse,
         TasksResponse,
         ErrorBody,
@@ -103,6 +120,8 @@ impl Modify for SecurityAddon {
         (name = "health", description = "Liveness and readiness probes"),
         (name = "jobs", description = "Job lifecycle"),
         (name = "workflows", description = "Workflow orchestration (DAG of steps)"),
+        (name = "cron", description = "Recurring enqueues on a cron schedule (UTC)"),
+        (name = "dlq", description = "Dead-letter queue: inspect terminally-failed jobs and replay them as fresh jobs"),
         (name = "worker", description = "Remote worker protocol: lease jobs, heartbeat, report completion/failure. \
                                          Lets handlers run in any language, outside the server binary."),
         (name = "system", description = "Introspection and metrics"),

@@ -1,0 +1,30 @@
+# openapi-generator config for the Rust SDK.
+#
+# Generates the core (apis + models, async reqwest) AND injects the
+# hand-written ergonomic facade as a supporting file
+# (sdk-templates/rust/facade.mustache), so the crate ships `QueueFlow`,
+# `wait_for_job`/`wait_for_workflow`, and a workflow builder that raw codegen
+# cannot emit. templateDir also overrides Cargo.mustache (named authors, repo
+# metadata, tokio + dev deps for the facade and its tests) and lib.mustache
+# (declares the facade module); every other template falls back to the
+# generator's built-in default.
+generatorName: rust
+# Baked into git_push.sh and the README; matches the actual GitHub remote.
+gitHost: github.com
+gitUserId: queue-flow
+gitRepoId: sdk-rust
+templateDir: /templates
+files:
+  facade.mustache:
+    destinationFilename: src/facade.rs
+    templateType: SupportingFiles
+  facade-readme.mustache:
+    destinationFilename: FACADE.md
+    templateType: SupportingFiles
+additionalProperties:
+  packageName: queueflow
+  packageVersion: 0.1.0
+  hideGenerationTimestamp: true
+  # Rendered into Cargo.toml [package] by the Cargo.mustache override.
+  repositoryUrl: https://github.com/queue-flow/sdk-rust
+  homePageUrl: https://queueflow.dev

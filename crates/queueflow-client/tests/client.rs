@@ -226,3 +226,46 @@ async fn wait_for_job_resolves_when_a_worker_completes_it() {
         .unwrap();
     assert_eq!(job.status, JobStatus::Completed);
 }
+
+#[tokio::test]
+async fn dead_letters_are_listable_and_replayable() {
+    let client = start_server().await;
+    let id = client
+        .create_job(
+            "doomed",
+            Map::new(),
+            CreateJobOptions {
+                max_retries: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Fail it permanently through the worker protocol: straight to the DLQ.
+    let leases = client.lease_jobs("default", 1, 30, 0).await.unwrap();
+    client
+        .fail_job(&leases[0], "permanent breakage", false)
+        .await
+        .unwrap();
+    assert_eq!(client.get_job(&id).await.unwrap().status, JobStatus::Failed);
+
+    let page = client
+        .list_dead_letters(&ListQuery {
+            include_total: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.total, Some(1));
+    let dl = page.dead_letters[0].clone();
+    assert_eq!(dl.job_id, id);
+
+    // Replay produces a fresh, leaseable job; a second replay is a 409.
+    let new_id = client.replay_dead_letter(dl.id).await.unwrap();
+    assert_ne!(new_id, id);
+    let leases = client.lease_jobs("default", 1, 30, 0).await.unwrap();
+    assert_eq!(leases[0].job.id, new_id);
+    let err = client.replay_dead_letter(dl.id).await.unwrap_err();
+    assert_eq!(err.status(), Some(409));
+}

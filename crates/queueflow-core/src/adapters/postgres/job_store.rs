@@ -485,6 +485,244 @@ impl JobStore for PostgresJobStore {
         row.try_get(0).map_err(db)
     }
 
+    async fn list_dead_letters(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<Page<DeadLetter>, StorageError> {
+        let total = if filter.include_total {
+            let mut cb: QueryBuilder<Postgres> =
+                QueryBuilder::new("SELECT COUNT(*) FROM queueflow.dead_letters WHERE 1=1");
+            push_dlq_filters(&mut cb, filter);
+            Some(
+                cb.build()
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(db)?
+                    .try_get(0)
+                    .map_err(db)?,
+            )
+        } else {
+            None
+        };
+
+        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
+            "SELECT {DLQ_COLUMNS} FROM queueflow.dead_letters WHERE 1=1"
+        ));
+        push_dlq_filters(&mut qb, filter);
+        qb.push(if filter.order_desc {
+            " ORDER BY created_at DESC, id DESC"
+        } else {
+            " ORDER BY created_at ASC, id ASC"
+        });
+        let limit = if filter.limit <= 0 { 50 } else { filter.limit };
+        qb.push(" LIMIT ").push_bind(limit + 1);
+        qb.push(" OFFSET ").push_bind(filter.offset.max(0));
+
+        let rows = qb.build().fetch_all(&self.pool).await.map_err(db)?;
+        let mut items = rows
+            .iter()
+            .map(dead_letter_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = items.len() as i64 > limit;
+        items.truncate(limit as usize);
+        Ok(Page {
+            items,
+            has_more,
+            total,
+        })
+    }
+
+    async fn get_dead_letter(&self, id: i64) -> Result<DeadLetter, StorageError> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {DLQ_COLUMNS} FROM queueflow.dead_letters WHERE id = $1"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?
+        .ok_or(StorageError::DeadLetterNotFound(id))?;
+        dead_letter_from_row(&row)
+    }
+
+    // ---- Cron schedules -----------------------------------------------------
+
+    async fn create_cron(&self, cron: &CronSchedule) -> Result<bool, StorageError> {
+        // ON CONFLICT DO NOTHING absorbs a (tenant, name) collision via the
+        // partial unique index from migration 0004.
+        let affected = sqlx::query(
+            "INSERT INTO queueflow.cron_schedules \
+             (id, name, cron_expr, task_name, payload, config, queue_name, tenant_id, enabled, \
+              next_run_at, last_enqueued_at, created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&cron.id)
+        .bind(&cron.name)
+        .bind(&cron.cron_expr)
+        .bind(&cron.task_name)
+        .bind(to_jsonb(&cron.payload)?)
+        .bind(cron.config.as_ref().map(to_jsonb).transpose()?)
+        .bind(cron.queue_name.as_deref())
+        .bind(cron.tenant_id.as_deref())
+        .bind(cron.enabled)
+        .bind(cron.next_run_at)
+        .bind(cron.last_enqueued_at)
+        .bind(cron.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        Ok(affected > 0)
+    }
+
+    async fn get_cron(&self, id: &str) -> Result<CronSchedule, StorageError> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {CRON_COLUMNS} FROM queueflow.cron_schedules WHERE id = $1"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?
+        .ok_or_else(|| StorageError::CronNotFound(id.to_string()))?;
+        cron_from_row(&row)
+    }
+
+    async fn list_crons(&self, filter: &ListFilter) -> Result<Page<CronSchedule>, StorageError> {
+        let total = if filter.include_total {
+            let mut cb: QueryBuilder<Postgres> =
+                QueryBuilder::new("SELECT COUNT(*) FROM queueflow.cron_schedules WHERE 1=1");
+            push_cron_filters(&mut cb, filter);
+            Some(
+                cb.build()
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(db)?
+                    .try_get(0)
+                    .map_err(db)?,
+            )
+        } else {
+            None
+        };
+
+        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
+            "SELECT {CRON_COLUMNS} FROM queueflow.cron_schedules WHERE 1=1"
+        ));
+        push_cron_filters(&mut qb, filter);
+        qb.push(if filter.order_desc {
+            " ORDER BY created_at DESC, id DESC"
+        } else {
+            " ORDER BY created_at ASC, id ASC"
+        });
+        let limit = if filter.limit <= 0 { 50 } else { filter.limit };
+        qb.push(" LIMIT ").push_bind(limit + 1);
+        qb.push(" OFFSET ").push_bind(filter.offset.max(0));
+
+        let rows = qb.build().fetch_all(&self.pool).await.map_err(db)?;
+        let mut items = rows
+            .iter()
+            .map(cron_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = items.len() as i64 > limit;
+        items.truncate(limit as usize);
+        Ok(Page {
+            items,
+            has_more,
+            total,
+        })
+    }
+
+    async fn delete_cron(&self, id: &str) -> Result<bool, StorageError> {
+        let affected = sqlx::query("DELETE FROM queueflow.cron_schedules WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        Ok(affected > 0)
+    }
+
+    async fn set_cron_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        next_run_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let affected = sqlx::query(
+            "UPDATE queueflow.cron_schedules SET enabled = $2, next_run_at = $3 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(enabled)
+        .bind(next_run_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        Ok(affected > 0)
+    }
+
+    async fn due_crons(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<CronSchedule>, StorageError> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {CRON_COLUMNS} FROM queueflow.cron_schedules \
+             WHERE enabled AND next_run_at <= $1 \
+             ORDER BY next_run_at \
+             LIMIT $2"
+        )))
+        .bind(now)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter().map(cron_from_row).collect()
+    }
+
+    async fn advance_cron(
+        &self,
+        id: &str,
+        fired_at: DateTime<Utc>,
+        next_run_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE queueflow.cron_schedules \
+             SET last_enqueued_at = $2, next_run_at = $3 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(fired_at)
+        .bind(next_run_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    async fn replay_dead_letter(&self, id: i64, replacement: &Job) -> Result<bool, StorageError> {
+        // Claim (`replayed_at IS NULL`) and insert commit together, so a dead
+        // letter can never spawn two replays and the replacement is only ever
+        // claimable once the claim won.
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let claimed = sqlx::query(
+            "UPDATE queueflow.dead_letters \
+             SET replayed_at = now(), replay_job_id = $2 \
+             WHERE id = $1 AND replayed_at IS NULL",
+        )
+        .bind(id)
+        .bind(&replacement.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if claimed == 0 {
+            tx.rollback().await.map_err(db)?;
+            return Ok(false);
+        }
+        insert_job(&mut *tx, replacement).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+
     async fn ping(&self) -> Result<(), StorageError> {
         sqlx::query("SELECT 1")
             .execute(&self.pool)
@@ -941,6 +1179,61 @@ fn workflow_from_row(
         metadata: serde_json::from_value(metadata)?,
         tenant_id: row.try_get("tenant_id").map_err(db)?,
     })
+}
+
+const DLQ_COLUMNS: &str = "id, job_id, queue_name, task_name, reason, error_message, tenant_id, \
+     created_at, replayed_at, replay_job_id";
+
+const CRON_COLUMNS: &str = "id, name, cron_expr, task_name, payload, config, queue_name, \
+     tenant_id, enabled, next_run_at, last_enqueued_at, created_at";
+
+fn cron_from_row(row: &sqlx::postgres::PgRow) -> Result<CronSchedule, StorageError> {
+    let payload: Json = row.try_get("payload").map_err(db)?;
+    let config: Option<Json> = row.try_get("config").map_err(db)?;
+    Ok(CronSchedule {
+        id: row.try_get("id").map_err(db)?,
+        name: row.try_get("name").map_err(db)?,
+        cron_expr: row.try_get("cron_expr").map_err(db)?,
+        task_name: row.try_get("task_name").map_err(db)?,
+        payload: serde_json::from_value(payload)?,
+        config: config.map(serde_json::from_value).transpose()?,
+        queue_name: row.try_get("queue_name").map_err(db)?,
+        tenant_id: row.try_get("tenant_id").map_err(db)?,
+        enabled: row.try_get("enabled").map_err(db)?,
+        next_run_at: row.try_get("next_run_at").map_err(db)?,
+        last_enqueued_at: row.try_get("last_enqueued_at").map_err(db)?,
+        created_at: row.try_get("created_at").map_err(db)?,
+    })
+}
+
+fn push_cron_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
+    if let Some(t) = &filter.tenant_id {
+        qb.push(" AND tenant_id = ").push_bind(t.clone());
+    }
+}
+
+fn dead_letter_from_row(row: &sqlx::postgres::PgRow) -> Result<DeadLetter, StorageError> {
+    Ok(DeadLetter {
+        id: row.try_get("id").map_err(db)?,
+        job_id: row.try_get("job_id").map_err(db)?,
+        queue_name: row.try_get("queue_name").map_err(db)?,
+        task_name: row.try_get("task_name").map_err(db)?,
+        reason: row.try_get("reason").map_err(db)?,
+        error_message: row.try_get("error_message").map_err(db)?,
+        tenant_id: row.try_get("tenant_id").map_err(db)?,
+        created_at: row.try_get("created_at").map_err(db)?,
+        replayed_at: row.try_get("replayed_at").map_err(db)?,
+        replay_job_id: row.try_get("replay_job_id").map_err(db)?,
+    })
+}
+
+fn push_dlq_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
+    if let Some(t) = &filter.tenant_id {
+        qb.push(" AND tenant_id = ").push_bind(t.clone());
+    }
+    if let Some(q) = &filter.queue {
+        qb.push(" AND queue_name = ").push_bind(q.clone());
+    }
 }
 
 fn push_job_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {

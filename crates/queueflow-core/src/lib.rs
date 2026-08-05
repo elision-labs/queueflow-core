@@ -42,6 +42,7 @@
 
 pub mod adapters;
 pub mod api;
+pub mod cron;
 pub mod domain;
 pub mod engine;
 pub mod error;
@@ -56,8 +57,9 @@ pub use adapters::clock::{SystemClock, TestClock};
 pub use adapters::memory::InMemoryJobStore;
 pub use api::JobApi;
 pub use domain::{
-    BackoffStrategy, CreateWorkflowRequest, Job, JobConfig, JobStatus, Json, LeasedJob, Map,
-    OnFailure, OnSuccess, StepStatus, Workflow, WorkflowStatus, WorkflowStep, CONTEXT_KEY,
+    limits, BackoffStrategy, CreateCronRequest, CreateWorkflowRequest, CronSchedule, DeadLetter,
+    Job, JobConfig, JobStatus, Json, LeasedJob, Map, OnFailure, OnSuccess, StepStatus, Workflow,
+    WorkflowStatus, WorkflowStep, CONTEXT_KEY,
 };
 pub use engine::janitor::JanitorSweepReport;
 pub use engine::{Engine, EngineBuilder, EnqueueOptions, JanitorConfig};

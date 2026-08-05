@@ -7,10 +7,11 @@
 # emit. templateDir holds only the facade template; every other template falls
 # back to the generator's built-in default.
 generatorName: go
-# Module path baked into go.mod; matches the import in FACADE.md.
+# Module path baked into go.mod; matches the import in FACADE.md and the
+# actual GitHub remote (github.com/queue-flow/sdk-go).
 gitHost: github.com
-gitUserId: queueflow
-gitRepoId: queueflow-sdk-go
+gitUserId: queue-flow
+gitRepoId: sdk-go
 templateDir: /templates
 files:
   facade.mustache:

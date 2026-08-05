@@ -1,6 +1,9 @@
 [package]
-name = "queueflow-server"
-description = "QueueFlow server binary: REST API, workers, metrics, and OpenAPI spec generation."
+name = "queueflow"
+description = "QueueFlow server and CLI: a PostgreSQL-native job queue and workflow engine (REST API, workers, metrics, OpenAPI spec generation)."
+readme = "README.md"
+keywords = ["queue", "jobs", "postgres", "workflow", "server"]
+categories = ["command-line-utilities", "asynchronous", "database"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,16 +12,15 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
-[[bin]]
-name = "queueflow"
-path = "src/main.rs"
+# The package is named after its binary: `cargo install queueflow` installs
+# the `queueflow` command (src/main.rs is the auto-discovered bin target).
 
 [dependencies]
 queueflow-core = { workspace = true, features = ["postgres"] }
 queueflow-api = { workspace = true }
 queueflow-client = { workspace = true }
 chrono = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

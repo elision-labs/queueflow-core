@@ -18,8 +18,9 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::Duration as ChronoDuration;
+use futures::FutureExt;
 
-use super::Engine;
+use super::{panic_message, Engine};
 use crate::error::EngineError;
 use crate::ports::JobStore;
 
@@ -89,7 +90,19 @@ where
                     _ = engine.shutdown.cancelled() => break,
                     _ = tokio::time::sleep(engine.janitor.interval) => {}
                 }
-                let report = engine.janitor_sweep().await;
+                // The janitor is the engine's self-healing backbone: a panic
+                // in one sweep (an adapter bug, a poisoned lock) must not
+                // silently end lease recovery for the life of the process.
+                let report = match std::panic::AssertUnwindSafe(engine.janitor_sweep())
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(report) => report,
+                    Err(panic) => {
+                        tracing::error!(panic = %panic_message(&*panic), "janitor sweep panicked; continuing");
+                        JanitorSweepReport::default()
+                    }
+                };
                 if !report.is_empty() {
                     tracing::info!(
                         expired = report.expired_leases,
@@ -98,13 +111,32 @@ where
                         "janitor sweep"
                     );
                 }
+                // Pump due cron schedules. Safe on every server: the
+                // per-firing idempotency key dedupes concurrent pumps.
+                match std::panic::AssertUnwindSafe(engine.cron_tick())
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(n)) => tracing::info!(fired = n, "cron tick"),
+                    Ok(Err(e)) => tracing::warn!(error = %e, "cron tick failed"),
+                    Err(panic) => {
+                        tracing::error!(panic = %panic_message(&*panic), "cron tick panicked; continuing");
+                    }
+                }
                 if engine.janitor.retention.is_some()
                     && last_purge.elapsed() >= engine.janitor.retention_interval
                 {
                     last_purge = tokio::time::Instant::now();
-                    match engine.janitor_purge().await {
-                        Ok(0) | Err(_) => {} // errors are logged inside
-                        Ok(n) => tracing::info!(purged_jobs = n, "retention sweep"),
+                    match std::panic::AssertUnwindSafe(engine.janitor_purge())
+                        .catch_unwind()
+                        .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) => {} // errors are logged inside
+                        Ok(Ok(n)) => tracing::info!(purged_jobs = n, "retention sweep"),
+                        Err(panic) => {
+                            tracing::error!(panic = %panic_message(&*panic), "retention sweep panicked; continuing");
+                        }
                     }
                 }
             }

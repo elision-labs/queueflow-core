@@ -384,8 +384,10 @@ pub async fn stream_job_events(
 //
 // Workers in any language lease jobs, heartbeat while running, and report
 // completion/failure. Leasing is queue-scoped, not tenant-scoped: workers are
-// deployment infrastructure (they execute arbitrary tenants' jobs), unlike the
-// tenant-scoped producer endpoints above.
+// deployment infrastructure (they execute arbitrary tenants' jobs and see
+// their payloads), which is why these routes take the dedicated worker
+// credential (`--worker-token`) instead of a tenant token — see
+// `crate::auth::worker_auth`.
 
 #[utoipa::path(
     post, path = "/api/v1/queues/{queue}/lease", tag = "worker", operation_id = "leaseJobs",
@@ -394,6 +396,7 @@ pub async fn stream_job_events(
     responses(
         (status = 200, description = "Zero or more leased jobs (empty if none became available within wait_secs)", body = LeaseJobsResponse),
         (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Authenticated, but not with the worker credential", body = ErrorBody),
     ),
     security(("bearerAuth" = []))
 )]
@@ -419,6 +422,7 @@ pub async fn lease_jobs(
     responses(
         (status = 204, description = "Completed (idempotent: replaying against an already-finished job also succeeds)"),
         (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Authenticated, but not with the worker credential", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
         (status = 409, description = "Lease no longer held (expired and reclaimed)", body = ErrorBody),
     ),
@@ -442,6 +446,7 @@ pub async fn complete_job(
     responses(
         (status = 204, description = "Failure recorded; the job is retried or dead-lettered per its config"),
         (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Authenticated, but not with the worker credential", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
         (status = 409, description = "Lease no longer held (expired and reclaimed)", body = ErrorBody),
     ),
@@ -467,6 +472,7 @@ pub async fn fail_job(
                                       (e.g. `cancelled`) = not extended, stop working on the job.",
          body = HeartbeatResponse),
         (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Authenticated, but not with the worker credential", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
         (status = 409, description = "Lease no longer held (expired and reclaimed)", body = ErrorBody),
     ),
@@ -483,6 +489,221 @@ pub async fn heartbeat_job(
         .heartbeat_lease(&id, &req.lease_token, extend)
         .await?;
     Ok(Json(HeartbeatResponse { status }))
+}
+
+// ---- Cron schedules --------------------------------------------------------
+
+#[utoipa::path(
+    post, path = "/api/v1/cron", tag = "cron", operation_id = "createCron",
+    request_body = queueflow_core::CreateCronRequest,
+    responses(
+        (status = 201, description = "Schedule created; first firing is the next occurrence (UTC)", body = CreateCronResponse),
+        (status = 400, description = "Invalid request (e.g. a bad cron expression)", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 409, description = "A schedule with this name already exists", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn create_cron(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Json(req): Json<queueflow_core::CreateCronRequest>,
+) -> Result<Response, ApiError> {
+    let id = s.engine.create_cron(req, Some(t.0)).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateCronResponse { cron_id: id }),
+    )
+        .into_response())
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/cron", tag = "cron", operation_id = "listCrons",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "Page of cron schedules (`status`/`queue` filters do not apply)", body = ListCronsResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn list_crons(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<ListCronsResponse>, ApiError> {
+    let filter = q.into_filter(Some(t.0));
+    let page = s.engine.list_crons(filter.clone()).await?;
+    Ok(Json(ListCronsResponse {
+        crons: page.items,
+        total: page.total,
+        limit: filter.limit,
+        offset: filter.offset,
+        has_more: page.has_more,
+    }))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/cron/{id}", tag = "cron", operation_id = "getCron",
+    params(("id" = String, Path, description = "Cron schedule id")),
+    responses(
+        (status = 200, description = "Cron schedule", body = queueflow_core::CronSchedule),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn get_cron(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> Result<Json<queueflow_core::CronSchedule>, ApiError> {
+    let cron = s.engine.get_cron(&id).await?;
+    ensure_owner(cron.tenant_id.as_deref(), &t)?;
+    Ok(Json(cron))
+}
+
+#[utoipa::path(
+    delete, path = "/api/v1/cron/{id}", tag = "cron", operation_id = "deleteCron",
+    params(("id" = String, Path, description = "Cron schedule id")),
+    responses(
+        (status = 204, description = "Deleted; already-enqueued jobs are unaffected"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn delete_cron(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let cron = s.engine.get_cron(&id).await?;
+    ensure_owner(cron.tenant_id.as_deref(), &t)?;
+    s.engine.delete_cron(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/cron/{id}/pause", tag = "cron", operation_id = "pauseCron",
+    params(("id" = String, Path, description = "Cron schedule id")),
+    responses(
+        (status = 204, description = "Paused: no further firings until resumed"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn pause_cron(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let cron = s.engine.get_cron(&id).await?;
+    ensure_owner(cron.tenant_id.as_deref(), &t)?;
+    s.engine.set_cron_enabled(&id, false).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/cron/{id}/resume", tag = "cron", operation_id = "resumeCron",
+    params(("id" = String, Path, description = "Cron schedule id")),
+    responses(
+        (status = 204, description = "Resumed: fires at its next future occurrence (missed runs are not caught up)"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn resume_cron(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let cron = s.engine.get_cron(&id).await?;
+    ensure_owner(cron.tenant_id.as_deref(), &t)?;
+    s.engine.set_cron_enabled(&id, true).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- Dead letters ----------------------------------------------------------
+
+#[utoipa::path(
+    get, path = "/api/v1/dlq", tag = "dlq", operation_id = "listDeadLetters",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "Page of dead letters, newest first (the `status` filter does not apply)", body = ListDeadLettersResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn list_dead_letters(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<ListDeadLettersResponse>, ApiError> {
+    let filter = q.into_filter(Some(t.0));
+    let page = s.engine.list_dead_letters(filter.clone()).await?;
+    Ok(Json(ListDeadLettersResponse {
+        dead_letters: page.items,
+        total: page.total,
+        limit: filter.limit,
+        offset: filter.offset,
+        has_more: page.has_more,
+    }))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/dlq/{id}", tag = "dlq", operation_id = "getDeadLetter",
+    params(("id" = i64, Path, description = "Dead letter id")),
+    responses(
+        (status = 200, description = "Dead letter", body = queueflow_core::DeadLetter),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn get_dead_letter(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(id): Path<i64>,
+) -> Result<Json<queueflow_core::DeadLetter>, ApiError> {
+    let dl = s.engine.get_dead_letter(id).await?;
+    ensure_owner(dl.tenant_id.as_deref(), &t)?;
+    Ok(Json(dl))
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/dlq/{id}/replay", tag = "dlq", operation_id = "replayDeadLetter",
+    params(("id" = i64, Path, description = "Dead letter id")),
+    responses(
+        (status = 201, description = "A fresh job was created from the dead-lettered one \
+                                      (same task/payload/queue/config; workflow linkage is not resurrected)",
+         body = ReplayDeadLetterResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found (the entry, or its original job after retention)", body = ErrorBody),
+        (status = 409, description = "Already replayed", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn replay_dead_letter(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let dl = s.engine.get_dead_letter(id).await?;
+    ensure_owner(dl.tenant_id.as_deref(), &t)?;
+    let job_id = s.engine.replay_dead_letter(id).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ReplayDeadLetterResponse { job_id }),
+    )
+        .into_response())
 }
 
 // ---- System ----------------------------------------------------------------

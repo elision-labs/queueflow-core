@@ -1,5 +1,5 @@
-.PHONY: help build run test test-pg fmt fmt-check lint clippy clean docker spec validate-spec \
-        sdks sdks-python sdks-typescript sdks-go check-ts-sdk
+.PHONY: help build run test test-pg check-package fmt fmt-check lint clippy clean docker spec validate-spec \
+        sdks sdks-python sdks-typescript sdks-go sdks-rust check-ts-sdk
 
 CARGO ?= cargo
 BIN := queueflow
@@ -15,13 +15,19 @@ build: ## Build all crates (release)
 	$(CARGO) build --workspace --release
 
 run: ## Run the server (needs DATABASE_URL)
-	$(CARGO) run -p queueflow-server -- serve
+	$(CARGO) run -p queueflow -- serve
 
 test: ## Run unit + integration tests (no database needed)
 	$(CARGO) test --workspace
 
 test-pg: ## Run Postgres integration tests (needs TEST_DATABASE_URL; any plain PostgreSQL 13+)
-	$(CARGO) test -p queueflow-core --features postgres -- --include-ignored
+	REQUIRE_PG=1 $(CARGO) test -p queueflow-core --features postgres -- --include-ignored
+
+check-package: ## Prove the packaged queueflow-core builds standalone (catches files missing from the .crate)
+	$(CARGO) package -p queueflow-core --allow-dirty
+	rm -rf target/package-check && mkdir -p target/package-check
+	tar -xzf target/package/queueflow-core-$$($(CARGO) pkgid -p queueflow-core | sed 's/.*#//').crate -C target/package-check
+	cd target/package-check/queueflow-core-* && $(CARGO) build --features postgres
 
 fmt: ## Format the code
 	$(CARGO) fmt --all
@@ -43,13 +49,13 @@ docker: ## Build the server docker image
 ## OpenAPI / SDKs
 
 spec: ## Generate the OpenAPI spec from code into ./spec
-	$(CARGO) run -q -p queueflow-server -- spec --output-dir $(SPEC_DIR)
+	$(CARGO) run -q -p queueflow -- spec --output-dir $(SPEC_DIR)
 
 validate-spec: spec ## Validate the generated spec with openapi-generator
 	docker run --rm -v "$(CURDIR)/$(SPEC_DIR):/spec:ro" \
 		$(OPENAPI_IMAGE) validate -i /spec/openapi.json
 
-sdks: validate-spec ## Regenerate the Python + Go SDKs (generated core + injected facade). Rust = native crate; TS = own repo.
+sdks: validate-spec ## Regenerate the Python + Go + Rust SDKs (generated core + injected facade). TS = own repo.
 	./scripts/generate-sdks.sh all
 
 sdks-python: validate-spec ## Regenerate the Python SDK (generated core + facade supporting file)
@@ -60,6 +66,9 @@ sdks-typescript: ## Regenerate the TS core (../queueflow-sdk-nodejs) and build t
 
 sdks-go: validate-spec ## Regenerate the Go SDK (generated core + facade supporting file)
 	./scripts/generate-sdks.sh go
+
+sdks-rust: validate-spec ## Regenerate the Rust SDK (generated core + facade supporting file)
+	./scripts/generate-sdks.sh rust
 
 check-ts-sdk: spec ## Verify the TS generated core + facade match the spec
 	node ./scripts/check-ts-sdk.mjs

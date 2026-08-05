@@ -1,6 +1,9 @@
 [package]
 name = "queueflow-client"
 description = "Hand-written Rust client for the QueueFlow REST API, including the remote worker protocol. Reuses the engine's domain types, so requests and responses can never drift from the server."
+readme = "README.md"
+keywords = ["queue", "jobs", "client", "worker", "sdk"]
+categories = ["web-programming::http-client", "api-bindings", "asynchronous"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,10 +19,11 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 queueflow-api = { workspace = true }
 axum = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }

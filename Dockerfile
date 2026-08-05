@@ -8,7 +8,7 @@ WORKDIR /app
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release -p queueflow-server && \
+    cargo build --release -p queueflow && \
     cp target/release/queueflow /usr/local/bin/queueflow
 
 # ---- Runtime stage ----

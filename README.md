@@ -10,7 +10,7 @@ Durable background jobs and real DAG workflows on a database you already run —
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](./rust-toolchain.toml)
 [![OpenAPI 3.1](https://img.shields.io/badge/OpenAPI-3.1-6BA539.svg)](./spec/openapi.yaml)
-[![Tests](https://img.shields.io/badge/tests-92%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-118%20passing-brightgreen.svg)](#testing)
 
 [Quick start](#quick-start) · [Workflows](#workflows) · [How-to](#how-to-rest-api) · [Docs](#documentation) · [Roadmap](#roadmap)
 
@@ -43,7 +43,8 @@ is generated from the code and ships with every release.
 - 🐘 **PostgreSQL native** — durable, transactional, at-least-once delivery on any plain Postgres 13+; no extensions, no extra infrastructure.
 - 🔀 **Workflows as DAGs** — declare steps and `depends_on`; the engine schedules each step once its dependencies complete, threads results through a shared context, and aggregates the final status.
 - ♻️ **Durable retries** — typed backoff (fixed / linear / exponential, capped, with jitter) scheduled *in the row*, so retries outlive restarts.
-- 🪦 **Dead-letter queue** — exhausted, non-retryable, and unhandled jobs land somewhere you can inspect and replay.
+- 🪦 **Dead-letter queue** — exhausted, non-retryable, and unhandled jobs land in an inspectable DLQ, with a replay API that re-runs them as fresh jobs.
+- ⏰ **Cron schedules** — recurring enqueues from standard crontab expressions (UTC), deduplicated across servers, with pause/resume.
 - 🧪 **Built to be tested** — a ports-and-adapters core means the whole system runs in memory, deterministically, with a controllable clock.
 - 📜 **Code-generated OpenAPI** — the spec is derived from the handlers and attached to every release; generate a client for any language against it.
 - 📈 **Observable** — Prometheus metrics, structured JSON logs (`tracing`), health/readiness probes.
@@ -63,11 +64,11 @@ queueflow-core/                    Cargo workspace
 │   │   │   └── postgres/          PostgreSQL adapter + LISTEN/NOTIFY hub (feature "postgres")
 │   │   ├── engine/                enqueue, worker loop, durable retry, DLQ, janitor
 │   │   ├── workflow/              DAG validation, builder DSL, scheduler
-│   │   └── api.rs                 object-safe JobApi facade
+│   │   ├── api.rs                 object-safe JobApi facade
+│   │   └── migrations/            sqlx migrations (plain-SQL claim-queue schema, shipped in the crate)
 │   ├── queueflow-api/             axum router + utoipa OpenAPI
 │   ├── queueflow-client/          native Rust client (REST + remote worker runtime)
-│   └── queueflow-server/          the `queueflow` binary (serve / spec / migrate / CLI)
-├── migrations/                    sqlx migrations (plain-SQL claim-queue schema)
+│   └── queueflow/                 the `queueflow` binary (serve / spec / migrate / CLI)
 ├── sdk-configs/                   openapi-generator configs (on-demand python/go)
 ├── scripts/generate-sdks.sh       drives openapi-generator
 └── Makefile
@@ -122,7 +123,7 @@ cargo run --example workflow       -p queueflow-core
 docker run -d --name pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16-alpine
 
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
-cargo run -p queueflow-server -- serve --mode all --workers 10 --api-port 8000
+cargo run -p queueflow -- serve --mode all --workers 10 --api-port 8000
 ```
 
 The server applies migrations on startup, exposes the REST API on `:8000`, Prometheus metrics on `:9090`,
@@ -174,8 +175,10 @@ graph TD
 
 ## How-to (REST API)
 
-Every `/api/v1` route needs a bearer token. (Token validation is currently a placeholder that maps any
-non-empty token to a tenant — see [Roadmap](#roadmap).)
+Every `/api/v1` route needs a bearer token. Configure real tenant credentials with `--jwt-secret`
+(HS256; the `sub` claim is the tenant) and/or `--api-keys "token:tenant,..."`; with neither set the
+server runs in development mode, where any non-empty token maps to one fixed tenant (and `serve`
+warns at startup). Worker-protocol endpoints take the separate `--worker-token` credential.
 
 ```bash
 # Enqueue a job
@@ -216,6 +219,10 @@ curl -s http://localhost:9090/metrics
 | `POST /api/v1/jobs/{id}/heartbeat` · `/complete` · `/fail` | Worker protocol: extend lease · report outcome |
 | `POST /api/v1/workflows` | Create a workflow |
 | `GET /api/v1/workflows` · `/{id}` · `/{id}/cancel` · `/{id}/diagram` | List / fetch / cancel / diagram |
+| `POST /api/v1/cron` · `GET /api/v1/cron` · `/{id}` | Create / list / fetch cron schedules |
+| `DELETE /api/v1/cron/{id}` · `POST .../pause` · `POST .../resume` | Delete / pause / resume a schedule |
+| `GET /api/v1/dlq` · `/{id}` | List / inspect dead-lettered jobs |
+| `POST /api/v1/dlq/{id}/replay` | Replay a dead letter as a fresh job (once per entry) |
 | `GET /api/v1/tasks` · `/stats` | Registered handlers · engine counters (process-local) |
 | `GET /health` · `/ready` · `/docs` · `/openapi.json` | Probes · Swagger UI · spec |
 
@@ -223,7 +230,9 @@ curl -s http://localhost:9090/metrics
 
 Handlers do not have to be compiled into the server. A worker in any language can drain a queue
 over HTTP with at-least-once semantics, durable retries, and workflow advancement handled
-server-side:
+server-side. Workers execute arbitrary tenants' jobs, so give them their own credential: set
+`--worker-token` on the server and use that token below (without one configured the server runs
+in development mode and accepts any authenticated token, warning at startup):
 
 ```bash
 # 1. Lease (long-polls up to wait_secs when the queue is empty)
@@ -286,6 +295,9 @@ queueflow stats
 | `--workers` | `QUEUEFLOW_WORKERS` | `10` | Workers per queue |
 | `--metrics-port` | `QUEUEFLOW_METRICS_PORT` | `9090` | Prometheus port |
 | `--default-queue` | `QUEUEFLOW_DEFAULT_QUEUE` | `default` | Default queue name |
+| `--worker-token` | `QUEUEFLOW_WORKER_TOKEN` | unset | Credential required by the worker-protocol endpoints (lease/heartbeat/complete/fail). Unset = development mode: any authenticated token is accepted, with a startup warning |
+| `--jwt-secret` | `QUEUEFLOW_JWT_SECRET` | unset | HS256 secret for tenant JWTs (`sub` = tenant id, `exp` enforced) |
+| `--api-keys` | `QUEUEFLOW_API_KEYS` | unset | Static tenant API keys, `token:tenant,...`. With neither this nor `--jwt-secret`, tenant auth is the development placeholder |
 
 ## Testing
 
@@ -343,23 +355,26 @@ make check-ts-sdk    # assert the TS generated core + facade match the spec
 - **API reference (rustdoc):** `cargo doc --open -p queueflow-core`
 - **OpenAPI spec:** [`spec/openapi.yaml`](./spec/openapi.yaml) / [`spec/openapi.json`](./spec/openapi.json), or live at `/openapi.json` and `/docs`
 - **Runnable examples:** [`crates/queueflow-core/examples/`](./crates/queueflow-core/examples)
-- **Database schema:** [`migrations/0001_init.sql`](./migrations/0001_init.sql)
+- **Database schema:** [`crates/queueflow-core/migrations/0001_init.sql`](./crates/queueflow-core/migrations/0001_init.sql)
 - **Multi-repo overview:** [`repository-structure.md`](../repository-structure.md)
 
 ## Roadmap
 
 Contributions welcome — these are the planned next steps, roughly in priority order:
 
-- [ ] **Real authentication** — replace the placeholder token check with JWT signature/claims validation
-      and an API-key store (the seam is `auth::validate_token`). Worker-protocol endpoints should get
-      their own credential class (they are deployment infrastructure, not tenant-scoped).
-- [ ] **Conditional steps** — evaluate a per-step predicate (the `condition` column is reserved but unread today).
-- [ ] **Cron jobs** — recurring enqueues on a schedule (one-shot `run_at` scheduling already ships).
-- [ ] **DLQ admin API** — list, inspect, and replay dead-lettered jobs.
+- [x] **Real authentication** — tenant JWTs (HS256, `--jwt-secret`) and static API keys
+      (`--api-keys`), plus a dedicated worker credential (`--worker-token`) for the worker-protocol
+      endpoints. Next: a database-backed API-key store with management endpoints, and asymmetric
+      JWT (JWKS) support.
+- [x] **Cron jobs** — recurring enqueues from crontab expressions (UTC), deduplicated across
+      servers via per-firing idempotency keys, with pause/resume and catch-up-once semantics.
+- [x] **DLQ admin API** — list, inspect, and replay dead-lettered jobs (each entry replays at
+      most once, as a fresh detached job).
+- [ ] **Conditional steps** — evaluate a per-step predicate before scheduling (skip when false).
 - [ ] **Sub-workflows & fan-out** — a step that spawns a child workflow or a dynamic batch.
 - [ ] **OpenTelemetry** — distributed tracing export alongside the Prometheus metrics.
 - [ ] **Per-tenant rate limiting & quotas.**
-- [ ] **Publish** — crates.io release and a Helm chart.
+- [ ] **Publish** — crates.io release (pipeline and runbook ready, see [`PUBLISHING.md`](./PUBLISHING.md)) and a Helm chart.
 
 ## Contributing
 

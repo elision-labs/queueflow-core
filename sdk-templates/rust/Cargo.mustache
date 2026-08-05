@@ -1,0 +1,41 @@
+{{! Override of the stock rust-generator Cargo.mustache (v7.10.0). Differences
+    from stock: named authors (the spec carries no contact email, which stock
+    turns into "OpenAPI Generator team and contributors"), repository/homepage
+    metadata, a direct tokio dependency (the facade pollers need
+    tokio::time::sleep; async reqwest already brings the runtime), and
+    dev-dependencies for the hand-written facade tests in tests/. The
+    hyper/AWS/middleware branches are dropped: this template only renders for
+    the async-reqwest config in sdk-configs/rust.yaml. }}
+[package]
+name = "{{{packageName}}}"
+version = "{{#lambdaVersion}}{{{packageVersion}}}{{/lambdaVersion}}"
+authors = ["QueueFlow"]
+{{#appDescription}}
+description = "{{{.}}}"
+{{/appDescription}}
+{{#licenseInfo}}
+license = "{{.}}"
+{{/licenseInfo}}
+edition = "2021"
+{{#repositoryUrl}}
+repository = "{{.}}"
+{{/repositoryUrl}}
+{{#homePageUrl}}
+homepage = "{{.}}"
+{{/homePageUrl}}
+
+[dependencies]
+serde = { version = "^1.0", features = ["derive"] }
+{{#serdeWith}}
+serde_with = { version = "^3.8", default-features = false, features = ["base64", "std", "macros"] }
+{{/serdeWith}}
+serde_json = "^1.0"
+serde_repr = "^0.1"
+url = "^2.5"
+uuid = { version = "^1.8", features = ["serde", "v4"] }
+reqwest = { version = "^0.12", features = ["json", "multipart"] }
+tokio = { version = "^1", default-features = false, features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "^1", features = ["macros", "rt-multi-thread", "time"] }
+wiremock = "^0.6"

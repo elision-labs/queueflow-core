@@ -8,7 +8,7 @@ use anyhow::Context;
 use queueflow_client::{Client, CreateJobOptions, ListQuery};
 use queueflow_core::{CreateWorkflowRequest, Map};
 
-use crate::cli::{ClientArgs, JobCommand, WorkflowCommand};
+use crate::cli::{ClientArgs, CronCommand, DlqCommand, JobCommand, WorkflowCommand};
 
 fn client(args: &ClientArgs) -> Client {
     Client::new(&args.server_url, &args.token)
@@ -150,6 +150,99 @@ pub async fn workflow(cmd: WorkflowCommand) -> anyhow::Result<()> {
         WorkflowCommand::Diagram { client: args, id } => {
             println!("{}", client(&args).workflow_diagram(&id).await?);
             Ok(())
+        }
+    }
+}
+
+pub async fn dlq(cmd: DlqCommand) -> anyhow::Result<()> {
+    match cmd {
+        DlqCommand::List {
+            client: args,
+            queue,
+            limit,
+            offset,
+            include_total,
+        } => {
+            let page = client(&args)
+                .list_dead_letters(&ListQuery {
+                    status: None,
+                    queue,
+                    limit,
+                    offset,
+                    include_total,
+                })
+                .await?;
+            print_json(&serde_json::json!({
+                "dead_letters": page.dead_letters,
+                "has_more": page.has_more,
+                "total": page.total,
+            }))
+        }
+        DlqCommand::Get { client: args, id } => {
+            print_json(&client(&args).get_dead_letter(id).await?)
+        }
+        DlqCommand::Replay { client: args, id } => {
+            let job_id = client(&args).replay_dead_letter(id).await?;
+            print_json(&serde_json::json!({ "job_id": job_id }))
+        }
+    }
+}
+
+pub async fn cron(cmd: CronCommand) -> anyhow::Result<()> {
+    match cmd {
+        CronCommand::Create {
+            client: args,
+            name,
+            schedule,
+            task,
+            payload,
+            queue,
+        } => {
+            let id = client(&args)
+                .create_cron(&queueflow_core::CreateCronRequest {
+                    name,
+                    cron_expr: schedule,
+                    task_name: task,
+                    payload: parse_payload(&payload)?,
+                    config: None,
+                    queue,
+                })
+                .await?;
+            print_json(&serde_json::json!({ "cron_id": id }))
+        }
+        CronCommand::List {
+            client: args,
+            limit,
+            offset,
+            include_total,
+        } => {
+            let page = client(&args)
+                .list_crons(&ListQuery {
+                    status: None,
+                    queue: None,
+                    limit,
+                    offset,
+                    include_total,
+                })
+                .await?;
+            print_json(&serde_json::json!({
+                "crons": page.crons,
+                "has_more": page.has_more,
+                "total": page.total,
+            }))
+        }
+        CronCommand::Get { client: args, id } => print_json(&client(&args).get_cron(&id).await?),
+        CronCommand::Delete { client: args, id } => {
+            client(&args).delete_cron(&id).await?;
+            print_json(&serde_json::json!({ "deleted": id }))
+        }
+        CronCommand::Pause { client: args, id } => {
+            client(&args).pause_cron(&id).await?;
+            print_json(&serde_json::json!({ "paused": id }))
+        }
+        CronCommand::Resume { client: args, id } => {
+            client(&args).resume_cron(&id).await?;
+            print_json(&serde_json::json!({ "resumed": id }))
         }
     }
 }

@@ -4,7 +4,7 @@ members = [
     "crates/queueflow-core",
     "crates/queueflow-api",
     "crates/queueflow-client",
-    "crates/queueflow-server",
+    "crates/queueflow",
 ]
 
 [workspace.package]
@@ -20,7 +20,9 @@ authors = ["QueueFlow"]
 # committed Cargo.lock; these constraints keep the workspace internally
 # consistent and let `cargo update` move within a compatible range.
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
+# Minimal base; each crate adds only the tokio features it uses, so the
+# published libraries do not drag the full runtime surface into downstreams.
+tokio = { version = "1", default-features = false }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 async-trait = "0.1"
@@ -31,6 +33,7 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde", "clock"] }
 tracing = "0.1"
+cron = "0.17"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
@@ -43,6 +46,8 @@ sqlx = { version = "0.9", default-features = false, features = [
     "migrate",
 ] }
 axum = "0.8"
+# rust_crypto backend: pure Rust, no cmake/nasm toolchain requirements.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
 utoipa = { version = "5", features = ["axum_extras", "chrono", "yaml"] }
@@ -50,10 +55,12 @@ clap = { version = "4", features = ["derive", "env"] }
 rand = "0.10"
 reqwest = { version = "0.13", features = ["json", "query"] }
 
-# Internal crates
-queueflow-core = { path = "crates/queueflow-core" }
-queueflow-api = { path = "crates/queueflow-api" }
-queueflow-client = { path = "crates/queueflow-client" }
+# Internal crates. The `version` alongside `path` is what makes the crates
+# publishable: local builds resolve the path, `cargo publish` rewrites the
+# dependency to the registry version.
+queueflow-core = { path = "crates/queueflow-core", version = "0.1.0" }
+queueflow-api = { path = "crates/queueflow-api", version = "0.1.0" }
+queueflow-client = { path = "crates/queueflow-client", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

@@ -1,33 +1,28 @@
-# =============================================================================
-# TEMPORARILY DISABLED — commented out until the repo and secrets are ready.
-# Re-enable by uncommenting the block below (remove the leading "# " on each
-# line after this banner).
-# =============================================================================
-# name: Security audit
-# 
-# on:
-#   push:
-#     paths:
-#       - "**/Cargo.toml"
-#       - "**/Cargo.lock"
-#   pull_request:
-#     paths:
-#       - "**/Cargo.toml"
-#       - "**/Cargo.lock"
-#   schedule:
-#     - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC — catches newly-published advisories
-#   workflow_dispatch:
-# 
-# permissions:
-#   contents: read
-#   issues: write # the audit action opens an issue when a vuln is found
-# 
-# jobs:
-#   audit:
-#     name: cargo audit (RustSec)
-#     runs-on: ubuntu-latest
-#     steps:
-#       - uses: actions/checkout@v4
-#       - uses: rustsec/audit-check@v2
-#         with:
-#           token: ${{ secrets.GITHUB_TOKEN }}
+name: Security audit
+
+on:
+  push:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC — catches newly-published advisories
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write # the audit action opens an issue when a vuln is found
+
+jobs:
+  audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

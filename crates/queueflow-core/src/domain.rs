@@ -163,6 +163,61 @@ impl Default for JobConfig {
     }
 }
 
+/// Bounds accepted by [`JobConfig::validate`]. Generous by design: they exist
+/// to reject nonsense (and the arithmetic overflow it causes), not to police
+/// reasonable configurations.
+pub mod limits {
+    /// Maximum accepted `max_retries`.
+    pub const MAX_RETRIES: u32 = 1_000;
+    /// Maximum accepted per-attempt timeout: 1 day.
+    pub const MAX_TIMEOUT_SECS: u64 = 86_400;
+    /// Maximum accepted retry delay (base and cap): 30 days.
+    pub const MAX_RETRY_DELAY_SECS: u64 = 2_592_000;
+}
+
+impl JobConfig {
+    /// Check this configuration against the documented [`limits`]. The engine
+    /// validates every config it accepts (single enqueue, batches, workflow
+    /// steps), so an absurd value is a 400 at the boundary instead of an
+    /// overflow deep in the retry math.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_retries > limits::MAX_RETRIES {
+            return Err(format!(
+                "max_retries must be <= {} (got {})",
+                limits::MAX_RETRIES,
+                self.max_retries
+            ));
+        }
+        if self.timeout_secs == 0 || self.timeout_secs > limits::MAX_TIMEOUT_SECS {
+            return Err(format!(
+                "timeout_secs must be within 1..={} (got {})",
+                limits::MAX_TIMEOUT_SECS,
+                self.timeout_secs
+            ));
+        }
+        if self.retry_delay_secs > limits::MAX_RETRY_DELAY_SECS {
+            return Err(format!(
+                "retry_delay_secs must be <= {} (got {})",
+                limits::MAX_RETRY_DELAY_SECS,
+                self.retry_delay_secs
+            ));
+        }
+        if self.retry_max_delay_secs > limits::MAX_RETRY_DELAY_SECS {
+            return Err(format!(
+                "retry_max_delay_secs must be <= {} (got {})",
+                limits::MAX_RETRY_DELAY_SECS,
+                self.retry_max_delay_secs
+            ));
+        }
+        if let Some(j) = self.jitter_factor {
+            if !j.is_finite() || !(0.0..=1.0).contains(&j) {
+                return Err(format!("jitter_factor must be within 0.0..=1.0 (got {j})"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A single unit of work.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct Job {
@@ -306,6 +361,80 @@ pub struct CreateWorkflowRequest {
     #[serde(default)]
     #[schema(value_type = HashMap<String, serde_json::Value>)]
     pub metadata: Map,
+}
+
+/// A dead-lettered job: a terminal failure recorded for inspection and
+/// replay. The original job row remains (subject to retention); this entry
+/// captures why it died and, once replayed, which fresh job took its place.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct DeadLetter {
+    pub id: i64,
+    pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_name: Option<String>,
+    /// Why the job dead-lettered: `max_attempts_exceeded`, `non_retryable`,
+    /// or `handler_not_found`.
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    /// Set once this entry has been replayed; a dead letter replays at most
+    /// once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed_at: Option<DateTime<Utc>>,
+    /// The fresh job created by the replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_job_id: Option<String>,
+}
+
+/// A recurring enqueue schedule. Expressions are standard 5-field crontab
+/// (`minute hour day-of-month month day-of-week`), evaluated in **UTC**; a
+/// 6/7-field form with leading seconds is also accepted.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct CronSchedule {
+    pub id: String,
+    /// Unique per tenant.
+    pub name: String,
+    pub cron_expr: String,
+    pub task_name: String,
+    #[serde(default)]
+    #[schema(value_type = HashMap<String, serde_json::Value>)]
+    pub payload: Map,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<JobConfig>,
+    /// Queue for the enqueued jobs (the engine default when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    pub enabled: bool,
+    /// The next instant this schedule fires. Missed occurrences (server
+    /// down) collapse into at most one catch-up firing.
+    pub next_run_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_enqueued_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Request body for creating a cron schedule.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct CreateCronRequest {
+    /// Unique per tenant.
+    pub name: String,
+    /// 5-field crontab (UTC); 6/7 fields with leading seconds also accepted.
+    pub cron_expr: String,
+    pub task_name: String,
+    #[serde(default)]
+    #[schema(value_type = HashMap<String, serde_json::Value>)]
+    pub payload: Map,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<JobConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
 }
 
 /// The key under which a step's payload receives upstream workflow context.

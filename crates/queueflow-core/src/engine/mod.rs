@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
+use futures::FutureExt;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -41,6 +42,17 @@ pub struct EnqueueOptions {
 /// Headroom added on top of a job's timeout when extending its lease, covering
 /// post-handler bookkeeping (terminal write, workflow advance).
 const LEASE_GRACE_SECS: u64 = 30;
+
+/// Best-effort text from a caught panic payload (for logs and job errors).
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
 
 /// Upper bound on a single idle wait. NOTIFY wakes waiters instantly; this is
 /// the missed-notification safety net, so it can be generous without making
@@ -187,6 +199,9 @@ where
         payload: Map,
         opts: EnqueueOptions,
     ) -> Result<String, EngineError> {
+        if let Some(cfg) = &opts.config {
+            cfg.validate().map_err(EngineError::Validation)?;
+        }
         let queue = opts.queue.unwrap_or_else(|| self.default_queue.clone());
         let now = self.clock.now();
         let job = Job {
@@ -235,6 +250,12 @@ where
         requests: Vec<(String, Map, Option<JobConfig>)>,
         tenant_id: Option<String>,
     ) -> Result<Vec<String>, EngineError> {
+        for (i, (_, _, config)) in requests.iter().enumerate() {
+            if let Some(cfg) = config {
+                cfg.validate()
+                    .map_err(|e| EngineError::Validation(format!("jobs[{i}]: {e}")))?;
+            }
+        }
         let now = self.clock.now();
         let jobs: Vec<Job> = requests
             .into_iter()
@@ -358,6 +379,198 @@ where
         self.scheduler.diagram(id).await
     }
 
+    // ---- Cron schedules ---------------------------------------------------
+
+    /// Create a recurring enqueue. The expression (standard 5-field crontab,
+    /// UTC; 6/7 fields with leading seconds also accepted) and any config
+    /// override are validated here; the first firing is the next occurrence
+    /// after now. Names are unique per tenant (a duplicate is a Conflict).
+    pub async fn create_cron(
+        &self,
+        req: CreateCronRequest,
+        tenant_id: Option<String>,
+    ) -> Result<String, EngineError> {
+        if req.name.trim().is_empty() {
+            return Err(EngineError::Validation("name is required".into()));
+        }
+        if req.task_name.trim().is_empty() {
+            return Err(EngineError::Validation("task_name is required".into()));
+        }
+        if let Some(cfg) = &req.config {
+            cfg.validate().map_err(EngineError::Validation)?;
+        }
+        let now = self.clock.now();
+        let next =
+            crate::cron::next_occurrence(&req.cron_expr, now).map_err(EngineError::Validation)?;
+        let cron = CronSchedule {
+            id: Uuid::new_v4().to_string(),
+            name: req.name,
+            cron_expr: req.cron_expr,
+            task_name: req.task_name,
+            payload: req.payload,
+            config: req.config,
+            queue_name: req.queue,
+            tenant_id,
+            enabled: true,
+            next_run_at: next,
+            last_enqueued_at: None,
+            created_at: now,
+        };
+        if !self.store.create_cron(&cron).await? {
+            return Err(EngineError::Conflict(format!(
+                "cron schedule '{}' already exists",
+                cron.name
+            )));
+        }
+        Ok(cron.id)
+    }
+
+    pub async fn get_cron(&self, id: &str) -> Result<CronSchedule, EngineError> {
+        Ok(self.store.get_cron(id).await?)
+    }
+
+    pub async fn list_crons(&self, filter: &ListFilter) -> Result<Page<CronSchedule>, EngineError> {
+        Ok(self.store.list_crons(filter).await?)
+    }
+
+    pub async fn delete_cron(&self, id: &str) -> Result<(), EngineError> {
+        if !self.store.delete_cron(id).await? {
+            return Err(StorageError::CronNotFound(id.to_string()).into());
+        }
+        Ok(())
+    }
+
+    /// Pause or resume a schedule. Resuming recomputes `next_run_at` from
+    /// now, so the schedule fires at its next future slot rather than
+    /// catching up on everything it missed while paused.
+    pub async fn set_cron_enabled(&self, id: &str, enabled: bool) -> Result<(), EngineError> {
+        let cron = self.store.get_cron(id).await?;
+        let next = crate::cron::next_occurrence(&cron.cron_expr, self.clock.now())
+            .map_err(EngineError::Validation)?;
+        if !self.store.set_cron_enabled(id, enabled, next).await? {
+            return Err(StorageError::CronNotFound(id.to_string()).into());
+        }
+        Ok(())
+    }
+
+    /// Enqueue a job for every due cron schedule; returns how many fired.
+    /// Runs from the janitor loop on every server: the idempotency key
+    /// (`cron:{id}:{due_ts}`) is bound to the stored due instant, so
+    /// concurrent pumps enqueue exactly once, and occurrences missed during
+    /// downtime collapse into at most one catch-up firing before the
+    /// schedule jumps to its next future slot.
+    pub async fn cron_tick(&self) -> Result<usize, EngineError> {
+        let now = self.clock.now();
+        let due = self.store.due_crons(now, self.janitor.batch).await?;
+        let mut fired = 0;
+        for cron in due {
+            let due_at = cron.next_run_at;
+            let mut metadata = Map::new();
+            metadata.insert("cron_id".into(), Json::String(cron.id.clone()));
+            metadata.insert("cron_name".into(), Json::String(cron.name.clone()));
+            metadata.insert("cron_due_at".into(), Json::String(due_at.to_rfc3339()));
+            let enqueue = self
+                .enqueue(
+                    &cron.task_name,
+                    cron.payload.clone(),
+                    EnqueueOptions {
+                        config: cron.config.clone(),
+                        queue: cron.queue_name.clone(),
+                        tenant_id: cron.tenant_id.clone(),
+                        metadata,
+                        idempotency_key: Some(format!("cron:{}:{}", cron.id, due_at.timestamp())),
+                        run_at: None,
+                    },
+                )
+                .await;
+            if let Err(e) = enqueue {
+                // Leave next_run_at untouched: the next tick retries this
+                // same firing (same idempotency key).
+                tracing::warn!(cron_id = %cron.id, error = %e, "cron firing failed; will retry");
+                continue;
+            }
+            fired += 1;
+            match crate::cron::next_occurrence(&cron.cron_expr, now) {
+                Ok(next) => self.store.advance_cron(&cron.id, now, next).await?,
+                Err(e) => {
+                    // E.g. a year-bounded expression ran out of occurrences.
+                    tracing::error!(cron_id = %cron.id, error = %e, "cron has no future occurrence; disabling");
+                    let _ = self.store.set_cron_enabled(&cron.id, false, due_at).await;
+                }
+            }
+        }
+        Ok(fired)
+    }
+
+    // ---- Dead letters -----------------------------------------------------
+
+    pub async fn list_dead_letters(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<Page<DeadLetter>, EngineError> {
+        Ok(self.store.list_dead_letters(filter).await?)
+    }
+
+    pub async fn get_dead_letter(&self, id: i64) -> Result<DeadLetter, EngineError> {
+        Ok(self.store.get_dead_letter(id).await?)
+    }
+
+    /// Replay a dead-lettered job as a fresh, detached job: same task,
+    /// payload, queue, config, and tenant; a new id; zeroed retry and
+    /// delivery counters. Workflow linkage is deliberately not resurrected —
+    /// the original step already settled its workflow — but the new job's
+    /// metadata records the provenance (`replayed_from_job`,
+    /// `replayed_from_dead_letter`). A dead letter replays at most once;
+    /// replaying it again is a Conflict. Requires the original job row (the
+    /// retention sweep may have purged it).
+    pub async fn replay_dead_letter(&self, id: i64) -> Result<String, EngineError> {
+        let dl = self.store.get_dead_letter(id).await?;
+        if let Some(existing) = &dl.replay_job_id {
+            return Err(EngineError::Conflict(format!(
+                "dead letter {id} was already replayed as job {existing}"
+            )));
+        }
+        let original = self.store.get_job(&dl.job_id).await?;
+
+        let now = self.clock.now();
+        let mut metadata = original.metadata.clone();
+        metadata.insert(
+            "replayed_from_job".into(),
+            Json::String(original.id.clone()),
+        );
+        metadata.insert("replayed_from_dead_letter".into(), Json::from(id));
+        let job = Job {
+            id: Uuid::new_v4().to_string(),
+            queue_name: original.queue_name.clone(),
+            task_name: original.task_name.clone(),
+            payload: original.payload.clone(),
+            config: original.config.clone(),
+            status: JobStatus::Pending,
+            created_at: now,
+            scheduled_at: now,
+            started_at: None,
+            completed_at: None,
+            delivery_count: 0,
+            error_message: None,
+            retry_count: 0,
+            next_retry_at: None,
+            workflow_id: None,
+            workflow_step_id: None,
+            result: None,
+            metadata,
+            tenant_id: original.tenant_id.clone(),
+            idempotency_key: None,
+        };
+
+        if !self.store.replay_dead_letter(id, &job).await? {
+            return Err(EngineError::Conflict(format!(
+                "dead letter {id} was already replayed"
+            )));
+        }
+        EngineStats::incr(&self.stats.jobs_created);
+        Ok(job.id)
+    }
+
     pub async fn ping(&self) -> Result<(), EngineError> {
         Ok(self.store.ping().await?)
     }
@@ -378,6 +591,10 @@ where
     /// Spawn `worker_count` concurrent workers draining `queue`. The returned
     /// [`JoinSet`] resolves when all workers stop (on shutdown). Call
     /// [`Engine::shutdown`] (or cancel via the token) to stop them.
+    ///
+    /// Workers are supervised: a panic that escapes the per-job containment
+    /// (an adapter bug, say) restarts the worker instead of silently
+    /// shrinking the pool. The pool only winds down at shutdown.
     pub fn run_workers(self: &Arc<Self>, queue: impl Into<String>) -> JoinSet<()> {
         let queue = queue.into();
         self.mark_running();
@@ -385,7 +602,28 @@ where
         for worker_id in 0..self.worker_count {
             let engine = Arc::clone(self);
             let q = queue.clone();
-            set.spawn(async move { engine.worker_loop(worker_id, q).await });
+            set.spawn(async move {
+                loop {
+                    let run = std::panic::AssertUnwindSafe(
+                        engine.clone().worker_loop(worker_id, q.clone()),
+                    )
+                    .catch_unwind()
+                    .await;
+                    match run {
+                        Ok(()) => break, // clean exit (shutdown)
+                        Err(panic) => {
+                            tracing::error!(
+                                worker_id,
+                                panic = %panic_message(&*panic),
+                                "worker panicked; restarting"
+                            );
+                            if engine.shutdown.is_cancelled() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
         }
         set
     }
@@ -491,10 +729,19 @@ where
         }
 
         let timeout = StdDuration::from_secs(job.config.timeout_secs.max(1));
-        let outcome = tokio::time::timeout(timeout, handler.handle(job.payload.clone())).await;
+        // catch_unwind: a panicking handler must not take down the worker.
+        // At-least-once delivery treats a panic like any other crash, so it
+        // consumes retry budget and eventually dead-letters.
+        let handler_fut =
+            std::panic::AssertUnwindSafe(handler.handle(job.payload.clone())).catch_unwind();
+        let outcome = tokio::time::timeout(timeout, handler_fut).await;
 
         match outcome {
-            Ok(Ok(result)) => {
+            Ok(Err(panic)) => {
+                let msg = format!("handler panicked: {}", panic_message(&*panic));
+                self.handle_failure(&job, &lease_token, &msg, true).await;
+            }
+            Ok(Ok(Ok(result))) => {
                 let result_value = serde_json::to_value(&result).unwrap_or(Json::Null);
                 match self
                     .store
@@ -528,7 +775,7 @@ where
                     }
                 }
             }
-            Ok(Err(handler_err)) => {
+            Ok(Ok(Err(handler_err))) => {
                 self.handle_failure(
                     &job,
                     &lease_token,

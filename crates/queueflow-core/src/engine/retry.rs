@@ -8,10 +8,16 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::domain::{BackoffStrategy, JobConfig};
 
+/// Defensive ceiling on any computed retry delay: about 100 years. Configs
+/// this absurd are rejected by [`JobConfig::validate`] at the boundary, but
+/// the arithmetic here must stay panic-free regardless (a `u64::MAX` delay
+/// would otherwise overflow `chrono::Duration` and kill the failure path).
+const MAX_DELAY_SECS: u64 = 3_155_760_000;
+
 impl BackoffStrategy {
     /// Deterministic delay (in seconds) before retrying, given a zero-based
-    /// `attempt` index. Capped by `retry_max_delay_secs`. No jitter — used for
-    /// tests and inspection.
+    /// `attempt` index. Capped by `retry_max_delay_secs` (all strategies).
+    /// No jitter — used for tests and inspection.
     pub fn delay_secs(self, cfg: &JobConfig, attempt: u32) -> u64 {
         let base = cfg.retry_delay_secs as f64;
         let raw = match self {
@@ -20,7 +26,9 @@ impl BackoffStrategy {
             // 2^attempt, guarding against overflow for absurd attempt counts.
             BackoffStrategy::Exponential => base * 2f64.powi(attempt.min(62) as i32),
         };
-        raw.min(cfg.retry_max_delay_secs as f64).max(0.0) as u64
+        raw.min(cfg.retry_max_delay_secs as f64)
+            .min(MAX_DELAY_SECS as f64)
+            .max(0.0) as u64
     }
 
     /// The wall-clock instant at which a retry should next become visible,
@@ -36,7 +44,10 @@ impl BackoffStrategy {
             }
             _ => base,
         };
-        now + Duration::seconds(secs.max(0.0).round() as i64)
+        // Saturating float->int cast, then re-clamp: never hand chrono a
+        // Duration it would panic on.
+        let secs = (secs.max(0.0).round() as i64).min(MAX_DELAY_SECS as i64);
+        now + Duration::seconds(secs)
     }
 }
 
@@ -77,6 +88,27 @@ mod tests {
         assert_eq!(BackoffStrategy::Exponential.delay_secs(&cfg(), 2), 240);
         // capped at retry_max_delay_secs
         assert_eq!(BackoffStrategy::Exponential.delay_secs(&cfg(), 20), 3600);
+    }
+
+    #[test]
+    fn absurd_config_is_clamped_not_panicking() {
+        // u64::MAX delays would overflow chrono::Duration without the clamp;
+        // this must compute a sane future instant, not panic.
+        let c = JobConfig {
+            retry_delay_secs: u64::MAX,
+            retry_max_delay_secs: u64::MAX,
+            jitter_factor: Some(1.0),
+            ..cfg()
+        };
+        let now = Utc::now();
+        for strategy in [
+            BackoffStrategy::Fixed,
+            BackoffStrategy::Linear,
+            BackoffStrategy::Exponential,
+        ] {
+            assert!(strategy.delay_secs(&c, u32::MAX) <= 3_155_760_000);
+            assert!(strategy.next_retry_at(&c, u32::MAX, now) > now);
+        }
     }
 
     #[test]

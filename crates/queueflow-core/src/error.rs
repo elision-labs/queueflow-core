@@ -38,6 +38,8 @@ impl EngineError {
                 StorageError::JobNotFound(_)
                     | StorageError::WorkflowNotFound(_)
                     | StorageError::StepNotFound { .. }
+                    | StorageError::DeadLetterNotFound(_)
+                    | StorageError::CronNotFound(_)
             )
         )
     }

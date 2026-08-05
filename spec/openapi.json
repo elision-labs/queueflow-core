@@ -24,6 +24,640 @@
     }
   ],
   "paths": {
+    "/api/v1/cron": {
+      "get": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "listCrons",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by status (e.g. `pending`, `completed`).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "queue",
+            "in": "query",
+            "description": "Filter by queue name (jobs only).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1..=100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Number of records to skip (default 0).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "order_by",
+            "in": "query",
+            "description": "`created_at ASC` or `created_at DESC` (default DESC).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_total",
+            "in": "query",
+            "description": "Include the exact `total` count in the response (default false; the\ncount is an extra full scan over the filtered set).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of cron schedules (`status`/`queue` filters do not apply)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListCronsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "createCron",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCronRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Schedule created; first firing is the next occurrence (UTC)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateCronResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (e.g. a bad cron expression)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A schedule with this name already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/cron/{id}": {
+      "get": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "getCron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron schedule id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cron schedule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CronSchedule"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "deleteCron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron schedule id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted; already-enqueued jobs are unaffected"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/cron/{id}/pause": {
+      "post": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "pauseCron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron schedule id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Paused: no further firings until resumed"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/cron/{id}/resume": {
+      "post": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "resumeCron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron schedule id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Resumed: fires at its next future occurrence (missed runs are not caught up)"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/dlq": {
+      "get": {
+        "tags": [
+          "dlq"
+        ],
+        "operationId": "listDeadLetters",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by status (e.g. `pending`, `completed`).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "queue",
+            "in": "query",
+            "description": "Filter by queue name (jobs only).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1..=100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Number of records to skip (default 0).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "order_by",
+            "in": "query",
+            "description": "`created_at ASC` or `created_at DESC` (default DESC).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_total",
+            "in": "query",
+            "description": "Include the exact `total` count in the response (default false; the\ncount is an extra full scan over the filtered set).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of dead letters, newest first (the `status` filter does not apply)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListDeadLettersResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/dlq/{id}": {
+      "get": {
+        "tags": [
+          "dlq"
+        ],
+        "operationId": "getDeadLetter",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Dead letter id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dead letter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeadLetter"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/dlq/{id}/replay": {
+      "post": {
+        "tags": [
+          "dlq"
+        ],
+        "operationId": "replayDeadLetter",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Dead letter id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "A fresh job was created from the dead-lettered one (same task/payload/queue/config; workflow linkage is not resurrected)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplayDeadLetterResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (the entry, or its original job after retention)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already replayed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/jobs": {
       "get": {
         "tags": [
@@ -395,6 +1029,16 @@
               }
             }
           },
+          "403": {
+            "description": "Authenticated, but not with the worker credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Not found",
             "content": {
@@ -531,6 +1175,16 @@
               }
             }
           },
+          "403": {
+            "description": "Authenticated, but not with the worker credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Not found",
             "content": {
@@ -607,6 +1261,16 @@
               }
             }
           },
+          "403": {
+            "description": "Authenticated, but not with the worker credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Not found",
             "content": {
@@ -675,6 +1339,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Authenticated, but not with the worker credential",
             "content": {
               "application/json": {
                 "schema": {
@@ -1194,6 +1868,62 @@
           }
         }
       },
+      "CreateCronRequest": {
+        "type": "object",
+        "description": "Request body for creating a cron schedule.",
+        "required": [
+          "name",
+          "cron_expr",
+          "task_name"
+        ],
+        "properties": {
+          "config": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JobConfig"
+              }
+            ]
+          },
+          "cron_expr": {
+            "type": "string",
+            "description": "5-field crontab (UTC); 6/7 fields with leading seconds also accepted."
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique per tenant."
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "queue": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_name": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateCronResponse": {
+        "type": "object",
+        "required": [
+          "cron_id"
+        ],
+        "properties": {
+          "cron_id": {
+            "type": "string"
+          }
+        }
+      },
       "CreateJobRequest": {
         "type": "object",
         "required": [
@@ -1284,6 +2014,149 @@
         "properties": {
           "workflow_id": {
             "type": "string"
+          }
+        }
+      },
+      "CronSchedule": {
+        "type": "object",
+        "description": "A recurring enqueue schedule. Expressions are standard 5-field crontab\n(`minute hour day-of-month month day-of-week`), evaluated in **UTC**; a\n6/7-field form with leading seconds is also accepted.",
+        "required": [
+          "id",
+          "name",
+          "cron_expr",
+          "task_name",
+          "enabled",
+          "next_run_at",
+          "created_at"
+        ],
+        "properties": {
+          "config": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JobConfig"
+              }
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "cron_expr": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_enqueued_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique per tenant."
+          },
+          "next_run_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The next instant this schedule fires. Missed occurrences (server\ndown) collapse into at most one catch-up firing."
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "queue_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Queue for the enqueued jobs (the engine default when absent)."
+          },
+          "task_name": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "DeadLetter": {
+        "type": "object",
+        "description": "A dead-lettered job: a terminal failure recorded for inspection and\nreplay. The original job row remains (subject to retention); this entry\ncaptures why it died and, once replayed, which fresh job took its place.",
+        "required": [
+          "id",
+          "job_id",
+          "reason",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "queue_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why the job dead-lettered: `max_attempts_exceeded`, `non_retryable`,\nor `handler_not_found`."
+          },
+          "replay_job_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The fresh job created by the replay."
+          },
+          "replayed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Set once this entry has been replayed; a dead letter replays at most\nonce."
+          },
+          "task_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenant_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -1669,6 +2542,78 @@
           }
         }
       },
+      "ListCronsResponse": {
+        "type": "object",
+        "required": [
+          "crons",
+          "limit",
+          "offset",
+          "has_more"
+        ],
+        "properties": {
+          "crons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CronSchedule"
+            }
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Exact total match count; only present when `include_total=true`."
+          }
+        }
+      },
+      "ListDeadLettersResponse": {
+        "type": "object",
+        "required": [
+          "dead_letters",
+          "limit",
+          "offset",
+          "has_more"
+        ],
+        "properties": {
+          "dead_letters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeadLetter"
+            }
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Exact total match count; only present when `include_total=true`."
+          }
+        }
+      },
       "ListJobsResponse": {
         "type": "object",
         "required": [
@@ -1765,6 +2710,18 @@
         "properties": {
           "status": {
             "type": "string"
+          }
+        }
+      },
+      "ReplayDeadLetterResponse": {
+        "type": "object",
+        "required": [
+          "job_id"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "description": "The fresh job created from the dead-lettered one."
           }
         }
       },
@@ -2007,6 +2964,14 @@
     {
       "name": "workflows",
       "description": "Workflow orchestration (DAG of steps)"
+    },
+    {
+      "name": "cron",
+      "description": "Recurring enqueues on a cron schedule (UTC)"
+    },
+    {
+      "name": "dlq",
+      "description": "Dead-letter queue: inspect terminally-failed jobs and replay them as fresh jobs"
     },
     {
       "name": "worker",

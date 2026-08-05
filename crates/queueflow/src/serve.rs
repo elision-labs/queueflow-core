@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use queueflow_api::auth::{parse_api_keys, AuthConfig};
 use queueflow_api::{build_router, ApiState};
 use queueflow_core::task::builtin;
 use queueflow_core::{connect, migrate, Engine, JanitorConfig, PostgresJobStore, SystemClock};
@@ -87,7 +88,33 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             }
         }
         Mode::Api | Mode::All => {
-            let app = build_router(ApiState::new(engine.clone()));
+            let auth = AuthConfig {
+                worker_token: args.worker_token.clone(),
+                jwt_secret: args.jwt_secret.clone(),
+                api_keys: args
+                    .api_keys
+                    .as_deref()
+                    .map(parse_api_keys)
+                    .transpose()
+                    .map_err(anyhow::Error::msg)
+                    .context("--api-keys")?
+                    .unwrap_or_default(),
+            };
+            if !auth.strict() {
+                tracing::warn!(
+                    "no --jwt-secret or --api-keys configured: tenant authentication is the \
+                     development placeholder (any non-empty token maps to one tenant). Configure \
+                     real credentials before exposing this API."
+                );
+            }
+            if auth.worker_token.is_none() {
+                tracing::warn!(
+                    "no --worker-token / QUEUEFLOW_WORKER_TOKEN configured: the worker-protocol \
+                     endpoints (lease/heartbeat/complete/fail) will accept ANY authenticated \
+                     token. Set one for any deployment with more than one tenant."
+                );
+            }
+            let app = build_router(ApiState::new(engine.clone()).with_auth(auth));
             let listener = TcpListener::bind(("0.0.0.0", args.api_port))
                 .await
                 .with_context(|| format!("bind API port {}", args.api_port))?;

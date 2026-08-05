@@ -48,6 +48,22 @@ pub trait JobApi: Send + Sync {
     async fn cancel_workflow(&self, id: &str) -> Result<(), EngineError>;
     async fn workflow_diagram(&self, id: &str) -> Result<String, EngineError>;
 
+    // Dead-letter admin: inspect and replay terminally-failed jobs.
+    async fn list_dead_letters(&self, filter: ListFilter) -> Result<Page<DeadLetter>, EngineError>;
+    async fn get_dead_letter(&self, id: i64) -> Result<DeadLetter, EngineError>;
+    async fn replay_dead_letter(&self, id: i64) -> Result<String, EngineError>;
+
+    // Cron schedules: recurring enqueues.
+    async fn create_cron(
+        &self,
+        req: CreateCronRequest,
+        tenant_id: Option<String>,
+    ) -> Result<String, EngineError>;
+    async fn get_cron(&self, id: &str) -> Result<CronSchedule, EngineError>;
+    async fn list_crons(&self, filter: ListFilter) -> Result<Page<CronSchedule>, EngineError>;
+    async fn delete_cron(&self, id: &str) -> Result<(), EngineError>;
+    async fn set_cron_enabled(&self, id: &str, enabled: bool) -> Result<(), EngineError>;
+
     // Remote worker protocol. Lease ownership rides on the lease token.
     async fn lease_jobs(
         &self,
@@ -155,6 +171,42 @@ where
 
     async fn workflow_diagram(&self, id: &str) -> Result<String, EngineError> {
         Engine::workflow_diagram(self, id).await
+    }
+
+    async fn create_cron(
+        &self,
+        req: CreateCronRequest,
+        tenant_id: Option<String>,
+    ) -> Result<String, EngineError> {
+        Engine::create_cron(self, req, tenant_id).await
+    }
+
+    async fn get_cron(&self, id: &str) -> Result<CronSchedule, EngineError> {
+        Engine::get_cron(self, id).await
+    }
+
+    async fn list_crons(&self, filter: ListFilter) -> Result<Page<CronSchedule>, EngineError> {
+        Engine::list_crons(self, &filter).await
+    }
+
+    async fn delete_cron(&self, id: &str) -> Result<(), EngineError> {
+        Engine::delete_cron(self, id).await
+    }
+
+    async fn set_cron_enabled(&self, id: &str, enabled: bool) -> Result<(), EngineError> {
+        Engine::set_cron_enabled(self, id, enabled).await
+    }
+
+    async fn list_dead_letters(&self, filter: ListFilter) -> Result<Page<DeadLetter>, EngineError> {
+        Engine::list_dead_letters(self, &filter).await
+    }
+
+    async fn get_dead_letter(&self, id: i64) -> Result<DeadLetter, EngineError> {
+        Engine::get_dead_letter(self, id).await
+    }
+
+    async fn replay_dead_letter(&self, id: i64) -> Result<String, EngineError> {
+        Engine::replay_dead_letter(self, id).await
     }
 
     async fn lease_jobs(

@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 // Re-export the domain types callers need (also imports them for this module),
 // so depending on queueflow-core directly is optional.
 pub use queueflow_core::{
-    BackoffStrategy, CreateWorkflowRequest, HandlerError, Job, JobConfig, JobStatus, LeasedJob,
-    Map, OnFailure, StatsSnapshot, Workflow, WorkflowStatus, WorkflowStep,
+    BackoffStrategy, CreateCronRequest, CreateWorkflowRequest, CronSchedule, DeadLetter,
+    HandlerError, Job, JobConfig, JobStatus, LeasedJob, Map, OnFailure, StatsSnapshot, Workflow,
+    WorkflowStatus, WorkflowStep,
 };
 
 /// Errors returned by [`Client`] calls.
@@ -98,6 +99,24 @@ pub struct WorkflowsPage {
     pub total: Option<i64>,
 }
 
+/// One page of dead letters.
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeadLettersPage {
+    pub dead_letters: Vec<DeadLetter>,
+    pub has_more: bool,
+    #[serde(default)]
+    pub total: Option<i64>,
+}
+
+/// One page of cron schedules.
+#[derive(Clone, Debug, Deserialize)]
+pub struct CronsPage {
+    pub crons: Vec<CronSchedule>,
+    pub has_more: bool,
+    #[serde(default)]
+    pub total: Option<i64>,
+}
+
 #[derive(Serialize)]
 struct JobConfigBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,6 +142,16 @@ struct CreateBatchJobsResponse {
 #[derive(Deserialize)]
 struct CreateWorkflowResponse {
     workflow_id: String,
+}
+
+#[derive(Deserialize)]
+struct ReplayDeadLetterResponse {
+    job_id: String,
+}
+
+#[derive(Deserialize)]
+struct CreateCronResponse {
+    cron_id: String,
 }
 
 #[derive(Deserialize)]
@@ -338,6 +367,96 @@ impl Client {
                 .await?,
         )
         .await
+    }
+
+    // ---- Cron schedules -----------------------------------------------------
+
+    /// Create a recurring enqueue (5-field crontab, UTC); returns the
+    /// schedule id. A duplicate name for the tenant is a 409.
+    pub async fn create_cron(&self, req: &CreateCronRequest) -> Result<String, Error> {
+        let resp: CreateCronResponse = Self::decode(
+            self.request(reqwest::Method::POST, "/api/v1/cron")
+                .json(req)
+                .send()
+                .await?,
+        )
+        .await?;
+        Ok(resp.cron_id)
+    }
+
+    pub async fn list_crons(&self, q: &ListQuery) -> Result<CronsPage, Error> {
+        let mut req = self.request(reqwest::Method::GET, "/api/v1/cron");
+        req = apply_list_query(req, q);
+        Self::decode(req.send().await?).await
+    }
+
+    pub async fn get_cron(&self, id: &str) -> Result<CronSchedule, Error> {
+        Self::decode(
+            self.request(reqwest::Method::GET, &format!("/api/v1/cron/{id}"))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    pub async fn delete_cron(&self, id: &str) -> Result<(), Error> {
+        Self::expect_no_content(
+            self.request(reqwest::Method::DELETE, &format!("/api/v1/cron/{id}"))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// Stop firings until [`Client::resume_cron`].
+    pub async fn pause_cron(&self, id: &str) -> Result<(), Error> {
+        Self::expect_no_content(
+            self.request(reqwest::Method::POST, &format!("/api/v1/cron/{id}/pause"))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// Resume firings at the next future occurrence (missed runs are skipped).
+    pub async fn resume_cron(&self, id: &str) -> Result<(), Error> {
+        Self::expect_no_content(
+            self.request(reqwest::Method::POST, &format!("/api/v1/cron/{id}/resume"))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    // ---- Dead letters -------------------------------------------------------
+
+    /// List dead-lettered jobs, newest first (`status` in the query is
+    /// ignored; `queue`/paging apply).
+    pub async fn list_dead_letters(&self, q: &ListQuery) -> Result<DeadLettersPage, Error> {
+        let mut req = self.request(reqwest::Method::GET, "/api/v1/dlq");
+        req = apply_list_query(req, q);
+        Self::decode(req.send().await?).await
+    }
+
+    pub async fn get_dead_letter(&self, id: i64) -> Result<DeadLetter, Error> {
+        Self::decode(
+            self.request(reqwest::Method::GET, &format!("/api/v1/dlq/{id}"))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// Replay a dead-lettered job as a fresh, detached job; returns the new
+    /// job id. Each entry replays at most once (a second replay is a 409).
+    pub async fn replay_dead_letter(&self, id: i64) -> Result<String, Error> {
+        let resp: ReplayDeadLetterResponse = Self::decode(
+            self.request(reqwest::Method::POST, &format!("/api/v1/dlq/{id}/replay"))
+                .send()
+                .await?,
+        )
+        .await?;
+        Ok(resp.job_id)
     }
 
     /// Stream the job's status transitions as they happen (Server-Sent

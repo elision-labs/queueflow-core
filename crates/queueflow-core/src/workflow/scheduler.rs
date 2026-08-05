@@ -67,11 +67,18 @@ where
             tenant_id,
         };
 
-        // Validate before persisting anything.
+        // Validate before persisting anything: the DAG shape and every
+        // per-step config override.
         let roots: Vec<String> = {
             let graph = DependencyGraph::new(&wf.steps)?;
             graph.roots().iter().map(|s| s.to_string()).collect()
         };
+        for step in &wf.steps {
+            if let Some(cfg) = &step.config {
+                cfg.validate()
+                    .map_err(|e| EngineError::Validation(format!("step '{}': {e}", step.name)))?;
+            }
+        }
 
         self.store.create_workflow(&wf).await?;
         let _ = self
@@ -82,7 +89,7 @@ where
 
         for root in &roots {
             if let Some(step) = wf.steps.iter().find(|s| &s.name == root) {
-                self.enqueue_step(&wf, step, &wf.context).await?;
+                self.enqueue_step(&wf, step).await?;
             }
         }
 
@@ -90,18 +97,27 @@ where
     }
 
     /// Called by a worker when a workflow-linked job completes successfully.
+    ///
+    /// Write ordering is load-bearing: the result is merged into the shared
+    /// context *before* the step is marked `Completed`, so any observer that
+    /// sees the step terminal is guaranteed a context read that already
+    /// contains its result ([`Self::enqueue_step`] relies on this to hand
+    /// fan-in steps a complete `_context`). A crash between the two writes
+    /// leaves a terminal job under a non-terminal step, which the janitor's
+    /// stalled-step sweep re-drives through this method (the merge is
+    /// idempotent per step).
     pub async fn on_step_completed(
         &self,
         workflow_id: &str,
         step_name: &str,
         result: &Map,
     ) -> Result<(), EngineError> {
-        self.store
-            .set_step_status(workflow_id, step_name, StepStatus::Completed, None)
-            .await?;
         let value = serde_json::to_value(result).unwrap_or(Json::Null);
         self.store
             .merge_workflow_context(workflow_id, step_name, &value)
+            .await?;
+        self.store
+            .set_step_status(workflow_id, step_name, StepStatus::Completed, None)
             .await?;
         self.advance(workflow_id).await
     }
@@ -126,16 +142,28 @@ where
                 self.store
                     .set_step_status(workflow_id, step_name, StepStatus::Failed, Some(error))
                     .await?;
-                // Cancel everything not yet scheduled, then fail the workflow.
+                // Halt everything that has not already reached a terminal
+                // state, live jobs included: an unclaimed sibling job would
+                // otherwise stay claimable and start fresh work for a dead
+                // workflow. A currently-running sibling keeps its handler
+                // alive, but flipping its job to cancelled means every
+                // lease-guarded outcome write (and the next heartbeat) is
+                // refused, exactly as in `Engine::cancel_workflow`.
                 for rec in self.store.workflow_step_statuses(workflow_id).await? {
-                    if rec.status == StepStatus::Pending && rec.job_id.is_none() {
+                    if rec.name == step_name || rec.status.is_terminal() {
+                        continue;
+                    }
+                    self.store
+                        .set_step_status(
+                            workflow_id,
+                            &rec.name,
+                            StepStatus::Cancelled,
+                            Some("workflow halted by an upstream failure"),
+                        )
+                        .await?;
+                    if let Some(job_id) = &rec.job_id {
                         self.store
-                            .set_step_status(
-                                workflow_id,
-                                &rec.name,
-                                StepStatus::Cancelled,
-                                Some("workflow halted by an upstream failure"),
-                            )
+                            .cancel_job_if_active(job_id, "workflow halted by an upstream failure")
                             .await?;
                     }
                 }
@@ -209,7 +237,7 @@ where
                     status_by_name.get(d.as_str()).copied() == Some(StepStatus::Completed)
                 });
                 if step.depends_on.is_empty() || deps_completed {
-                    self.enqueue_step(&wf, step, &wf.context).await?;
+                    self.enqueue_step(&wf, step).await?;
                     changed = true;
                 } else {
                     let dep_unsatisfiable = step.depends_on.iter().any(|d| {
@@ -294,13 +322,20 @@ where
         &self,
         wf: &Workflow,
         step: &WorkflowStep,
-        context: &Map,
     ) -> Result<String, EngineError> {
+        // Read the context *after* the caller observed the dependency
+        // statuses that made this step ready. Combined with the
+        // merge-before-status ordering in [`Self::on_step_completed`], seeing
+        // a dependency `Completed` guarantees its result is already visible
+        // to this read, so a fan-in step can never be scheduled with a
+        // partial `_context`.
+        let context = self.store.get_workflow(&wf.id).await?.context;
+
         let mut payload = step.payload.clone();
         if !context.is_empty() {
             payload.insert(
                 CONTEXT_KEY.to_string(),
-                serde_json::to_value(context).unwrap_or(Json::Null),
+                serde_json::to_value(&context).unwrap_or(Json::Null),
             );
         }
 

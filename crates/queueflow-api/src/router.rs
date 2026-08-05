@@ -9,25 +9,20 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 
-use crate::auth::bearer_auth;
+use crate::auth::{bearer_auth, worker_auth};
 use crate::handlers;
 use crate::openapi::ApiDoc;
 use crate::ApiState;
 
 /// Build the full application router for the given engine state.
 pub fn build_router(state: ApiState) -> Router {
-    // Everything under /api/v1 requires a bearer token.
-    let v1 = Router::new()
+    // Tenant surface: requires a tenant bearer token.
+    let tenant = Router::new()
         .route("/jobs", post(handlers::create_job).get(handlers::list_jobs))
         .route("/jobs/batch", post(handlers::create_batch_jobs))
         .route("/jobs/{id}", get(handlers::get_job))
         .route("/jobs/{id}/cancel", post(handlers::cancel_job))
         .route("/jobs/{id}/events", get(handlers::stream_job_events))
-        // Remote worker protocol: lease / heartbeat / complete / fail.
-        .route("/queues/{queue}/lease", post(handlers::lease_jobs))
-        .route("/jobs/{id}/complete", post(handlers::complete_job))
-        .route("/jobs/{id}/fail", post(handlers::fail_job))
-        .route("/jobs/{id}/heartbeat", post(handlers::heartbeat_job))
         .route(
             "/workflows",
             post(handlers::create_workflow).get(handlers::list_workflows),
@@ -38,9 +33,32 @@ pub fn build_router(state: ApiState) -> Router {
             "/workflows/{id}/diagram",
             get(handlers::get_workflow_diagram),
         )
+        .route(
+            "/cron",
+            post(handlers::create_cron).get(handlers::list_crons),
+        )
+        .route(
+            "/cron/{id}",
+            get(handlers::get_cron).delete(handlers::delete_cron),
+        )
+        .route("/cron/{id}/pause", post(handlers::pause_cron))
+        .route("/cron/{id}/resume", post(handlers::resume_cron))
+        .route("/dlq", get(handlers::list_dead_letters))
+        .route("/dlq/{id}", get(handlers::get_dead_letter))
+        .route("/dlq/{id}/replay", post(handlers::replay_dead_letter))
         .route("/tasks", get(handlers::list_tasks))
         .route("/stats", get(handlers::get_stats))
-        .route_layer(middleware::from_fn(bearer_auth));
+        .route_layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
+
+    // Worker protocol: lease / heartbeat / complete / fail. Workers execute
+    // arbitrary tenants' jobs, so these routes take the worker credential,
+    // not a tenant token.
+    let worker = Router::new()
+        .route("/queues/{queue}/lease", post(handlers::lease_jobs))
+        .route("/jobs/{id}/complete", post(handlers::complete_job))
+        .route("/jobs/{id}/fail", post(handlers::fail_job))
+        .route("/jobs/{id}/heartbeat", post(handlers::heartbeat_job))
+        .route_layer(middleware::from_fn_with_state(state.clone(), worker_auth));
 
     Router::new()
         .route("/health", get(handlers::health))
@@ -48,7 +66,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/openapi.json", get(openapi_json))
         .route("/openapi.yaml", get(openapi_yaml))
         .route("/docs", get(docs_ui))
-        .nest("/api/v1", v1)
+        .nest("/api/v1", tenant.merge(worker))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .layer(CompressionLayer::new())

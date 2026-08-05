@@ -9,6 +9,7 @@
 //! deterministically with zero external services.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
@@ -28,18 +29,8 @@ struct StepState {
     error: Option<String>,
 }
 
-#[derive(Clone)]
-struct DeadLetter {
-    #[allow(dead_code)]
-    job_id: String,
-    #[allow(dead_code)]
-    reason: String,
-    #[allow(dead_code)]
-    error: String,
-    #[allow(dead_code)]
-    tenant_id: Option<String>,
-    created_at: DateTime<Utc>,
-}
+// Dead letters are stored as the public domain type; ids come from a local
+// sequence, mirroring the BIGSERIAL column on Postgres.
 
 /// A held lease on a `running` job.
 #[derive(Clone)]
@@ -67,6 +58,8 @@ struct Inner {
     // keyed by (workflow_id, step_name)
     steps: Mutex<HashMap<(String, String), StepState>>,
     dead_letters: Mutex<Vec<DeadLetter>>,
+    dlq_seq: AtomicI64,
+    crons: Mutex<HashMap<String, CronSchedule>>,
     /// Per-queue wakeups for `await_work`.
     waiters: Mutex<HashMap<String, Arc<Notify>>>,
 }
@@ -81,6 +74,8 @@ impl InMemoryJobStore {
                 workflows: Mutex::new(HashMap::new()),
                 steps: Mutex::new(HashMap::new()),
                 dead_letters: Mutex::new(Vec::new()),
+                dlq_seq: AtomicI64::new(0),
+                crons: Mutex::new(HashMap::new()),
                 waiters: Mutex::new(HashMap::new()),
             }),
         }
@@ -413,25 +408,195 @@ impl JobStore for InMemoryJobStore {
     }
 
     async fn move_to_dlq(&self, id: &str, reason: &str, error: &str) -> Result<(), StorageError> {
-        let tenant_id = self
-            .inner
-            .jobs
-            .lock()
-            .unwrap()
-            .get(id)
-            .and_then(|j| j.tenant_id.clone());
+        let (queue_name, task_name, tenant_id) = {
+            let jobs = self.inner.jobs.lock().unwrap();
+            let job = jobs.get(id);
+            (
+                job.map(|j| j.queue_name.clone()),
+                job.map(|j| j.task_name.clone()),
+                job.and_then(|j| j.tenant_id.clone()),
+            )
+        };
         self.inner.dead_letters.lock().unwrap().push(DeadLetter {
+            id: self.inner.dlq_seq.fetch_add(1, Ordering::Relaxed) + 1,
             job_id: id.to_string(),
+            queue_name,
+            task_name,
             reason: reason.to_string(),
-            error: error.to_string(),
+            error_message: Some(error.to_string()),
             tenant_id,
             created_at: self.now(),
+            replayed_at: None,
+            replay_job_id: None,
         });
         Ok(())
     }
 
     async fn count_dead_letters(&self) -> Result<i64, StorageError> {
         Ok(self.inner.dead_letters.lock().unwrap().len() as i64)
+    }
+
+    async fn list_dead_letters(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<Page<DeadLetter>, StorageError> {
+        let guard = self.inner.dead_letters.lock().unwrap();
+        let mut matched: Vec<DeadLetter> = guard
+            .iter()
+            .filter(|d| {
+                filter
+                    .tenant_id
+                    .as_ref()
+                    .map(|t| d.tenant_id.as_deref() == Some(t.as_str()))
+                    .unwrap_or(true)
+                    && filter
+                        .queue
+                        .as_ref()
+                        .map(|q| d.queue_name.as_deref() == Some(q.as_str()))
+                        .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        let total = matched.len() as i64;
+        matched.sort_by(|a, b| {
+            if filter.order_desc {
+                b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id))
+            } else {
+                a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id))
+            }
+        });
+        Ok(paginate(matched, filter, total))
+    }
+
+    async fn get_dead_letter(&self, id: i64) -> Result<DeadLetter, StorageError> {
+        self.inner
+            .dead_letters
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|d| d.id == id)
+            .cloned()
+            .ok_or(StorageError::DeadLetterNotFound(id))
+    }
+
+    // ---- Cron schedules -----------------------------------------------------
+
+    async fn create_cron(&self, cron: &CronSchedule) -> Result<bool, StorageError> {
+        let mut crons = self.inner.crons.lock().unwrap();
+        let taken = crons
+            .values()
+            .any(|c| c.name == cron.name && c.tenant_id == cron.tenant_id);
+        if taken {
+            return Ok(false);
+        }
+        crons.insert(cron.id.clone(), cron.clone());
+        Ok(true)
+    }
+
+    async fn get_cron(&self, id: &str) -> Result<CronSchedule, StorageError> {
+        self.inner
+            .crons
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| StorageError::CronNotFound(id.to_string()))
+    }
+
+    async fn list_crons(&self, filter: &ListFilter) -> Result<Page<CronSchedule>, StorageError> {
+        let guard = self.inner.crons.lock().unwrap();
+        let mut matched: Vec<CronSchedule> = guard
+            .values()
+            .filter(|c| {
+                filter
+                    .tenant_id
+                    .as_ref()
+                    .map(|t| c.tenant_id.as_deref() == Some(t.as_str()))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        let total = matched.len() as i64;
+        matched.sort_by(|a, b| {
+            if filter.order_desc {
+                b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id))
+            } else {
+                a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id))
+            }
+        });
+        Ok(paginate(matched, filter, total))
+    }
+
+    async fn delete_cron(&self, id: &str) -> Result<bool, StorageError> {
+        Ok(self.inner.crons.lock().unwrap().remove(id).is_some())
+    }
+
+    async fn set_cron_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        next_run_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let mut crons = self.inner.crons.lock().unwrap();
+        let Some(cron) = crons.get_mut(id) else {
+            return Ok(false);
+        };
+        cron.enabled = enabled;
+        cron.next_run_at = next_run_at;
+        Ok(true)
+    }
+
+    async fn due_crons(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<CronSchedule>, StorageError> {
+        let guard = self.inner.crons.lock().unwrap();
+        let mut due: Vec<CronSchedule> = guard
+            .values()
+            .filter(|c| c.enabled && c.next_run_at <= now)
+            .cloned()
+            .collect();
+        due.sort_by_key(|c| c.next_run_at);
+        due.truncate(limit);
+        Ok(due)
+    }
+
+    async fn advance_cron(
+        &self,
+        id: &str,
+        fired_at: DateTime<Utc>,
+        next_run_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let mut crons = self.inner.crons.lock().unwrap();
+        if let Some(cron) = crons.get_mut(id) {
+            cron.last_enqueued_at = Some(fired_at);
+            cron.next_run_at = next_run_at;
+        }
+        Ok(())
+    }
+
+    async fn replay_dead_letter(&self, id: i64, replacement: &Job) -> Result<bool, StorageError> {
+        // One critical section covers the claim and the insert (lock order:
+        // jobs before dead_letters), so a dead letter never spawns two
+        // replays and the replacement is only visible once the claim won.
+        {
+            let mut jobs = self.inner.jobs.lock().unwrap();
+            let mut dead = self.inner.dead_letters.lock().unwrap();
+            let Some(entry) = dead.iter_mut().find(|d| d.id == id) else {
+                return Err(StorageError::DeadLetterNotFound(id));
+            };
+            if entry.replayed_at.is_some() {
+                return Ok(false);
+            }
+            entry.replayed_at = Some(self.now());
+            entry.replay_job_id = Some(replacement.id.clone());
+            jobs.insert(replacement.id.clone(), replacement.clone());
+        }
+        if replacement.status == JobStatus::Pending {
+            self.notify_work(&replacement.queue_name);
+        }
+        Ok(true)
     }
 
     async fn ping(&self) -> Result<(), StorageError> {

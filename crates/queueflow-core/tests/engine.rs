@@ -725,3 +725,244 @@ async fn retention_purges_old_terminal_jobs_only() {
         "non-terminal job must survive retention"
     );
 }
+
+#[tokio::test]
+async fn panicking_handler_fails_the_job_without_killing_the_worker() {
+    let h = harness(|b| {
+        b.register_fn("explode", |_p: Map| async { panic!("boom") })
+            .register("echo", builtin::echo())
+    });
+
+    let id = h
+        .engine
+        .enqueue(
+            "explode",
+            Map::new(),
+            EnqueueOptions {
+                config: Some(deterministic_cfg(0)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // The panic is contained: process_once returns normally and the job goes
+    // through the standard failure policy (0 retries here, so straight to
+    // failed + dead-letter).
+    assert!(h.engine.process_once("default").await.unwrap());
+    let job = h.engine.get_job(&id).await.unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(
+        job.error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("handler panicked: boom"),
+        "got: {:?}",
+        job.error_message
+    );
+    assert_eq!(h.store.count_dead_letters().await.unwrap(), 1);
+
+    // The same worker path keeps processing afterwards.
+    h.engine
+        .enqueue("echo", Map::new(), Default::default())
+        .await
+        .unwrap();
+    assert!(h.engine.process_once("default").await.unwrap());
+    assert_eq!(h.engine.stats().snapshot().jobs_completed, 1);
+}
+
+#[tokio::test]
+async fn absurd_job_config_is_rejected_at_enqueue() {
+    let h = harness(|b| b.register("echo", builtin::echo()));
+
+    for bad in [
+        JobConfig {
+            retry_delay_secs: u64::MAX,
+            ..JobConfig::default()
+        },
+        JobConfig {
+            retry_max_delay_secs: u64::MAX,
+            ..JobConfig::default()
+        },
+        JobConfig {
+            timeout_secs: 0,
+            ..JobConfig::default()
+        },
+        JobConfig {
+            max_retries: u32::MAX,
+            ..JobConfig::default()
+        },
+        JobConfig {
+            jitter_factor: Some(7.0),
+            ..JobConfig::default()
+        },
+    ] {
+        let err = h
+            .engine
+            .enqueue(
+                "echo",
+                Map::new(),
+                EnqueueOptions {
+                    config: Some(bad.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Validation(_)),
+            "config {bad:?} should be rejected, got: {err:?}"
+        );
+    }
+
+    // Batches are validated per entry, with the index in the error.
+    let err = h
+        .engine
+        .enqueue_batch(
+            vec![(
+                "echo".into(),
+                Map::new(),
+                Some(JobConfig {
+                    timeout_secs: 0,
+                    ..JobConfig::default()
+                }),
+            )],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Validation(_)), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn dead_letter_replay_creates_a_fresh_detached_job() {
+    let h = harness(|b| {
+        b.register_fn("boom", |_p: Map| async {
+            Err::<Map, _>(HandlerError::permanent("nope"))
+        })
+    });
+    let id = h
+        .engine
+        .enqueue(
+            "boom",
+            map(json!({"k": 1})),
+            EnqueueOptions {
+                config: Some(deterministic_cfg(0)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(h.engine.process_once("default").await.unwrap());
+    assert_eq!(
+        h.engine.get_job(&id).await.unwrap().status,
+        JobStatus::Failed
+    );
+
+    let page = h
+        .engine
+        .list_dead_letters(&ListFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    let dl = page.items[0].clone();
+    assert_eq!(dl.job_id, id);
+    assert_eq!(dl.reason, "non_retryable");
+    assert!(dl.replayed_at.is_none());
+
+    let new_id = h.engine.replay_dead_letter(dl.id).await.unwrap();
+    assert_ne!(new_id, id);
+    let fresh = h.engine.get_job(&new_id).await.unwrap();
+    assert_eq!(fresh.status, JobStatus::Pending);
+    assert_eq!(fresh.payload, map(json!({"k": 1})));
+    assert_eq!(fresh.retry_count, 0);
+    assert_eq!(fresh.delivery_count, 0);
+    assert!(fresh.workflow_id.is_none(), "replays are detached jobs");
+    assert_eq!(fresh.metadata.get("replayed_from_job"), Some(&json!(id)));
+
+    // The entry records the replay, and a second replay is refused.
+    let dl = h.engine.get_dead_letter(dl.id).await.unwrap();
+    assert_eq!(dl.replay_job_id.as_deref(), Some(new_id.as_str()));
+    let err = h.engine.replay_dead_letter(dl.id).await.unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "got: {err:?}");
+
+    // The replayed job is genuinely claimable.
+    assert!(h.engine.process_once("default").await.unwrap());
+}
+
+#[tokio::test]
+async fn cron_schedules_fire_on_time_dedupe_and_skip_missed_runs() {
+    let h = harness(|b| b.register("echo", builtin::echo()));
+    // TestClock epoch is 2021-01-01T00:00:00Z; every 5 minutes fires at :05.
+    let cron_id = h
+        .engine
+        .create_cron(
+            CreateCronRequest {
+                name: "tick".into(),
+                cron_expr: "*/5 * * * *".into(),
+                task_name: "echo".into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Not due yet.
+    assert_eq!(h.engine.cron_tick().await.unwrap(), 0);
+
+    // 00:05 passes: one firing; a second tick at the same instant is a no-op
+    // (the idempotency key is bound to the due instant).
+    h.clock.advance_secs(5 * 60 + 1);
+    assert_eq!(h.engine.cron_tick().await.unwrap(), 1);
+    assert_eq!(h.engine.cron_tick().await.unwrap(), 0);
+    let page = h.engine.list_jobs(&ListFilter::default()).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].metadata.get("cron_id"), Some(&json!(cron_id)));
+
+    // An hour "offline": exactly one catch-up firing, then the schedule
+    // jumps to its next future slot.
+    h.clock.advance_secs(3600);
+    assert_eq!(h.engine.cron_tick().await.unwrap(), 1);
+    assert_eq!(h.engine.cron_tick().await.unwrap(), 0);
+    assert_eq!(
+        h.engine
+            .list_jobs(&ListFilter::default())
+            .await
+            .unwrap()
+            .items
+            .len(),
+        2
+    );
+
+    // Pause stops firings; resume does not catch up on missed runs.
+    h.engine.set_cron_enabled(&cron_id, false).await.unwrap();
+    h.clock.advance_secs(3600);
+    assert_eq!(h.engine.cron_tick().await.unwrap(), 0);
+    h.engine.set_cron_enabled(&cron_id, true).await.unwrap();
+    assert_eq!(
+        h.engine.cron_tick().await.unwrap(),
+        0,
+        "resume must not fire for runs missed while paused"
+    );
+    h.clock.advance_secs(5 * 60);
+    assert_eq!(h.engine.cron_tick().await.unwrap(), 1);
+
+    // Names are unique; deletion is final.
+    let err = h
+        .engine
+        .create_cron(
+            CreateCronRequest {
+                name: "tick".into(),
+                cron_expr: "*/5 * * * *".into(),
+                task_name: "echo".into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "got: {err:?}");
+    h.engine.delete_cron(&cron_id).await.unwrap();
+    assert!(h.engine.get_cron(&cron_id).await.is_err());
+}

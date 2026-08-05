@@ -35,6 +35,10 @@ pub enum StorageError {
     WorkflowNotFound(String),
     #[error("workflow step not found: {workflow}/{step}")]
     StepNotFound { workflow: String, step: String },
+    #[error("dead letter not found: {0}")]
+    DeadLetterNotFound(i64),
+    #[error("cron schedule not found: {0}")]
+    CronNotFound(String),
     #[error("database error: {0}")]
     Database(String),
     #[error("serialization error: {0}")]
@@ -191,6 +195,59 @@ pub trait JobStore: Send + Sync {
     async fn move_to_dlq(&self, id: &str, reason: &str, error: &str) -> Result<(), StorageError>;
 
     async fn count_dead_letters(&self) -> Result<i64, StorageError>;
+
+    /// List dead letters, honouring the filter's tenant/queue scoping and
+    /// paging (`status` does not apply and is ignored).
+    async fn list_dead_letters(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<Page<DeadLetter>, StorageError>;
+
+    async fn get_dead_letter(&self, id: i64) -> Result<DeadLetter, StorageError>;
+
+    /// Atomically claim an unreplayed dead letter and insert `replacement` as
+    /// a fresh pending job: the claim (`replayed_at IS NULL`) and the insert
+    /// commit together, so a dead letter can never spawn two replays. Returns
+    /// `false` — persisting nothing — when the entry was already replayed.
+    async fn replay_dead_letter(&self, id: i64, replacement: &Job) -> Result<bool, StorageError>;
+
+    // ---- Cron schedules -----------------------------------------------------
+
+    /// Persist a new schedule. Returns `false` when the (tenant, name) pair
+    /// already exists (nothing is written).
+    async fn create_cron(&self, cron: &CronSchedule) -> Result<bool, StorageError>;
+    async fn get_cron(&self, id: &str) -> Result<CronSchedule, StorageError>;
+    /// List schedules (tenant scoping and paging honoured; `status`/`queue`
+    /// are ignored).
+    async fn list_crons(&self, filter: &ListFilter) -> Result<Page<CronSchedule>, StorageError>;
+    /// Returns `false` when the schedule did not exist.
+    async fn delete_cron(&self, id: &str) -> Result<bool, StorageError>;
+    /// Enable or disable a schedule. `next_run_at` is the caller's freshly
+    /// computed next occurrence, so a re-enabled schedule fires at its next
+    /// future slot instead of catching up on everything it missed. Returns
+    /// `false` when the schedule did not exist.
+    async fn set_cron_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        next_run_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError>;
+    /// Enabled schedules whose `next_run_at` has passed. May return the same
+    /// schedule to concurrent callers; the per-firing idempotency key makes
+    /// the duplicate enqueue a no-op.
+    async fn due_crons(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<CronSchedule>, StorageError>;
+    /// Record a firing: stamp `last_enqueued_at = fired_at` and move
+    /// `next_run_at` forward.
+    async fn advance_cron(
+        &self,
+        id: &str,
+        fired_at: DateTime<Utc>,
+        next_run_at: DateTime<Utc>,
+    ) -> Result<(), StorageError>;
 
     async fn ping(&self) -> Result<(), StorageError>;
 

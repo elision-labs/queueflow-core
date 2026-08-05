@@ -25,6 +25,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Job(cmd) => client_cmds::job(cmd).await,
         Command::Workflow(cmd) => client_cmds::workflow(cmd).await,
+        Command::Dlq(cmd) => client_cmds::dlq(cmd).await,
+        Command::Cron(cmd) => client_cmds::cron(cmd).await,
         Command::Tasks(args) => client_cmds::tasks(args).await,
         Command::Stats(args) => client_cmds::stats(args).await,
     }

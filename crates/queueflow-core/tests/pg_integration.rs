@@ -5,8 +5,10 @@
 //! database: the `FOR UPDATE SKIP LOCKED` claim query, lease tokens, and the
 //! LISTEN/NOTIFY wakeup. They run only when `TEST_DATABASE_URL` points at a
 //! PostgreSQL (any plain 13+; no extensions); otherwise each test logs a skip
-//! and returns, so the default offline `cargo test` stays green. The whole
-//! file is compiled out unless the `postgres` feature is enabled.
+//! and returns, so the default offline `cargo test` stays green. Set
+//! `REQUIRE_PG=1` (as CI does) to turn that skip into a failure, so a database
+//! that never came up cannot masquerade as a passing run. The whole file is
+//! compiled out unless the `postgres` feature is enabled.
 #![cfg(feature = "postgres")]
 
 use std::sync::Arc;
@@ -26,9 +28,19 @@ fn map(v: serde_json::Value) -> Map {
 
 /// Connect, migrate, and isolate this test on its own queue (cleared of any
 /// leftovers from previous runs). Returns `None` (with a logged skip) when no
-/// database is configured.
+/// database is configured, unless `REQUIRE_PG` is set, in which case a missing
+/// `TEST_DATABASE_URL` is a hard failure rather than a silent pass.
 async fn setup(queue: &str) -> Option<Arc<PostgresJobStore>> {
     let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+        // Skipping is a convenience for offline development, never for CI: a
+        // green run there must mean the assertions actually hit a database, so
+        // any environment that intends to test Postgres sets REQUIRE_PG and
+        // turns a lost database into a red build instead of 8 vacuous passes.
+        assert!(
+            std::env::var_os("REQUIRE_PG").is_none(),
+            "REQUIRE_PG is set but TEST_DATABASE_URL is not: refusing to skip \
+             the Postgres integration tests and report a false pass",
+        );
         eprintln!("skipping: TEST_DATABASE_URL not set");
         return None;
     };
@@ -70,14 +82,27 @@ async fn pg_unknown_task_is_dead_lettered() {
         .default_queue(queue)
         .build();
 
-    let before = store.count_dead_letters().await.unwrap();
     let id = engine
         .enqueue("ghost", Map::new(), Default::default())
         .await
         .unwrap();
     assert!(engine.process_once(queue).await.unwrap());
     assert_eq!(engine.get_job(&id).await.unwrap().status, JobStatus::Failed);
-    assert_eq!(store.count_dead_letters().await.unwrap(), before + 1);
+    // Look the entry up by job id rather than diffing the global count:
+    // the pg tests share one database and run concurrently.
+    let dl = store
+        .list_dead_letters(&ListFilter {
+            queue: Some(queue.into()),
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|d| d.job_id == id);
+    assert!(dl.is_some(), "dead letter recorded for {id}");
+    assert_eq!(dl.unwrap().reason, "handler_not_found");
 }
 
 #[tokio::test]
@@ -303,4 +328,115 @@ async fn pg_workflow_halt_policy() {
     assert_eq!(status_of("a"), StepStatus::Completed);
     assert_eq!(status_of("b"), StepStatus::Failed);
     assert_eq!(status_of("c"), StepStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn pg_dead_letter_replay_claim_is_atomic_and_single_shot() {
+    let queue = "test_dlq_replay";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    let engine = Engine::builder(store.clone(), Arc::new(SystemClock))
+        .default_queue(queue)
+        .build();
+
+    // No handler registered: the job dead-letters on first delivery.
+    let id = engine
+        .enqueue("ghost", map(json!({"k": 1})), Default::default())
+        .await
+        .unwrap();
+    assert!(engine.process_once(queue).await.unwrap());
+
+    let dl = store
+        .list_dead_letters(&ListFilter {
+            queue: Some(queue.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|d| d.job_id == id)
+        .expect("dead letter recorded");
+    assert!(dl.replayed_at.is_none());
+
+    // Replay: the claim and the fresh job commit together.
+    let new_id = engine.replay_dead_letter(dl.id).await.unwrap();
+    let fresh = engine.get_job(&new_id).await.unwrap();
+    assert_eq!(fresh.status, JobStatus::Pending);
+    assert_eq!(fresh.queue_name, queue);
+    assert_eq!(fresh.retry_count, 0);
+
+    let dl = store.get_dead_letter(dl.id).await.unwrap();
+    assert_eq!(dl.replay_job_id.as_deref(), Some(new_id.as_str()));
+
+    // The claim is single-shot: a second replay conflicts and persists nothing.
+    let err = engine.replay_dead_letter(dl.id).await.unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn pg_cron_schedule_fires_exactly_once_per_due_instant() {
+    let queue = "test_cron";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    let engine = Engine::builder(store.clone(), Arc::new(SystemClock))
+        .default_queue(queue)
+        .register("echo", builtin::echo())
+        .build();
+
+    // The schedule table persists across runs and names are unique per
+    // tenant; clear leftovers from previous runs.
+    for c in store
+        .list_crons(&ListFilter {
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .items
+    {
+        if c.name == "pg-tick" {
+            store.delete_cron(&c.id).await.unwrap();
+        }
+    }
+
+    let id = engine
+        .create_cron(
+            CreateCronRequest {
+                name: "pg-tick".into(),
+                cron_expr: "*/5 * * * *".into(),
+                task_name: "echo".into(),
+                queue: Some(queue.into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Force the schedule due, then pump twice: exactly one job (the firing
+    // key is bound to the due instant).
+    let now = chrono::Utc::now();
+    store
+        .advance_cron(&id, now, now - chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(engine.cron_tick().await.unwrap(), 1);
+    assert_eq!(engine.cron_tick().await.unwrap(), 0);
+    let page = engine
+        .list_jobs(&ListFilter {
+            queue: Some(queue.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(
+        page.items[0].metadata.get("cron_name"),
+        Some(&serde_json::json!("pg-tick"))
+    );
+
+    engine.delete_cron(&id).await.unwrap();
 }
