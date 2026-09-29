@@ -7,8 +7,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use std::time::Duration;
+
 use crate::domain::*;
-use crate::engine::{Engine, EnqueueOptions};
+use crate::engine::{BatchItem, Engine, EnqueueOptions};
 use crate::error::EngineError;
 use crate::ports::{JobStore, ListFilter, Page};
 use crate::stats::StatsSnapshot;
@@ -30,11 +32,15 @@ pub trait JobApi: Send + Sync {
 
     async fn enqueue_batch(
         &self,
-        jobs: Vec<(String, Map, Option<JobConfig>)>,
+        jobs: Vec<BatchItem>,
         tenant_id: Option<String>,
     ) -> Result<Vec<String>, EngineError>;
 
     async fn get_job(&self, id: &str) -> Result<Job, EngineError>;
+
+    /// Park until the job may have changed status (or `max_wait` passes).
+    /// May wake spuriously; callers re-read the job and loop.
+    async fn await_job_change(&self, id: &str, max_wait: Duration) -> Result<(), EngineError>;
     async fn list_jobs(&self, filter: ListFilter) -> Result<Page<Job>, EngineError>;
     async fn cancel_job(&self, id: &str) -> Result<(), EngineError>;
 
@@ -131,7 +137,7 @@ where
 
     async fn enqueue_batch(
         &self,
-        jobs: Vec<(String, Map, Option<JobConfig>)>,
+        jobs: Vec<BatchItem>,
         tenant_id: Option<String>,
     ) -> Result<Vec<String>, EngineError> {
         Engine::enqueue_batch(self, jobs, tenant_id).await
@@ -139,6 +145,10 @@ where
 
     async fn get_job(&self, id: &str) -> Result<Job, EngineError> {
         Engine::get_job(self, id).await
+    }
+
+    async fn await_job_change(&self, id: &str, max_wait: Duration) -> Result<(), EngineError> {
+        Engine::await_job_change(self, id, max_wait).await
     }
 
     async fn list_jobs(&self, filter: ListFilter) -> Result<Page<Job>, EngineError> {

@@ -9,7 +9,7 @@
 //! deterministically with zero external services.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
@@ -39,6 +39,16 @@ struct Lease {
     locked_until: DateTime<Utc>,
 }
 
+/// Per-queue wakeup channel: a monotonically increasing epoch (bumped on
+/// every notification) plus the notifier itself. The epoch lets a claimer
+/// detect a wakeup that raced its empty claim (see
+/// [`JobStore::await_work`]).
+#[derive(Default)]
+struct QueueSignal {
+    epoch: AtomicU64,
+    notify: Notify,
+}
+
 /// In-memory [`JobStore`]. Cloneable; clones share the same backing maps.
 #[derive(Clone)]
 pub struct InMemoryJobStore {
@@ -61,7 +71,10 @@ struct Inner {
     dlq_seq: AtomicI64,
     crons: Mutex<HashMap<String, CronSchedule>>,
     /// Per-queue wakeups for `await_work`.
-    waiters: Mutex<HashMap<String, Arc<Notify>>>,
+    waiters: Mutex<HashMap<String, Arc<QueueSignal>>>,
+    /// One broadcast for all job status changes: at in-memory (test) scale a
+    /// spurious wakeup per watcher is cheaper than a per-job waiter map.
+    job_events: Notify,
 }
 
 impl InMemoryJobStore {
@@ -77,6 +90,7 @@ impl InMemoryJobStore {
                 dlq_seq: AtomicI64::new(0),
                 crons: Mutex::new(HashMap::new()),
                 waiters: Mutex::new(HashMap::new()),
+                job_events: Notify::new(),
             }),
         }
     }
@@ -85,7 +99,7 @@ impl InMemoryJobStore {
         self.inner.clock.now()
     }
 
-    fn waiter(&self, queue: &str) -> Arc<Notify> {
+    fn waiter(&self, queue: &str) -> Arc<QueueSignal> {
         self.inner
             .waiters
             .lock()
@@ -95,18 +109,30 @@ impl InMemoryJobStore {
             .clone()
     }
 
-    /// Wake every `await_work` parked on `queue` (mirrors the NOTIFY trigger).
+    /// Wake every `await_work` parked on `queue` (mirrors the NOTIFY
+    /// trigger), advancing the epoch first so an in-flight claimer that
+    /// misses the wakeup still sees the epoch move.
     fn notify_work(&self, queue: &str) {
-        if let Some(n) = self.inner.waiters.lock().unwrap().get(queue) {
-            n.notify_waiters();
-        }
+        let signal = self.waiter(queue);
+        signal.epoch.fetch_add(1, Ordering::SeqCst);
+        signal.notify.notify_waiters();
+    }
+
+    /// Wake every `await_job_change` watcher (mirrors the status trigger).
+    fn notify_job_change(&self) {
+        self.inner.job_events.notify_waiters();
     }
 }
 
 /// Slice a sorted, fully-matched result set into a [`Page`] honouring the
-/// filter's offset/limit and `include_total`.
+/// filter's offset/limit and `include_total`. When a cursor is set, `offset`
+/// is ignored (the cursor filter already positioned the set).
 fn paginate<T>(matched: Vec<T>, filter: &ListFilter, total: i64) -> Page<T> {
-    let start = filter.offset.max(0) as usize;
+    let start = if filter.after.is_some() {
+        0
+    } else {
+        filter.offset.max(0) as usize
+    };
     let lim = if filter.limit <= 0 {
         50
     } else {
@@ -118,6 +144,23 @@ fn paginate<T>(matched: Vec<T>, filter: &ListFilter, total: i64) -> Page<T> {
         items,
         has_more,
         total: filter.include_total.then_some(total),
+    }
+}
+
+/// Keyset-cursor predicate: keep rows strictly past the cursor in the
+/// filter's sort order. Rows are compared by `(created_at, id)`.
+fn past_cursor(created_at: DateTime<Utc>, id: &str, filter: &ListFilter) -> bool {
+    match &filter.after {
+        None => true,
+        Some(c) => {
+            let key = (created_at, id);
+            let cursor = (c.created_at, c.id.as_str());
+            if filter.order_desc {
+                key < cursor
+            } else {
+                key > cursor
+            }
+        }
     }
 }
 
@@ -216,6 +259,7 @@ impl JobStore for InMemoryJobStore {
             .cloned()
             .collect();
         let total = matched.len() as i64;
+        matched.retain(|j| past_cursor(j.created_at, &j.id, filter));
         matched.sort_by(|a, b| {
             if filter.order_desc {
                 b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id))
@@ -233,7 +277,12 @@ impl JobStore for InMemoryJobStore {
         queue: &str,
         count: usize,
         lease_secs: u32,
+        cover_timeout: bool,
     ) -> Result<Claimed, StorageError> {
+        // Snapshot the epoch before scanning: a notification racing this
+        // claim either makes its job visible to the scan or advances the
+        // epoch, so the caller's subsequent await_work cannot lose it.
+        let epoch = self.waiter(queue).epoch.load(Ordering::SeqCst);
         let now = self.now();
         let mut jobs = self.inner.jobs.lock().unwrap();
         let mut leases = self.inner.leases.lock().unwrap();
@@ -266,12 +315,19 @@ impl JobStore for InMemoryJobStore {
             job.status = JobStatus::Running;
             job.started_at.get_or_insert(now);
             job.delivery_count += 1;
+            let lease = if cover_timeout {
+                lease_secs
+                    .max((job.config.timeout_secs.saturating_add(LEASE_GRACE_SECS))
+                        .min(u32::MAX as u64) as u32)
+            } else {
+                lease_secs
+            };
             let token = Uuid::new_v4().to_string();
             leases.insert(
                 id.clone(),
                 Lease {
                     token: token.clone(),
-                    locked_until: now + Duration::seconds(lease_secs as i64),
+                    locked_until: now + Duration::seconds(lease as i64),
                 },
             );
             out.push(LeasedJob {
@@ -288,10 +344,16 @@ impl JobStore for InMemoryJobStore {
         } else {
             None
         };
+        drop(leases);
+        drop(jobs);
 
+        if !out.is_empty() {
+            self.notify_job_change(); // pending -> running transitions
+        }
         Ok(Claimed {
             jobs: out,
             next_due,
+            epoch,
         })
     }
 
@@ -327,55 +389,89 @@ impl JobStore for InMemoryJobStore {
         status: JobStatus,
         error: Option<&str>,
         result: Option<&Json>,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<FinishedJob>, StorageError> {
         debug_assert!(status.is_terminal());
         let now = self.now();
-        let mut jobs = self.inner.jobs.lock().unwrap();
-        let mut leases = self.inner.leases.lock().unwrap();
-        let Some(job) = jobs.get_mut(job_id) else {
-            return Ok(false);
+        let finished = {
+            let mut jobs = self.inner.jobs.lock().unwrap();
+            let mut leases = self.inner.leases.lock().unwrap();
+            let Some(job) = jobs.get_mut(job_id) else {
+                return Ok(None);
+            };
+            let owned = job.status == JobStatus::Running
+                && leases.get(job_id).is_some_and(|l| l.token == token);
+            if !owned {
+                return Ok(None);
+            }
+            job.status = status;
+            job.completed_at = Some(now);
+            if let Some(e) = error {
+                job.error_message = Some(e.to_string());
+            }
+            if let Some(r) = result {
+                job.result = Some(r.clone());
+            }
+            leases.remove(job_id);
+            FinishedJob {
+                workflow_id: job.workflow_id.clone(),
+                workflow_step_id: job.workflow_step_id.clone(),
+            }
         };
-        let owned = job.status == JobStatus::Running
-            && leases.get(job_id).is_some_and(|l| l.token == token);
-        if !owned {
-            return Ok(false);
-        }
-        job.status = status;
-        job.completed_at = Some(now);
-        if let Some(e) = error {
-            job.error_message = Some(e.to_string());
-        }
-        if let Some(r) = result {
-            job.result = Some(r.clone());
-        }
-        leases.remove(job_id);
-        Ok(true)
+        self.notify_job_change();
+        Ok(Some(finished))
     }
 
-    async fn await_work(&self, queue: &str, max_wait: StdDuration) -> Result<(), StorageError> {
-        let notify = self.waiter(queue);
-        // Note: a wakeup fired between the caller's empty claim and this call
-        // is missed, exactly like a NOTIFY between query and LISTEN; max_wait
-        // bounds the damage and the caller re-claims in a loop.
+    async fn await_work(
+        &self,
+        queue: &str,
+        since_epoch: u64,
+        max_wait: StdDuration,
+    ) -> Result<(), StorageError> {
+        let signal = self.waiter(queue);
+        // Register the waiter *before* re-checking the epoch: a wakeup that
+        // fired between the caller's empty claim and this call advanced the
+        // epoch (return immediately); one firing after registration lands in
+        // the notify. No ordering loses a wakeup.
+        let notified = signal.notify.notified();
+        if signal.epoch.load(Ordering::SeqCst) != since_epoch {
+            return Ok(());
+        }
         tokio::select! {
-            _ = notify.notified() => {}
+            _ = notified => {}
+            _ = tokio::time::sleep(max_wait) => {}
+        }
+        Ok(())
+    }
+
+    async fn await_job_change(
+        &self,
+        _job_id: &str,
+        max_wait: StdDuration,
+    ) -> Result<(), StorageError> {
+        // One broadcast for all jobs: spurious wakeups are within contract,
+        // and callers re-read the job and loop.
+        tokio::select! {
+            _ = self.inner.job_events.notified() => {}
             _ = tokio::time::sleep(max_wait) => {}
         }
         Ok(())
     }
 
     async fn cancel_job_if_active(&self, id: &str, reason: &str) -> Result<bool, StorageError> {
-        let mut guard = self.inner.jobs.lock().unwrap();
-        let Some(job) = guard.get_mut(id) else {
-            return Ok(false);
-        };
-        if job.status.is_terminal() {
-            return Ok(false);
+        {
+            let mut guard = self.inner.jobs.lock().unwrap();
+            let Some(job) = guard.get_mut(id) else {
+                return Ok(false);
+            };
+            if job.status.is_terminal() {
+                return Ok(false);
+            }
+            job.status = JobStatus::Cancelled;
+            job.error_message = Some(reason.to_string());
+            job.completed_at = Some(self.now());
+            self.inner.leases.lock().unwrap().remove(id);
         }
-        job.status = JobStatus::Cancelled;
-        job.error_message = Some(reason.to_string());
-        job.completed_at = Some(self.now());
-        self.inner.leases.lock().unwrap().remove(id);
+        self.notify_job_change();
         Ok(true)
     }
 
@@ -387,23 +483,26 @@ impl JobStore for InMemoryJobStore {
         next_retry_at: DateTime<Utc>,
         error: &str,
     ) -> Result<bool, StorageError> {
-        let mut guard = self.inner.jobs.lock().unwrap();
-        let mut leases = self.inner.leases.lock().unwrap();
-        let Some(job) = guard.get_mut(id) else {
-            return Ok(false);
-        };
-        let owned =
-            job.status == JobStatus::Running && leases.get(id).is_some_and(|l| l.token == token);
-        if !owned {
-            return Ok(false);
+        {
+            let mut guard = self.inner.jobs.lock().unwrap();
+            let mut leases = self.inner.leases.lock().unwrap();
+            let Some(job) = guard.get_mut(id) else {
+                return Ok(false);
+            };
+            let owned = job.status == JobStatus::Running
+                && leases.get(id).is_some_and(|l| l.token == token);
+            if !owned {
+                return Ok(false);
+            }
+            job.status = JobStatus::Retrying;
+            job.retry_count = retry_count;
+            job.next_retry_at = Some(next_retry_at);
+            // The durable delay: the row itself is invisible to claims until then.
+            job.scheduled_at = next_retry_at;
+            job.error_message = Some(error.to_string());
+            leases.remove(id);
         }
-        job.status = JobStatus::Retrying;
-        job.retry_count = retry_count;
-        job.next_retry_at = Some(next_retry_at);
-        // The durable delay: the row itself is invisible to claims until then.
-        job.scheduled_at = next_retry_at;
-        job.error_message = Some(error.to_string());
-        leases.remove(id);
+        self.notify_job_change();
         Ok(true)
     }
 
@@ -458,6 +557,19 @@ impl JobStore for InMemoryJobStore {
             .cloned()
             .collect();
         let total = matched.len() as i64;
+        // The dead-letter cursor id is the BIGSERIAL rendered in decimal.
+        if let Some(cursor_id) = filter.after.as_ref().and_then(|c| c.id.parse::<i64>().ok()) {
+            let c = filter.after.as_ref().unwrap();
+            matched.retain(|d| {
+                let key = (d.created_at, d.id);
+                let cursor = (c.created_at, cursor_id);
+                if filter.order_desc {
+                    key < cursor
+                } else {
+                    key > cursor
+                }
+            });
+        }
         matched.sort_by(|a, b| {
             if filter.order_desc {
                 b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id))
@@ -517,6 +629,7 @@ impl JobStore for InMemoryJobStore {
             .cloned()
             .collect();
         let total = matched.len() as i64;
+        matched.retain(|c| past_cursor(c.created_at, &c.id, filter));
         matched.sort_by(|a, b| {
             if filter.order_desc {
                 b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id))
@@ -760,6 +873,7 @@ impl JobStore for InMemoryJobStore {
             .cloned()
             .collect();
         let total = matched.len() as i64;
+        matched.retain(|w| past_cursor(w.created_at, &w.id, filter));
         matched.sort_by(|a, b| {
             if filter.order_desc {
                 b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id))
@@ -940,7 +1054,7 @@ mod tests {
         let (s, clock) = store();
         s.create_job(&job("a", "default", 0)).await.unwrap();
 
-        let first = s.claim_jobs("default", 1, 30).await.unwrap();
+        let first = s.claim_jobs("default", 1, 30, false).await.unwrap();
         assert_eq!(first.jobs.len(), 1);
         assert_eq!(first.jobs[0].job.delivery_count, 1);
         assert_eq!(first.jobs[0].job.status, JobStatus::Running);
@@ -949,14 +1063,14 @@ mod tests {
         // NOT make the job claimable again on expiry; recovery is the
         // janitor's expired-lease sweep.
         assert!(s
-            .claim_jobs("default", 1, 30)
+            .claim_jobs("default", 1, 30, false)
             .await
             .unwrap()
             .jobs
             .is_empty());
         clock.advance_secs(31);
         assert!(s
-            .claim_jobs("default", 1, 30)
+            .claim_jobs("default", 1, 30, false)
             .await
             .unwrap()
             .jobs
@@ -974,12 +1088,12 @@ mod tests {
         j.scheduled_at = clock.now() + Duration::seconds(60);
         s.create_job(&j).await.unwrap();
 
-        let c = s.claim_jobs("default", 1, 30).await.unwrap();
+        let c = s.claim_jobs("default", 1, 30, false).await.unwrap();
         assert!(c.jobs.is_empty());
         assert_eq!(c.next_due, Some(j.scheduled_at));
 
         clock.advance_secs(61);
-        assert_eq!(s.claim_jobs("default", 1, 30).await.unwrap().jobs.len(), 1);
+        assert_eq!(s.claim_jobs("default", 1, 30, false).await.unwrap().jobs.len(), 1);
     }
 
     #[tokio::test]
@@ -987,7 +1101,7 @@ mod tests {
         let (s, _) = store();
         s.create_job(&job("low", "default", 0)).await.unwrap();
         s.create_job(&job("high", "default", 10)).await.unwrap();
-        let c = s.claim_jobs("default", 1, 30).await.unwrap();
+        let c = s.claim_jobs("default", 1, 30, false).await.unwrap();
         assert_eq!(c.jobs[0].job.id, "high");
     }
 
@@ -995,7 +1109,7 @@ mod tests {
     async fn stale_token_cannot_finish_or_extend() {
         let (s, clock) = store();
         s.create_job(&job("a", "default", 0)).await.unwrap();
-        let stale = s.claim_jobs("default", 1, 30).await.unwrap().jobs[0]
+        let stale = s.claim_jobs("default", 1, 30, false).await.unwrap().jobs[0]
             .lease_token
             .clone();
 
@@ -1006,26 +1120,29 @@ mod tests {
             .clone();
 
         assert_eq!(s.extend_lease("a", &stale, 30).await.unwrap(), None);
-        assert!(!s
+        assert!(s
             .finish_if_leased("a", &stale, JobStatus::Completed, None, None)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
         assert!(s
             .finish_if_leased("a", &fresh, JobStatus::Completed, None, None)
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
         // A replay of the fresh token after finishing is also rejected.
-        assert!(!s
+        assert!(s
             .finish_if_leased("a", &fresh, JobStatus::Completed, None, None)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn heartbeat_observes_mid_run_cancellation() {
         let (s, _) = store();
         s.create_job(&job("a", "default", 0)).await.unwrap();
-        let token = s.claim_jobs("default", 1, 30).await.unwrap().jobs[0]
+        let token = s.claim_jobs("default", 1, 30, false).await.unwrap().jobs[0]
             .lease_token
             .clone();
         assert_eq!(
@@ -1039,17 +1156,18 @@ mod tests {
             Some(JobStatus::Cancelled)
         );
         // And the cancelled job can no longer be completed under the token.
-        assert!(!s
+        assert!(s
             .finish_if_leased("a", &token, JobStatus::Completed, None, None)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn mark_retrying_reschedules_and_releases_the_lease() {
         let (s, clock) = store();
         s.create_job(&job("a", "default", 0)).await.unwrap();
-        let token = s.claim_jobs("default", 1, 30).await.unwrap().jobs[0]
+        let token = s.claim_jobs("default", 1, 30, false).await.unwrap().jobs[0]
             .lease_token
             .clone();
 
@@ -1061,12 +1179,12 @@ mod tests {
             .unwrap());
         assert!(s.mark_retrying("a", &token, 1, next, "boom").await.unwrap());
 
-        let c = s.claim_jobs("default", 1, 30).await.unwrap();
+        let c = s.claim_jobs("default", 1, 30, false).await.unwrap();
         assert!(c.jobs.is_empty());
         assert_eq!(c.next_due, Some(next));
 
         clock.advance_secs(61);
-        let again = s.claim_jobs("default", 1, 30).await.unwrap();
+        let again = s.claim_jobs("default", 1, 30, false).await.unwrap();
         assert_eq!(again.jobs[0].job.retry_count, 1);
         assert_eq!(again.jobs[0].job.delivery_count, 2);
     }
@@ -1074,6 +1192,11 @@ mod tests {
     #[tokio::test]
     async fn await_work_wakes_on_new_job() {
         let (s, _) = store();
+        let epoch = s
+            .claim_jobs("default", 1, 30, false)
+            .await
+            .unwrap()
+            .epoch;
         let s2 = s.clone();
         tokio::spawn(async move {
             tokio::time::sleep(StdDuration::from_millis(50)).await;
@@ -1081,10 +1204,44 @@ mod tests {
         });
         // Wakes well before the 5s cap once the job lands.
         let start = std::time::Instant::now();
-        s.await_work("default", StdDuration::from_secs(5))
+        s.await_work("default", epoch, StdDuration::from_secs(5))
             .await
             .unwrap();
         assert!(start.elapsed() < StdDuration::from_secs(4));
-        assert_eq!(s.claim_jobs("default", 1, 30).await.unwrap().jobs.len(), 1);
+        assert_eq!(s.claim_jobs("default", 1, 30, false).await.unwrap().jobs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn await_work_returns_immediately_when_the_epoch_moved() {
+        // A job enqueued between an empty claim and the park must not cost
+        // the full wait: the epoch snapshot detects it.
+        let (s, _) = store();
+        let epoch = s
+            .claim_jobs("default", 1, 30, false)
+            .await
+            .unwrap()
+            .epoch;
+        s.create_job(&job("racy", "default", 0)).await.unwrap();
+        let start = std::time::Instant::now();
+        s.await_work("default", epoch, StdDuration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(start.elapsed() < StdDuration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn cover_timeout_stretches_the_lease_to_the_job_timeout() {
+        let (s, clock) = store();
+        let mut j = job("a", "default", 0);
+        j.config.timeout_secs = 120;
+        s.create_job(&j).await.unwrap();
+        assert_eq!(s.claim_jobs("default", 1, 30, true).await.unwrap().jobs.len(), 1);
+
+        // Well past the raw 30s lease but inside timeout + grace: not reaped.
+        clock.advance_secs(120);
+        assert!(s.claim_expired_leases(10, 30).await.unwrap().is_empty());
+        // Past timeout + grace: reaped.
+        clock.advance_secs(31);
+        assert_eq!(s.claim_expired_leases(10, 30).await.unwrap().len(), 1);
     }
 }

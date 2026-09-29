@@ -390,7 +390,7 @@ async fn janitor_heals_a_completed_job_with_unfinished_step() {
         .unwrap();
     let id = c.engine.create_workflow(req, None).await.unwrap();
 
-    let claimed = c.store.claim_jobs("default", 1, 30).await.unwrap();
+    let claimed = c.store.claim_jobs("default", 1, 30, false).await.unwrap();
     let lease = &claimed.jobs[0];
     assert!(c
         .store
@@ -402,7 +402,8 @@ async fn janitor_heals_a_completed_job_with_unfinished_step() {
             None
         )
         .await
-        .unwrap());
+        .unwrap()
+        .is_some());
     assert_eq!(step_status(&c.store, &id, "a").await, StepStatus::Pending);
 
     // Job terminal + step non-terminal = exactly what the janitor heals.
@@ -431,7 +432,7 @@ async fn janitor_advances_a_stalled_workflow() {
         .unwrap();
     let id = c.engine.create_workflow(req, None).await.unwrap();
 
-    let claimed = c.store.claim_jobs("default", 1, 30).await.unwrap();
+    let claimed = c.store.claim_jobs("default", 1, 30, false).await.unwrap();
     let lease = &claimed.jobs[0];
     assert!(c
         .store
@@ -443,7 +444,8 @@ async fn janitor_advances_a_stalled_workflow() {
             None
         )
         .await
-        .unwrap());
+        .unwrap()
+        .is_some());
     c.store
         .set_step_status(&id, "a", StepStatus::Completed, None)
         .await
@@ -676,7 +678,7 @@ async fn janitor_heals_a_crash_between_context_merge_and_status_write() {
     let id = c.engine.create_workflow(req, None).await.unwrap();
 
     // Claim both root jobs; drive x through the engine normally.
-    let claimed = c.store.claim_jobs("default", 2, 30).await.unwrap().jobs;
+    let claimed = c.store.claim_jobs("default", 2, 30, false).await.unwrap().jobs;
     let by_step = |name: &str| {
         claimed
             .iter()
@@ -700,7 +702,8 @@ async fn janitor_heals_a_crash_between_context_merge_and_status_write() {
             Some(&result)
         )
         .await
-        .unwrap());
+        .unwrap()
+        .is_some());
     c.store
         .merge_workflow_context(&id, "y", &result)
         .await
@@ -767,8 +770,11 @@ impl JobStore for OrderProbe {
         queue: &str,
         count: usize,
         lease_secs: u32,
+        cover_timeout: bool,
     ) -> Result<Claimed, StorageError> {
-        self.inner.claim_jobs(queue, count, lease_secs).await
+        self.inner
+            .claim_jobs(queue, count, lease_secs, cover_timeout)
+            .await
     }
     async fn extend_lease(
         &self,
@@ -785,7 +791,7 @@ impl JobStore for OrderProbe {
         status: JobStatus,
         error: Option<&str>,
         result: Option<&Json>,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<FinishedJob>, StorageError> {
         self.inner
             .finish_if_leased(job_id, token, status, error, result)
             .await
@@ -793,9 +799,10 @@ impl JobStore for OrderProbe {
     async fn await_work(
         &self,
         queue: &str,
+        since_epoch: u64,
         max_wait: std::time::Duration,
     ) -> Result<(), StorageError> {
-        self.inner.await_work(queue, max_wait).await
+        self.inner.await_work(queue, since_epoch, max_wait).await
     }
     async fn cancel_job_if_active(&self, id: &str, reason: &str) -> Result<bool, StorageError> {
         self.inner.cancel_job_if_active(id, reason).await

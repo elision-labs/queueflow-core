@@ -4,7 +4,7 @@
 //! against the partial `idx_jobs_claim` index, and lease ownership rides on a
 //! random `lease_token` UUID stamped by every claim.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -95,6 +95,87 @@ fn job_columns_prefixed(alias: &str) -> String {
         .map(|c| format!("{alias}.{}", c.trim()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The claim statement, built once: it runs on every worker poll, so the
+/// column-list formatting should not be repaid per call. SKIP LOCKED makes
+/// concurrent claimers disjoint without blocking; the CTE-then-UPDATE shape
+/// is the standard Postgres claim pattern. `$4` (cover_timeout) stretches
+/// the lease to the job's configured timeout plus grace, so local workers
+/// need no separate extension round trip.
+static CLAIM_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "WITH c AS (\
+             SELECT id FROM queueflow.jobs \
+             WHERE queue_name = $1 AND status IN ('pending','retrying') \
+               AND scheduled_at <= now() \
+             ORDER BY priority DESC, scheduled_at, created_at \
+             FOR UPDATE SKIP LOCKED \
+             LIMIT $2\
+         ) \
+         UPDATE queueflow.jobs j \
+         SET status = 'running', \
+             started_at = COALESCE(j.started_at, now()), \
+             locked_until = now() + make_interval(secs => CASE WHEN $4 THEN \
+                 GREATEST($3, COALESCE((j.config->>'timeout_secs')::float8, 0) + {grace}) \
+                 ELSE $3 END), \
+             lease_token = gen_random_uuid(), \
+             delivery_count = j.delivery_count + 1 \
+         FROM c WHERE j.id = c.id \
+         RETURNING {cols}, j.lease_token::text AS lease_token",
+        grace = LEASE_GRACE_SECS,
+        cols = job_columns_prefixed("j")
+    )
+});
+
+/// The janitor's expired-lease reclaim, built once for the same reason.
+static RECLAIM_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "WITH c AS (\
+             SELECT id FROM queueflow.jobs \
+             WHERE status = 'running' AND locked_until < now() \
+             ORDER BY locked_until \
+             FOR UPDATE SKIP LOCKED \
+             LIMIT $1\
+         ) \
+         UPDATE queueflow.jobs j \
+         SET lease_token = gen_random_uuid(), \
+             locked_until = now() + make_interval(secs => $2) \
+         FROM c WHERE j.id = c.id \
+         RETURNING {cols}, j.lease_token::text AS lease_token",
+        cols = job_columns_prefixed("j")
+    )
+});
+
+/// Rows deleted per retention transaction. Bounding each round keeps the
+/// delete's locks and WAL burst small even when a huge backlog expires at
+/// once (e.g. the first sweep after enabling retention).
+const PURGE_BATCH: i64 = 5_000;
+
+/// Keyset-cursor predicate for text-id tables: continue strictly past
+/// `(created_at, id)` in the filter's sort order. Applied to page queries
+/// only — a requested total still counts the whole filtered set.
+fn push_cursor_text(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
+    if let Some(c) = &filter.after {
+        qb.push(if filter.order_desc {
+            " AND (created_at, id) < ("
+        } else {
+            " AND (created_at, id) > ("
+        });
+        qb.push_bind(c.created_at);
+        qb.push(", ");
+        qb.push_bind(c.id.clone());
+        qb.push(")");
+    }
+}
+
+/// The effective OFFSET: ignored when a cursor positions the page instead.
+fn effective_offset(filter: &ListFilter) -> i64 {
+    if filter.after.is_some() {
+        0
+    } else {
+        filter.offset.max(0)
+    }
 }
 
 /// Insert one job row. `ON CONFLICT DO NOTHING` absorbs an idempotency-key
@@ -254,6 +335,7 @@ impl JobStore for PostgresJobStore {
             "SELECT {JOB_COLUMNS} FROM queueflow.jobs WHERE 1=1"
         ));
         push_job_filters(&mut qb, filter);
+        push_cursor_text(&mut qb, filter);
         qb.push(if filter.order_desc {
             " ORDER BY created_at DESC, id DESC"
         } else {
@@ -261,7 +343,7 @@ impl JobStore for PostgresJobStore {
         });
         let limit = if filter.limit <= 0 { 50 } else { filter.limit };
         qb.push(" LIMIT ").push_bind(limit + 1);
-        qb.push(" OFFSET ").push_bind(filter.offset.max(0));
+        qb.push(" OFFSET ").push_bind(effective_offset(filter));
 
         let rows = qb.build().fetch_all(&self.pool).await.map_err(db)?;
         let mut jobs = rows
@@ -284,34 +366,20 @@ impl JobStore for PostgresJobStore {
         queue: &str,
         count: usize,
         lease_secs: u32,
+        cover_timeout: bool,
     ) -> Result<Claimed, StorageError> {
-        // SKIP LOCKED makes concurrent claimers disjoint without blocking;
-        // the CTE-then-UPDATE shape is the standard Postgres claim pattern.
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "WITH c AS (\
-                 SELECT id FROM queueflow.jobs \
-                 WHERE queue_name = $1 AND status IN ('pending','retrying') \
-                   AND scheduled_at <= now() \
-                 ORDER BY priority DESC, scheduled_at, created_at \
-                 FOR UPDATE SKIP LOCKED \
-                 LIMIT $2\
-             ) \
-             UPDATE queueflow.jobs j \
-             SET status = 'running', \
-                 started_at = COALESCE(j.started_at, now()), \
-                 locked_until = now() + make_interval(secs => $3), \
-                 lease_token = gen_random_uuid(), \
-                 delivery_count = j.delivery_count + 1 \
-             FROM c WHERE j.id = c.id \
-             RETURNING {}, j.lease_token::text AS lease_token",
-            job_columns_prefixed("j")
-        )))
-        .bind(queue)
-        .bind(count as i64)
-        .bind(lease_secs as f64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db)?;
+        // Snapshot the queue's epoch before the claim runs: a NOTIFY that
+        // races this query either made its job visible to the claim or
+        // advanced the epoch, so the caller's await_work cannot lose it.
+        let epoch = self.hub.epoch(queue);
+        let rows = sqlx::query(CLAIM_SQL.as_str())
+            .bind(queue)
+            .bind(count as i64)
+            .bind(lease_secs as f64)
+            .bind(cover_timeout)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
 
         let mut jobs = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -322,6 +390,8 @@ impl JobStore for PostgresJobStore {
         }
 
         // Only when empty-handed: when is the next delayed job due?
+        // idx_jobs_next_due (queue_name, scheduled_at, partial) serves this
+        // as a cheap first-row index probe however deep the backlog.
         let next_due = if jobs.is_empty() {
             sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
                 "SELECT MIN(scheduled_at) FROM queueflow.jobs \
@@ -336,7 +406,11 @@ impl JobStore for PostgresJobStore {
             None
         };
 
-        Ok(Claimed { jobs, next_due })
+        Ok(Claimed {
+            jobs,
+            next_due,
+            epoch,
+        })
     }
 
     async fn extend_lease(
@@ -388,31 +462,49 @@ impl JobStore for PostgresJobStore {
         status: JobStatus,
         error: Option<&str>,
         result: Option<&Json>,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<FinishedJob>, StorageError> {
         debug_assert!(status.is_terminal());
-        let affected = sqlx::query(
+        // RETURNING the workflow linkage saves callers advancing a workflow
+        // (the remote-worker complete path) a re-read of the row.
+        let row = sqlx::query(
             "UPDATE queueflow.jobs \
              SET status = $3, \
                  error_message = COALESCE($4, error_message), \
                  result = COALESCE($5, result), \
                  completed_at = now(), \
                  locked_until = NULL, lease_token = NULL \
-             WHERE id = $1 AND status = 'running' AND lease_token::text = $2",
+             WHERE id = $1 AND status = 'running' AND lease_token::text = $2 \
+             RETURNING workflow_id, workflow_step_id",
         )
         .bind(job_id)
         .bind(token)
         .bind(status.as_str())
         .bind(error)
         .bind(result.cloned())
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(db)?
-        .rows_affected();
-        Ok(affected > 0)
+        .map_err(db)?;
+        row.map(|r| {
+            Ok(FinishedJob {
+                workflow_id: r.try_get("workflow_id").map_err(db)?,
+                workflow_step_id: r.try_get("workflow_step_id").map_err(db)?,
+            })
+        })
+        .transpose()
     }
 
-    async fn await_work(&self, queue: &str, max_wait: Duration) -> Result<(), StorageError> {
-        self.hub.await_work(queue, max_wait).await;
+    async fn await_work(
+        &self,
+        queue: &str,
+        since_epoch: u64,
+        max_wait: Duration,
+    ) -> Result<(), StorageError> {
+        self.hub.await_work(queue, since_epoch, max_wait).await;
+        Ok(())
+    }
+
+    async fn await_job_change(&self, job_id: &str, max_wait: Duration) -> Result<(), StorageError> {
+        self.hub.await_job_change(job_id, max_wait).await;
         Ok(())
     }
 
@@ -509,6 +601,20 @@ impl JobStore for PostgresJobStore {
             "SELECT {DLQ_COLUMNS} FROM queueflow.dead_letters WHERE 1=1"
         ));
         push_dlq_filters(&mut qb, filter);
+        // Dead-letter ids are BIGSERIAL; the cursor carries them in decimal.
+        if let Some(c) = &filter.after {
+            if let Ok(id) = c.id.parse::<i64>() {
+                qb.push(if filter.order_desc {
+                    " AND (created_at, id) < ("
+                } else {
+                    " AND (created_at, id) > ("
+                });
+                qb.push_bind(c.created_at);
+                qb.push(", ");
+                qb.push_bind(id);
+                qb.push(")");
+            }
+        }
         qb.push(if filter.order_desc {
             " ORDER BY created_at DESC, id DESC"
         } else {
@@ -516,7 +622,7 @@ impl JobStore for PostgresJobStore {
         });
         let limit = if filter.limit <= 0 { 50 } else { filter.limit };
         qb.push(" LIMIT ").push_bind(limit + 1);
-        qb.push(" OFFSET ").push_bind(filter.offset.max(0));
+        qb.push(" OFFSET ").push_bind(effective_offset(filter));
 
         let rows = qb.build().fetch_all(&self.pool).await.map_err(db)?;
         let mut items = rows
@@ -608,6 +714,7 @@ impl JobStore for PostgresJobStore {
             "SELECT {CRON_COLUMNS} FROM queueflow.cron_schedules WHERE 1=1"
         ));
         push_cron_filters(&mut qb, filter);
+        push_cursor_text(&mut qb, filter);
         qb.push(if filter.order_desc {
             " ORDER BY created_at DESC, id DESC"
         } else {
@@ -615,7 +722,7 @@ impl JobStore for PostgresJobStore {
         });
         let limit = if filter.limit <= 0 { 50 } else { filter.limit };
         qb.push(" LIMIT ").push_bind(limit + 1);
-        qb.push(" OFFSET ").push_bind(filter.offset.max(0));
+        qb.push(" OFFSET ").push_bind(effective_offset(filter));
 
         let rows = qb.build().fetch_all(&self.pool).await.map_err(db)?;
         let mut items = rows
@@ -738,26 +845,12 @@ impl JobStore for PostgresJobStore {
         limit: usize,
         lease_secs: u32,
     ) -> Result<Vec<LeasedJob>, StorageError> {
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "WITH c AS (\
-                 SELECT id FROM queueflow.jobs \
-                 WHERE status = 'running' AND locked_until < now() \
-                 ORDER BY locked_until \
-                 FOR UPDATE SKIP LOCKED \
-                 LIMIT $1\
-             ) \
-             UPDATE queueflow.jobs j \
-             SET lease_token = gen_random_uuid(), \
-                 locked_until = now() + make_interval(secs => $2) \
-             FROM c WHERE j.id = c.id \
-             RETURNING {}, j.lease_token::text AS lease_token",
-            job_columns_prefixed("j")
-        )))
-        .bind(limit as i64)
-        .bind(lease_secs as f64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db)?;
+        let rows = sqlx::query(RECLAIM_SQL.as_str())
+            .bind(limit as i64)
+            .bind(lease_secs as f64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -810,45 +903,70 @@ impl JobStore for PostgresJobStore {
     }
 
     async fn purge_terminal(&self, older_than: DateTime<Utc>) -> Result<u64, StorageError> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
-        // xact-scoped advisory lock: released automatically on commit/rollback,
-        // so a crashed janitor can never wedge retention.
-        let won: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-            .bind(RETENTION_LOCK_KEY)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db)?;
-        if !won {
-            tx.rollback().await.map_err(db)?;
-            return Ok(0);
-        }
-        let purged = sqlx::query(
-            "DELETE FROM queueflow.jobs \
-             WHERE status IN ('completed','failed','cancelled') \
-               AND COALESCE(completed_at, created_at) < $1",
-        )
-        .bind(older_than)
-        .execute(&mut *tx)
-        .await
-        .map_err(db)?
-        .rows_affected();
-        // Steps go with their workflow via ON DELETE CASCADE.
-        sqlx::query(
-            "DELETE FROM queueflow.workflows \
-             WHERE status IN ('completed','failed','partially_failed','cancelled') \
-               AND COALESCE(completed_at, created_at) < $1",
-        )
-        .bind(older_than)
-        .execute(&mut *tx)
-        .await
-        .map_err(db)?;
-        sqlx::query("DELETE FROM queueflow.dead_letters WHERE created_at < $1")
+        // Deleting in bounded rounds keeps each transaction's locks and WAL
+        // burst small even when an enormous backlog expires at once. Each
+        // round re-takes the xact-scoped advisory lock (released on
+        // commit/rollback, so a crashed janitor can never wedge retention);
+        // losing it mid-way means another janitor took over.
+        let mut purged = 0u64;
+        loop {
+            let mut tx = self.pool.begin().await.map_err(db)?;
+            let won: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                .bind(RETENTION_LOCK_KEY)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db)?;
+            if !won {
+                tx.rollback().await.map_err(db)?;
+                return Ok(purged);
+            }
+            let jobs = sqlx::query(
+                "DELETE FROM queueflow.jobs WHERE id IN (\
+                     SELECT id FROM queueflow.jobs \
+                     WHERE status IN ('completed','failed','cancelled') \
+                       AND COALESCE(completed_at, created_at) < $1 \
+                     LIMIT $2)",
+            )
             .bind(older_than)
+            .bind(PURGE_BATCH)
             .execute(&mut *tx)
             .await
-            .map_err(db)?;
-        tx.commit().await.map_err(db)?;
-        Ok(purged)
+            .map_err(db)?
+            .rows_affected();
+            // Steps go with their workflow via ON DELETE CASCADE.
+            let workflows = sqlx::query(
+                "DELETE FROM queueflow.workflows WHERE id IN (\
+                     SELECT id FROM queueflow.workflows \
+                     WHERE status IN ('completed','failed','partially_failed','cancelled') \
+                       AND COALESCE(completed_at, created_at) < $1 \
+                     LIMIT $2)",
+            )
+            .bind(older_than)
+            .bind(PURGE_BATCH)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected();
+            let dead_letters = sqlx::query(
+                "DELETE FROM queueflow.dead_letters WHERE id IN (\
+                     SELECT id FROM queueflow.dead_letters \
+                     WHERE created_at < $1 \
+                     LIMIT $2)",
+            )
+            .bind(older_than)
+            .bind(PURGE_BATCH)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected();
+            tx.commit().await.map_err(db)?;
+
+            purged += jobs;
+            let batch = PURGE_BATCH as u64;
+            if jobs < batch && workflows < batch && dead_letters < batch {
+                return Ok(purged);
+            }
+        }
     }
 
     // ---- Workflows ----------------------------------------------------------
@@ -892,6 +1010,28 @@ impl JobStore for PostgresJobStore {
         }
         tx.commit().await.map_err(db)?;
         Ok(())
+    }
+
+    async fn get_workflow_status(&self, id: &str) -> Result<WorkflowStatus, StorageError> {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM queueflow.workflows WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?
+                .ok_or_else(|| StorageError::WorkflowNotFound(id.to_string()))?;
+        enum_from_str(&status)
+    }
+
+    async fn get_workflow_context(&self, id: &str) -> Result<Map, StorageError> {
+        let context: Json =
+            sqlx::query_scalar("SELECT context FROM queueflow.workflows WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?
+                .ok_or_else(|| StorageError::WorkflowNotFound(id.to_string()))?;
+        Ok(serde_json::from_value(context)?)
     }
 
     async fn get_workflow(&self, id: &str) -> Result<Workflow, StorageError> {
@@ -945,6 +1085,7 @@ impl JobStore for PostgresJobStore {
              FROM queueflow.workflows WHERE 1=1",
         );
         push_workflow_filters(&mut qb, filter);
+        push_cursor_text(&mut qb, filter);
         qb.push(if filter.order_desc {
             " ORDER BY created_at DESC, id DESC"
         } else {
@@ -952,7 +1093,7 @@ impl JobStore for PostgresJobStore {
         });
         let limit = if filter.limit <= 0 { 50 } else { filter.limit };
         qb.push(" LIMIT ").push_bind(limit + 1);
-        qb.push(" OFFSET ").push_bind(filter.offset.max(0));
+        qb.push(" OFFSET ").push_bind(effective_offset(filter));
 
         let mut rows = qb.build().fetch_all(&self.pool).await.map_err(db)?;
         let has_more = rows.len() as i64 > limit;

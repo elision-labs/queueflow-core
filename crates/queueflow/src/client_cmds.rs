@@ -43,11 +43,11 @@ pub async fn job(cmd: JobCommand) -> anyhow::Result<()> {
                     parse_payload(&payload)?,
                     CreateJobOptions {
                         queue,
-                        priority: None,
                         max_retries,
                         timeout_secs,
                         idempotency_key,
                         run_at,
+                        ..Default::default()
                     },
                 )
                 .await?;
@@ -76,6 +76,7 @@ pub async fn job(cmd: JobCommand) -> anyhow::Result<()> {
                     limit,
                     offset,
                     include_total,
+                    cursor: None,
                 })
                 .await?;
             print_json(&serde_json::json!({
@@ -135,6 +136,7 @@ pub async fn workflow(cmd: WorkflowCommand) -> anyhow::Result<()> {
                     limit,
                     offset,
                     include_total,
+                    cursor: None,
                 })
                 .await?;
             print_json(&serde_json::json!({
@@ -170,6 +172,7 @@ pub async fn dlq(cmd: DlqCommand) -> anyhow::Result<()> {
                     limit,
                     offset,
                     include_total,
+                    cursor: None,
                 })
                 .await?;
             print_json(&serde_json::json!({
@@ -223,6 +226,7 @@ pub async fn cron(cmd: CronCommand) -> anyhow::Result<()> {
                     limit,
                     offset,
                     include_total,
+                    cursor: None,
                 })
                 .await?;
             print_json(&serde_json::json!({

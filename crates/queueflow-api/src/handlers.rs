@@ -10,7 +10,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use futures::stream::Stream;
-use queueflow_core::{CreateWorkflowRequest, EngineError, Job, Workflow};
+use queueflow_core::{BatchItem, CreateWorkflowRequest, EngineError, Job, Workflow};
 
 use crate::auth::Tenant;
 use crate::dto::*;
@@ -19,8 +19,10 @@ use crate::ApiState;
 
 const MAX_BATCH: usize = 1000;
 
-/// How often the SSE job stream re-reads the job, and its maximum lifetime.
-const SSE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Fallback poll interval for the SSE job stream: status transitions arrive
+/// as push wakeups (`await_job_change`); this only bounds the staleness when
+/// a wakeup is lost (e.g. LISTEN unavailable). Also its maximum lifetime.
+const SSE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const SSE_MAX_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
 /// Enforce tenant ownership of a resource. A resource with no tenant is treated
@@ -107,8 +109,14 @@ pub async fn create_batch_jobs(
         .jobs
         .into_iter()
         .map(|j| {
-            let (config, _queue) = j.config.unwrap_or_default().resolve();
-            (j.task_name, j.payload, config)
+            let (config, queue) = j.config.unwrap_or_default().resolve();
+            BatchItem {
+                task_name: j.task_name,
+                payload: j.payload,
+                config,
+                queue,
+                run_at: j.run_at,
+            }
         })
         .collect();
     let ids = s.engine.enqueue_batch(jobs, Some(t.0)).await?;
@@ -137,14 +145,19 @@ pub async fn list_jobs(
     Extension(t): Extension<Tenant>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListJobsResponse>, ApiError> {
-    let filter = q.into_filter(Some(t.0));
+    let filter = q.into_filter(Some(t.0)).map_err(EngineError::Validation)?;
     let page = s.engine.list_jobs(filter.clone()).await?;
+    let next_cursor = page
+        .has_more
+        .then(|| page.items.last().map(|j| encode_cursor(j.created_at, &j.id)))
+        .flatten();
     Ok(Json(ListJobsResponse {
         jobs: page.items,
         total: page.total,
         limit: filter.limit,
         offset: filter.offset,
         has_more: page.has_more,
+        next_cursor,
     }))
 }
 
@@ -237,14 +250,19 @@ pub async fn list_workflows(
     Extension(t): Extension<Tenant>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListWorkflowsResponse>, ApiError> {
-    let filter = q.into_filter(Some(t.0));
+    let filter = q.into_filter(Some(t.0)).map_err(EngineError::Validation)?;
     let page = s.engine.list_workflows(filter.clone()).await?;
+    let next_cursor = page
+        .has_more
+        .then(|| page.items.last().map(|w| encode_cursor(w.created_at, &w.id)))
+        .flatten();
     Ok(Json(ListWorkflowsResponse {
         workflows: page.items,
         total: page.total,
         limit: filter.limit,
         offset: filter.offset,
         has_more: page.has_more,
+        next_cursor,
     }))
 }
 
@@ -373,7 +391,10 @@ pub async fn stream_job_events(
                 if started.elapsed() > SSE_MAX_LIFETIME {
                     return None;
                 }
-                tokio::time::sleep(SSE_POLL_INTERVAL).await;
+                // Push-driven: status transitions wake this via the store's
+                // job-change notification; the interval is only the fallback
+                // bound when a wakeup is lost.
+                let _ = engine.await_job_change(&id, SSE_POLL_INTERVAL).await;
             }
         },
     );
@@ -531,14 +552,19 @@ pub async fn list_crons(
     Extension(t): Extension<Tenant>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListCronsResponse>, ApiError> {
-    let filter = q.into_filter(Some(t.0));
+    let filter = q.into_filter(Some(t.0)).map_err(EngineError::Validation)?;
     let page = s.engine.list_crons(filter.clone()).await?;
+    let next_cursor = page
+        .has_more
+        .then(|| page.items.last().map(|c| encode_cursor(c.created_at, &c.id)))
+        .flatten();
     Ok(Json(ListCronsResponse {
         crons: page.items,
         total: page.total,
         limit: filter.limit,
         offset: filter.offset,
         has_more: page.has_more,
+        next_cursor,
     }))
 }
 
@@ -645,14 +671,23 @@ pub async fn list_dead_letters(
     Extension(t): Extension<Tenant>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListDeadLettersResponse>, ApiError> {
-    let filter = q.into_filter(Some(t.0));
+    let filter = q.into_filter(Some(t.0)).map_err(EngineError::Validation)?;
     let page = s.engine.list_dead_letters(filter.clone()).await?;
+    let next_cursor = page
+        .has_more
+        .then(|| {
+            page.items
+                .last()
+                .map(|d| encode_cursor(d.created_at, &d.id.to_string()))
+        })
+        .flatten();
     Ok(Json(ListDeadLettersResponse {
         dead_letters: page.items,
         total: page.total,
         limit: filter.limit,
         offset: filter.offset,
         has_more: page.has_more,
+        next_cursor,
     }))
 }
 

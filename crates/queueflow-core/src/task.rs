@@ -66,7 +66,7 @@ pub mod builtin {
     use crate::domain::Map;
     use crate::error::HandlerError;
 
-    /// Returns the payload unchanged plus a `timestamp` field.
+    /// Returns the payload unchanged plus an `echoed: true` marker.
     pub fn echo() -> Arc<dyn TaskHandler> {
         handler_fn(|mut payload: Map| async move {
             payload.insert("echoed".into(), json!(true));

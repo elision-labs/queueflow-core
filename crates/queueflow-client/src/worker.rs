@@ -40,7 +40,10 @@ type Handler = Arc<dyn Fn(Job) -> HandlerFuture + Send + Sync>;
 /// Tuning for [`Worker`].
 #[derive(Clone, Debug)]
 pub struct WorkerOptions {
-    /// Jobs leased per poll (1..=100).
+    /// Jobs leased per poll (1..=100). A leased batch runs **concurrently**,
+    /// each job under its own heartbeat, so this is also the worker's
+    /// concurrency: later jobs never sit unheartbeated behind earlier ones
+    /// (which would let their leases expire and trigger duplicate delivery).
     pub batch_size: usize,
     /// Initial lease duration; the worker heartbeats at half this interval
     /// while a handler runs, so it also bounds redelivery delay after a crash.
@@ -96,39 +99,56 @@ impl Worker {
         self.shutdown.clone()
     }
 
-    /// Lease/execute/report until the shutdown token fires.
+    /// Lease/execute/report until the shutdown token fires. A leased batch
+    /// runs concurrently, one task per job, so every job heartbeats from the
+    /// moment it is leased; sequential processing would leave later jobs'
+    /// leases to expire while earlier ones run, causing duplicate delivery.
     pub async fn run(self) {
         tracing::info!(queue = %self.queue, tasks = ?self.handlers.keys().collect::<Vec<_>>(), "remote worker started");
+        let worker = Arc::new(self);
         loop {
-            if self.shutdown.is_cancelled() {
+            if worker.shutdown.is_cancelled() {
                 break;
             }
             let leased = tokio::select! {
                 biased;
-                _ = self.shutdown.cancelled() => break,
-                r = self.client.lease_jobs(
-                    &self.queue,
-                    self.options.batch_size,
-                    self.options.lease_secs,
-                    self.options.wait_secs,
+                _ = worker.shutdown.cancelled() => break,
+                r = worker.client.lease_jobs(
+                    &worker.queue,
+                    worker.options.batch_size,
+                    worker.options.lease_secs,
+                    worker.options.wait_secs,
                 ) => r,
             };
             match leased {
                 Ok(jobs) => {
+                    let mut set = tokio::task::JoinSet::new();
                     for lease in jobs {
-                        self.process(lease).await;
+                        let w = worker.clone();
+                        set.spawn(async move { w.process(lease).await });
+                    }
+                    // In-flight jobs finish and report before the next lease
+                    // round (and before shutdown), keeping concurrency
+                    // bounded by batch_size.
+                    while let Some(res) = set.join_next().await {
+                        if let Err(e) = res {
+                            // A panicking handler kills only its own task;
+                            // the job's lease expires and the server
+                            // redelivers per the retry policy.
+                            tracing::error!(error = %e, "job task panicked; lease will expire and redeliver");
+                        }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "lease failed; backing off");
                     tokio::select! {
-                        _ = self.shutdown.cancelled() => break,
+                        _ = worker.shutdown.cancelled() => break,
                         _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                     }
                 }
             }
         }
-        tracing::info!(queue = %self.queue, "remote worker stopped");
+        tracing::info!(queue = %worker.queue, "remote worker stopped");
     }
 
     /// Run one leased job: dispatch to its handler under a heartbeat, then

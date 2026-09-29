@@ -4,7 +4,7 @@
 //! every language.
 
 use chrono::{DateTime, Utc};
-use queueflow_core::{DeadLetter, Job, JobConfig, Map, Workflow};
+use queueflow_core::{BackoffStrategy, DeadLetter, Job, JobConfig, Map, PageCursor, Workflow};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -22,14 +22,31 @@ pub struct JobConfigRequest {
     /// Override the destination queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
+    /// How retry delays grow between attempts (default exponential).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_backoff: Option<BackoffStrategy>,
+    /// Base retry delay, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_delay_secs: Option<u64>,
+    /// Upper bound on any computed retry delay, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_delay_secs: Option<u64>,
+    /// Retry-delay jitter in `0.0..=1.0` (e.g. `0.1` = +/-10%).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter_factor: Option<f64>,
 }
 
 impl JobConfigRequest {
     /// Resolve into `(config, queue_override)`.
     pub fn resolve(self) -> (Option<JobConfig>, Option<String>) {
         let queue = self.queue;
-        let needs_config =
-            self.priority.is_some() || self.max_retries.is_some() || self.timeout.is_some();
+        let needs_config = self.priority.is_some()
+            || self.max_retries.is_some()
+            || self.timeout.is_some()
+            || self.retry_backoff.is_some()
+            || self.retry_delay_secs.is_some()
+            || self.retry_max_delay_secs.is_some()
+            || self.jitter_factor.is_some();
         let config = if needs_config {
             let mut c = JobConfig::default();
             if let Some(p) = self.priority {
@@ -40,6 +57,18 @@ impl JobConfigRequest {
             }
             if let Some(t) = self.timeout {
                 c.timeout_secs = t;
+            }
+            if let Some(b) = self.retry_backoff {
+                c.retry_backoff = b;
+            }
+            if let Some(d) = self.retry_delay_secs {
+                c.retry_delay_secs = d;
+            }
+            if let Some(m) = self.retry_max_delay_secs {
+                c.retry_max_delay_secs = m;
+            }
+            if let Some(j) = self.jitter_factor {
+                c.jitter_factor = Some(j);
             }
             Some(c)
         } else {
@@ -92,6 +121,11 @@ pub struct ListJobsResponse {
     pub limit: i64,
     pub offset: i64,
     pub has_more: bool,
+    /// Opaque keyset cursor for the next page (present when `has_more`).
+    /// Pass it back as `cursor` to continue where this page ended; cheaper
+    /// than deep OFFSET paging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -108,6 +142,11 @@ pub struct ListWorkflowsResponse {
     pub limit: i64,
     pub offset: i64,
     pub has_more: bool,
+    /// Opaque keyset cursor for the next page (present when `has_more`).
+    /// Pass it back as `cursor` to continue where this page ended; cheaper
+    /// than deep OFFSET paging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -124,6 +163,11 @@ pub struct ListCronsResponse {
     pub limit: i64,
     pub offset: i64,
     pub has_more: bool,
+    /// Opaque keyset cursor for the next page (present when `has_more`).
+    /// Pass it back as `cursor` to continue where this page ended; cheaper
+    /// than deep OFFSET paging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -135,6 +179,11 @@ pub struct ListDeadLettersResponse {
     pub limit: i64,
     pub offset: i64,
     pub has_more: bool,
+    /// Opaque keyset cursor for the next page (present when `has_more`).
+    /// Pass it back as `cursor` to continue where this page ended; cheaper
+    /// than deep OFFSET paging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -210,15 +259,23 @@ pub struct ListQuery {
     /// Include the exact `total` count in the response (default false; the
     /// count is an extra full scan over the filtered set).
     pub include_total: Option<bool>,
+    /// Opaque keyset cursor from a previous page's `next_cursor`. When set,
+    /// `offset` is ignored and listing continues where that page ended.
+    pub cursor: Option<String>,
 }
 
 impl ListQuery {
-    /// Convert to a core `ListFilter`, scoping to `tenant` and clamping paging.
-    pub fn into_filter(self, tenant: Option<String>) -> queueflow_core::ListFilter {
+    /// Convert to a core `ListFilter`, scoping to `tenant` and clamping
+    /// paging. A malformed cursor is an error, not a silently full listing.
+    pub fn into_filter(self, tenant: Option<String>) -> Result<queueflow_core::ListFilter, String> {
         let limit = self.limit.unwrap_or(50).clamp(1, 100);
         let offset = self.offset.unwrap_or(0).max(0);
         let order_desc = !matches!(self.order_by.as_deref(), Some("created_at ASC"));
-        queueflow_core::ListFilter {
+        let after = match &self.cursor {
+            None => None,
+            Some(c) => Some(decode_cursor(c).ok_or_else(|| "invalid cursor".to_string())?),
+        };
+        Ok(queueflow_core::ListFilter {
             tenant_id: tenant,
             status: self.status,
             queue: self.queue,
@@ -226,8 +283,27 @@ impl ListQuery {
             offset,
             order_desc,
             include_total: self.include_total.unwrap_or(false),
-        }
+            after,
+        })
     }
+}
+
+/// Encode a keyset cursor: microsecond timestamp and row id, `:`-separated.
+/// Opaque to clients; matches the timestamptz resolution Postgres stores.
+pub(crate) fn encode_cursor(created_at: DateTime<Utc>, id: &str) -> String {
+    format!("{}:{}", created_at.timestamp_micros(), id)
+}
+
+pub(crate) fn decode_cursor(s: &str) -> Option<PageCursor> {
+    let (micros, id) = s.split_once(':')?;
+    let created_at = DateTime::from_timestamp_micros(micros.parse().ok()?)?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(PageCursor {
+        created_at,
+        id: id.to_string(),
+    })
 }
 
 // ---- Remote worker protocol --------------------------------------------------

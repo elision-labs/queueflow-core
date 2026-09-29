@@ -114,7 +114,28 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                      token. Set one for any deployment with more than one tenant."
                 );
             }
-            let app = build_router(ApiState::new(engine.clone()).with_auth(auth));
+            let cors_origins: Vec<String> = args
+                .cors_origins
+                .as_deref()
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|o| !o.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if cors_origins.is_empty() {
+                tracing::warn!(
+                    "no --cors-origins / QUEUEFLOW_CORS_ORIGINS configured: CORS is permissive. \
+                     Restrict it before exposing this API to browsers."
+                );
+            }
+            let app = build_router(
+                ApiState::new(engine.clone())
+                    .with_auth(auth)
+                    .with_cors_origins(cors_origins),
+            );
             let listener = TcpListener::bind(("0.0.0.0", args.api_port))
                 .await
                 .with_context(|| format!("bind API port {}", args.api_port))?;

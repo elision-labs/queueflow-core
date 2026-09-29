@@ -39,9 +39,18 @@ pub struct EnqueueOptions {
     pub run_at: Option<DateTime<Utc>>,
 }
 
-/// Headroom added on top of a job's timeout when extending its lease, covering
-/// post-handler bookkeeping (terminal write, workflow advance).
-const LEASE_GRACE_SECS: u64 = 30;
+/// One entry of [`Engine::enqueue_batch`].
+#[derive(Clone, Debug)]
+pub struct BatchItem {
+    pub task_name: String,
+    pub payload: Map,
+    pub config: Option<JobConfig>,
+    /// Destination queue (the engine default when absent).
+    pub queue: Option<String>,
+    /// Don't run before this instant (durable scheduling, like
+    /// [`EnqueueOptions::run_at`]).
+    pub run_at: Option<DateTime<Utc>>,
+}
 
 /// Best-effort text from a caught panic payload (for logs and job errors).
 pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
@@ -244,14 +253,15 @@ where
         Ok(job.id)
     }
 
-    /// Enqueue many jobs efficiently (one multi-row insert).
+    /// Enqueue many jobs efficiently (one multi-row insert). Each item's
+    /// queue and `run_at` are honoured, exactly as on a single enqueue.
     pub async fn enqueue_batch(
         &self,
-        requests: Vec<(String, Map, Option<JobConfig>)>,
+        requests: Vec<BatchItem>,
         tenant_id: Option<String>,
     ) -> Result<Vec<String>, EngineError> {
-        for (i, (_, _, config)) in requests.iter().enumerate() {
-            if let Some(cfg) = config {
+        for (i, item) in requests.iter().enumerate() {
+            if let Some(cfg) = &item.config {
                 cfg.validate()
                     .map_err(|e| EngineError::Validation(format!("jobs[{i}]: {e}")))?;
             }
@@ -259,15 +269,15 @@ where
         let now = self.clock.now();
         let jobs: Vec<Job> = requests
             .into_iter()
-            .map(|(task_name, payload, config)| Job {
+            .map(|item| Job {
                 id: Uuid::new_v4().to_string(),
-                queue_name: self.default_queue.clone(),
-                task_name,
-                payload,
-                config: config.unwrap_or_default(),
+                queue_name: item.queue.unwrap_or_else(|| self.default_queue.clone()),
+                task_name: item.task_name,
+                payload: item.payload,
+                config: item.config.unwrap_or_default(),
                 status: JobStatus::Pending,
                 created_at: now,
-                scheduled_at: now,
+                scheduled_at: item.run_at.unwrap_or(now),
                 started_at: None,
                 completed_at: None,
                 delivery_count: 0,
@@ -284,9 +294,7 @@ where
             .collect();
 
         let ids = self.store.batch_create_jobs(&jobs).await?;
-        for _ in &jobs {
-            EngineStats::incr(&self.stats.jobs_created);
-        }
+        EngineStats::add(&self.stats.jobs_created, jobs.len() as u64);
         Ok(ids)
     }
 
@@ -442,11 +450,18 @@ where
 
     /// Pause or resume a schedule. Resuming recomputes `next_run_at` from
     /// now, so the schedule fires at its next future slot rather than
-    /// catching up on everything it missed while paused.
+    /// catching up on everything it missed while paused. Pausing keeps the
+    /// stored `next_run_at` untouched — recomputing there would make pausing
+    /// a schedule with no future occurrence fail, the one case where pausing
+    /// matters most.
     pub async fn set_cron_enabled(&self, id: &str, enabled: bool) -> Result<(), EngineError> {
         let cron = self.store.get_cron(id).await?;
-        let next = crate::cron::next_occurrence(&cron.cron_expr, self.clock.now())
-            .map_err(EngineError::Validation)?;
+        let next = if enabled {
+            crate::cron::next_occurrence(&cron.cron_expr, self.clock.now())
+                .map_err(EngineError::Validation)?
+        } else {
+            cron.next_run_at
+        };
         if !self.store.set_cron_enabled(id, enabled, next).await? {
             return Err(StorageError::CronNotFound(id.to_string()).into());
         }
@@ -575,6 +590,17 @@ where
         Ok(self.store.ping().await?)
     }
 
+    /// Park until `job_id` may have changed status, or `max_wait` passes.
+    /// May wake spuriously; callers re-read the job and loop. Drives the SSE
+    /// job stream without per-client polling.
+    pub async fn await_job_change(
+        &self,
+        job_id: &str,
+        max_wait: StdDuration,
+    ) -> Result<(), EngineError> {
+        Ok(self.store.await_job_change(job_id, max_wait).await?)
+    }
+
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
@@ -634,18 +660,20 @@ where
             if self.shutdown.is_cancelled() {
                 break;
             }
-            match self.store.claim_jobs(&queue, 1, self.lease_secs).await {
+            match self.store.claim_jobs(&queue, 1, self.lease_secs, true).await {
                 Ok(mut claimed) => {
                     if let Some(lease) = claimed.jobs.pop() {
                         self.process_job(lease).await;
                     } else {
                         // Idle: park until NOTIFY wakes us, the next delayed
-                        // job comes due, or the safety-net window passes.
+                        // job comes due, or the safety-net window passes. The
+                        // claim's epoch makes a wakeup that raced the empty
+                        // claim return immediately instead of being lost.
                         let wait = self.idle_wait(claimed.next_due);
                         tokio::select! {
                             biased;
                             _ = self.shutdown.cancelled() => break,
-                            _ = self.store.await_work(&queue, wait) => {}
+                            _ = self.store.await_work(&queue, claimed.epoch, wait) => {}
                         }
                     }
                 }
@@ -677,7 +705,7 @@ where
     /// Claim and process at most one job. Returns whether a job was handled.
     /// Primarily used to drive the engine deterministically in tests.
     pub async fn process_once(&self, queue: &str) -> Result<bool, EngineError> {
-        let mut claimed = self.store.claim_jobs(queue, 1, self.lease_secs).await?;
+        let mut claimed = self.store.claim_jobs(queue, 1, self.lease_secs, true).await?;
         match claimed.jobs.pop() {
             Some(lease) => {
                 self.process_job(lease).await;
@@ -696,8 +724,12 @@ where
     /// idempotent. Every outcome write is lease-guarded, so a job that was
     /// cancelled mid-run or reclaimed after lease expiry is never overwritten
     /// by this worker.
+    ///
+    /// The lease must already cover the job's timeout: claims made with
+    /// `cover_timeout` (as the worker loop's are) guarantee it, so no
+    /// per-job lease extension is needed here.
     pub async fn process_job(&self, lease: LeasedJob) {
-        let LeasedJob { job, lease_token } = lease;
+        let LeasedJob { mut job, lease_token } = lease;
 
         let Some(handler) = self.handlers.get(&job.task_name).cloned() else {
             let err = format!("no handler registered for task '{}'", job.task_name);
@@ -706,34 +738,14 @@ where
             return;
         };
 
-        // Extend the lease to cover the job's full timeout (plus grace for
-        // bookkeeping). Without this, any job running longer than the claim
-        // lease would be reaped by the janitor and retried concurrently.
-        let needed = job.config.timeout_secs.saturating_add(LEASE_GRACE_SECS);
-        if needed > self.lease_secs as u64 {
-            let secs = needed.min(u32::MAX as u64) as u32;
-            match self.store.extend_lease(&job.id, &lease_token, secs).await {
-                Ok(Some(JobStatus::Running)) => {}
-                Ok(_) => {
-                    // Cancelled or reclaimed between claim and here: not ours.
-                    tracing::info!(job_id = %job.id, "job lost its lease before starting; skipping");
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        job_id = %job.id, error = %e,
-                        "failed to extend lease; a long-running job may be reaped while still running"
-                    );
-                }
-            }
-        }
-
         let timeout = StdDuration::from_secs(job.config.timeout_secs.max(1));
+        // The payload is not needed after the handler runs (the failure path
+        // reads only config/counters/ids), so hand it over without cloning.
+        let payload = std::mem::take(&mut job.payload);
         // catch_unwind: a panicking handler must not take down the worker.
         // At-least-once delivery treats a panic like any other crash, so it
         // consumes retry budget and eventually dead-letters.
-        let handler_fut =
-            std::panic::AssertUnwindSafe(handler.handle(job.payload.clone())).catch_unwind();
+        let handler_fut = std::panic::AssertUnwindSafe(handler.handle(payload)).catch_unwind();
         let outcome = tokio::time::timeout(timeout, handler_fut).await;
 
         match outcome {
@@ -754,7 +766,7 @@ where
                     )
                     .await
                 {
-                    Ok(true) => {
+                    Ok(Some(_)) => {
                         EngineStats::incr(&self.stats.jobs_completed);
                         // Advance the workflow after the terminal write; if
                         // this fails (or we crash), the janitor's stalled-step
@@ -767,7 +779,7 @@ where
                             }
                         }
                     }
-                    Ok(false) => {
+                    Ok(None) => {
                         tracing::info!(job_id = %job.id, "lease lost before completion (cancelled or reclaimed); result dropped");
                     }
                     Err(e) => {
@@ -842,7 +854,7 @@ where
             .finish_if_leased(&job.id, token, JobStatus::Failed, Some(error), None)
             .await
         {
-            Ok(true) => {
+            Ok(Some(_)) => {
                 EngineStats::incr(&self.stats.jobs_failed);
                 if let Err(e) = self.store.move_to_dlq(&job.id, reason, error).await {
                     tracing::error!(job_id = %job.id, error = %e, "failed to record dead letter");
@@ -856,7 +868,7 @@ where
                 }
                 true
             }
-            Ok(false) => {
+            Ok(None) => {
                 tracing::info!(job_id = %job.id, "lease lost before failure could be recorded (cancelled or reclaimed)");
                 false
             }
@@ -921,7 +933,9 @@ where
     ) -> Result<Vec<LeasedJob>, EngineError> {
         let deadline = tokio::time::Instant::now() + StdDuration::from_secs(wait_secs as u64);
         loop {
-            let claimed = self.store.claim_jobs(queue, count, lease_secs).await?;
+            // cover_timeout = false: remote workers heartbeat, so short
+            // leases keep crash recovery fast.
+            let claimed = self.store.claim_jobs(queue, count, lease_secs, false).await?;
             if !claimed.jobs.is_empty() {
                 return Ok(claimed.jobs);
             }
@@ -930,7 +944,7 @@ where
                 return Ok(vec![]);
             }
             let wait = self.idle_wait(claimed.next_due).min(remaining);
-            self.store.await_work(queue, wait).await?;
+            self.store.await_work(queue, claimed.epoch, wait).await?;
         }
     }
 
@@ -974,10 +988,11 @@ where
                 Some(&result_value),
             )
             .await?;
-        if finished {
+        if let Some(fin) = finished {
             EngineStats::incr(&self.stats.jobs_completed);
-            let job = self.store.get_job(job_id).await?;
-            if let (Some(wf), Some(step)) = (&job.workflow_id, &job.workflow_step_id) {
+            // The terminal write returned the workflow linkage, so no
+            // re-read of the job is needed.
+            if let (Some(wf), Some(step)) = (&fin.workflow_id, &fin.workflow_step_id) {
                 if let Err(e) = self.scheduler.on_step_completed(wf, step, &result).await {
                     // The completion is recorded; the janitor re-drives the
                     // advance. Failing the request would only provoke a

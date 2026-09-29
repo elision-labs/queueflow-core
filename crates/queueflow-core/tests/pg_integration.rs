@@ -121,11 +121,11 @@ async fn pg_claim_is_exclusive_and_lease_guarded() {
         .unwrap();
 
     // First claim wins the job; a second claim sees nothing.
-    let first = store.claim_jobs(queue, 5, 30).await.unwrap();
+    let first = store.claim_jobs(queue, 5, 30, false).await.unwrap();
     assert_eq!(first.jobs.len(), 1);
     assert_eq!(first.jobs[0].job.id, id);
     assert!(store
-        .claim_jobs(queue, 5, 30)
+        .claim_jobs(queue, 5, 30, false)
         .await
         .unwrap()
         .jobs
@@ -134,10 +134,11 @@ async fn pg_claim_is_exclusive_and_lease_guarded() {
     // A bogus token cannot finish or extend the job; the real one can.
     let token = &first.jobs[0].lease_token;
     let bogus = "00000000-0000-0000-0000-000000000000";
-    assert!(!store
+    assert!(store
         .finish_if_leased(&id, bogus, JobStatus::Completed, None, None)
         .await
-        .unwrap());
+        .unwrap()
+        .is_none());
     assert_eq!(store.extend_lease(&id, bogus, 60).await.unwrap(), None);
     assert_eq!(
         store.extend_lease(&id, token, 60).await.unwrap(),
@@ -146,7 +147,8 @@ async fn pg_claim_is_exclusive_and_lease_guarded() {
     assert!(store
         .finish_if_leased(&id, token, JobStatus::Completed, None, None)
         .await
-        .unwrap());
+        .unwrap()
+        .is_some());
     assert_eq!(
         engine.get_job(&id).await.unwrap().status,
         JobStatus::Completed
@@ -176,7 +178,7 @@ async fn pg_run_at_and_priority_order_claims() {
         )
         .await
         .unwrap();
-    let claimed = store.claim_jobs(queue, 1, 30).await.unwrap();
+    let claimed = store.claim_jobs(queue, 1, 30, false).await.unwrap();
     assert!(claimed.jobs.is_empty());
     let next_due = claimed.next_due.expect("future job must report next_due");
     assert!((next_due - run_at).num_seconds().abs() < 2);
@@ -198,7 +200,7 @@ async fn pg_run_at_and_priority_order_claims() {
             .await
             .unwrap();
     }
-    let claimed = store.claim_jobs(queue, 1, 30).await.unwrap();
+    let claimed = store.claim_jobs(queue, 1, 30, false).await.unwrap();
     assert_eq!(claimed.jobs[0].job.payload["who"], json!("high"));
 }
 
@@ -215,8 +217,9 @@ async fn pg_notify_wakes_an_idle_waiter() {
     // Prime the LISTEN connection, then enqueue from a parallel task while
     // this one is parked in await_work. The NOTIFY (not the 10s timeout)
     // must wake it.
+    let prime_epoch = store.claim_jobs(queue, 1, 30, false).await.unwrap().epoch;
     store
-        .await_work(queue, Duration::from_millis(50))
+        .await_work(queue, prime_epoch, Duration::from_millis(50))
         .await
         .unwrap();
     let eng = engine.clone();
@@ -227,9 +230,10 @@ async fn pg_notify_wakes_an_idle_waiter() {
             .await
             .unwrap();
     });
+    let epoch = store.claim_jobs(queue, 1, 30, false).await.unwrap().epoch;
     let start = std::time::Instant::now();
     store
-        .await_work(queue, Duration::from_secs(10))
+        .await_work(queue, epoch, Duration::from_secs(10))
         .await
         .unwrap();
     assert!(
@@ -238,7 +242,7 @@ async fn pg_notify_wakes_an_idle_waiter() {
         start.elapsed()
     );
     let _ = q;
-    assert_eq!(store.claim_jobs(queue, 1, 30).await.unwrap().jobs.len(), 1);
+    assert_eq!(store.claim_jobs(queue, 1, 30, false).await.unwrap().jobs.len(), 1);
 }
 
 #[tokio::test]
@@ -256,7 +260,7 @@ async fn pg_expired_lease_is_reaped_into_a_retry() {
         .await
         .unwrap();
     // Claim with a 1-second lease and "crash" (never report).
-    let claimed = store.claim_jobs(queue, 1, 1).await.unwrap();
+    let claimed = store.claim_jobs(queue, 1, 1, false).await.unwrap();
     assert_eq!(claimed.jobs.len(), 1);
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
@@ -439,4 +443,100 @@ async fn pg_cron_schedule_fires_exactly_once_per_due_instant() {
     );
 
     engine.delete_cron(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn pg_status_change_wakes_a_job_watcher() {
+    let queue = "test_job_events";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    let engine = Engine::builder(store.clone(), Arc::new(SystemClock))
+        .default_queue(queue)
+        .build();
+
+    let id = engine
+        .enqueue("external", Map::new(), Default::default())
+        .await
+        .unwrap();
+    // Prime the shared LISTEN connection.
+    store
+        .await_job_change(&id, Duration::from_millis(300))
+        .await
+        .unwrap();
+
+    let store2 = store.clone();
+    let id2 = id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        store2.cancel_job_if_active(&id2, "watch me").await.unwrap();
+    });
+    let start = std::time::Instant::now();
+    store
+        .await_job_change(&id, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(8),
+        "the status trigger (not the timeout) should wake the watcher, took {:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn pg_keyset_cursor_pages_without_offset() {
+    let queue = "test_cursor";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    let engine = Engine::builder(store.clone(), Arc::new(SystemClock))
+        .default_queue(queue)
+        .build();
+    for i in 0..5 {
+        engine
+            .enqueue("noop", map(json!({ "i": i })), Default::default())
+            .await
+            .unwrap();
+    }
+
+    let all: Vec<String> = store
+        .list_jobs(&ListFilter {
+            queue: Some(queue.into()),
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|j| j.id)
+        .collect();
+    assert_eq!(all.len(), 5);
+
+    // Walk the same set in pages of 2 via the cursor. The absurd offset on
+    // cursor pages proves the cursor makes OFFSET irrelevant.
+    let mut walked = Vec::new();
+    let mut after: Option<PageCursor> = None;
+    loop {
+        let page = store
+            .list_jobs(&ListFilter {
+                queue: Some(queue.into()),
+                limit: 2,
+                offset: if after.is_some() { 9999 } else { 0 },
+                after: after.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        walked.extend(page.items.iter().map(|j| j.id.clone()));
+        if !page.has_more {
+            break;
+        }
+        let last = page.items.last().expect("has_more implies items");
+        after = Some(PageCursor {
+            created_at: last.created_at,
+            id: last.id.clone(),
+        });
+    }
+    assert_eq!(walked, all, "cursor paging must reproduce the full listing");
 }

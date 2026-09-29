@@ -26,6 +26,11 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
 
+/// Headroom added on top of a job's configured timeout when a claim is asked
+/// to cover it (`cover_timeout` on [`JobStore::claim_jobs`]), leaving room for
+/// post-handler bookkeeping (terminal write, workflow advance).
+pub const LEASE_GRACE_SECS: u64 = 30;
+
 /// Errors a [`JobStore`] can produce.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -45,6 +50,17 @@ pub enum StorageError {
     Serialization(#[from] serde_json::Error),
 }
 
+/// Keyset-pagination cursor: the sort key of the last row of the previous
+/// page. Listing continues strictly after it in the filter's sort order, so
+/// deep pages cost the same as page one (OFFSET scans and discards
+/// everything it skips). `id` is the row id as text (dead-letter ids are the
+/// integer rendered in decimal).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageCursor {
+    pub created_at: DateTime<Utc>,
+    pub id: String,
+}
+
 /// Filter + pagination for listing jobs or workflows.
 #[derive(Clone, Debug)]
 pub struct ListFilter {
@@ -60,6 +76,10 @@ pub struct ListFilter {
     /// full `COUNT(*)` over the filtered set on Postgres, which large tables
     /// pay for on every page. `has_more` is always computed cheaply.
     pub include_total: bool,
+    /// Resume listing strictly after this row (keyset pagination). When set,
+    /// `offset` is ignored. `total`, when requested, still counts the whole
+    /// filtered set, not the remainder.
+    pub after: Option<PageCursor>,
 }
 
 impl Default for ListFilter {
@@ -72,6 +92,7 @@ impl Default for ListFilter {
             offset: 0,
             order_desc: true,
             include_total: false,
+            after: None,
         }
     }
 }
@@ -96,6 +117,21 @@ pub struct Claimed {
     /// (a backoff retry or a `run_at` job) becomes due, instead of on a poll
     /// tick. `None` when jobs were claimed or the queue is empty.
     pub next_due: Option<DateTime<Utc>>,
+    /// The queue's work epoch as observed *before* the claim ran. Passing it
+    /// to [`JobStore::await_work`] closes the missed-wakeup window: a
+    /// notification that lands between the empty claim and the park advances
+    /// the epoch, and `await_work` then returns immediately instead of
+    /// sleeping out the poll cap.
+    pub epoch: u64,
+}
+
+/// Confirmation of a lease-guarded terminal write, carrying the finished
+/// job's workflow linkage so callers advancing a workflow do not need to
+/// re-read the row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FinishedJob {
+    pub workflow_id: Option<String>,
+    pub workflow_step_id: Option<String>,
 }
 
 /// Durable storage for jobs and workflows — and, via the claim/lease methods,
@@ -128,11 +164,19 @@ pub trait JobStore: Send + Sync {
     /// incremented. Concurrent claimers never receive the same job
     /// (`FOR UPDATE SKIP LOCKED` on Postgres). Higher `priority` wins, then
     /// earlier `scheduled_at`, then earlier `created_at`.
+    ///
+    /// With `cover_timeout`, each claim's lease is stretched to at least the
+    /// job's configured `timeout_secs` plus [`LEASE_GRACE_SECS`], so a local
+    /// worker that never heartbeats cannot be reaped mid-run and needs no
+    /// separate lease-extension round trip. Heartbeating callers (the remote
+    /// worker protocol) pass `false` to keep short leases and fast crash
+    /// recovery.
     async fn claim_jobs(
         &self,
         queue: &str,
         count: usize,
         lease_secs: u32,
+        cover_timeout: bool,
     ) -> Result<Claimed, StorageError>;
 
     /// Extend a held lease to `lease_secs` from now. Returns the job's current
@@ -150,9 +194,11 @@ pub trait JobStore: Send + Sync {
 
     /// Terminal-state transition guarded by lease ownership: succeeds only if
     /// the job is still `running` under `token`. Stamps `completed_at`, clears
-    /// the lease, records `error` / `result`. Returns `false` when the guard
+    /// the lease, records `error` / `result`. Returns `None` when the guard
     /// failed (lease lost, job already terminal, or cancelled mid-run) — the
     /// caller decides whether that is an idempotent replay or a conflict.
+    /// On success, returns the job's workflow linkage so a workflow advance
+    /// needs no re-read.
     async fn finish_if_leased(
         &self,
         job_id: &str,
@@ -160,14 +206,33 @@ pub trait JobStore: Send + Sync {
         status: JobStatus,
         error: Option<&str>,
         result: Option<&Json>,
-    ) -> Result<bool, StorageError>;
+    ) -> Result<Option<FinishedJob>, StorageError>;
 
     /// Park until work may exist on `queue` or `max_wait` passes. May wake
-    /// spuriously; callers re-claim and loop. Postgres: one shared LISTEN
-    /// connection fans out to all in-process waiters (degrading to a bounded
-    /// sleep if LISTEN is unavailable). Memory: `tokio::sync::Notify`. Either
-    /// way an idle worker holds zero database connections.
-    async fn await_work(&self, queue: &str, max_wait: Duration) -> Result<(), StorageError>;
+    /// spuriously; callers re-claim and loop. `since_epoch` is the epoch a
+    /// preceding [`JobStore::claim_jobs`] observed: if the queue was notified
+    /// after that snapshot, this returns immediately instead of parking, so
+    /// no wakeup is ever lost between claim and park. Postgres: one shared
+    /// LISTEN connection fans out to all in-process waiters (degrading to a
+    /// bounded sleep if LISTEN is unavailable). Memory: `tokio::sync::Notify`.
+    /// Either way an idle worker holds zero database connections.
+    async fn await_work(
+        &self,
+        queue: &str,
+        since_epoch: u64,
+        max_wait: Duration,
+    ) -> Result<(), StorageError>;
+
+    /// Park until `job_id` may have changed status, or `max_wait` passes. May
+    /// wake spuriously; callers re-read the job and loop. Postgres: driven by
+    /// the `jobs_status_notify` trigger over the shared LISTEN connection, so
+    /// idle watchers cost no queries. The default implementation is a plain
+    /// bounded sleep (pure polling), which keeps custom stores working.
+    async fn await_job_change(&self, job_id: &str, max_wait: Duration) -> Result<(), StorageError> {
+        let _ = job_id;
+        tokio::time::sleep(max_wait).await;
+        Ok(())
+    }
 
     /// Atomically cancel a job that is not yet terminal. Returns `true` if the
     /// job was cancelled, `false` if it was already terminal (or missing) — the
@@ -285,6 +350,21 @@ pub trait JobStore: Send + Sync {
     async fn create_workflow(&self, wf: &Workflow) -> Result<(), StorageError>;
     async fn get_workflow(&self, id: &str) -> Result<Workflow, StorageError>;
     async fn list_workflows(&self, filter: &ListFilter) -> Result<Page<Workflow>, StorageError>;
+
+    /// The workflow's status alone — a one-column read for the hot
+    /// advancement path, which needs terminal checks far more often than the
+    /// full step definitions. The default delegates to
+    /// [`JobStore::get_workflow`].
+    async fn get_workflow_status(&self, id: &str) -> Result<WorkflowStatus, StorageError> {
+        Ok(self.get_workflow(id).await?.status)
+    }
+
+    /// The workflow's accumulated context alone — read by the scheduler once
+    /// per advancement round instead of once per scheduled step. The default
+    /// delegates to [`JobStore::get_workflow`].
+    async fn get_workflow_context(&self, id: &str) -> Result<Map, StorageError> {
+        Ok(self.get_workflow(id).await?.context)
+    }
 
     /// `(step_name, status, linked_job_id)` for every step of a workflow.
     async fn workflow_step_statuses(

@@ -64,6 +64,14 @@ pub struct CreateJobOptions {
     pub priority: Option<i32>,
     pub max_retries: Option<u32>,
     pub timeout_secs: Option<u64>,
+    /// How retry delays grow between attempts (server default: exponential).
+    pub retry_backoff: Option<BackoffStrategy>,
+    /// Base retry delay, in seconds.
+    pub retry_delay_secs: Option<u64>,
+    /// Upper bound on any computed retry delay, in seconds.
+    pub retry_max_delay_secs: Option<u64>,
+    /// Retry-delay jitter in `0.0..=1.0` (e.g. `0.1` = +/-10%).
+    pub jitter_factor: Option<f64>,
     /// Makes the create idempotent per tenant (sent as `Idempotency-Key`).
     pub idempotency_key: Option<String>,
     /// Don't run before this instant. The job is created immediately but
@@ -80,6 +88,9 @@ pub struct ListQuery {
     pub offset: Option<i64>,
     /// Ask the server for the exact total (extra count query server-side).
     pub include_total: bool,
+    /// Opaque keyset cursor from a previous page's `next_cursor`. When set,
+    /// `offset` is ignored server-side; cheaper than deep OFFSET paging.
+    pub cursor: Option<String>,
 }
 
 /// One page of jobs or workflows.
@@ -89,6 +100,9 @@ pub struct JobsPage {
     pub has_more: bool,
     #[serde(default)]
     pub total: Option<i64>,
+    /// Pass back as [`ListQuery::cursor`] to fetch the next page.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -97,6 +111,8 @@ pub struct WorkflowsPage {
     pub has_more: bool,
     #[serde(default)]
     pub total: Option<i64>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 /// One page of dead letters.
@@ -106,6 +122,8 @@ pub struct DeadLettersPage {
     pub has_more: bool,
     #[serde(default)]
     pub total: Option<i64>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 /// One page of cron schedules.
@@ -115,6 +133,8 @@ pub struct CronsPage {
     pub has_more: bool,
     #[serde(default)]
     pub total: Option<i64>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -127,6 +147,14 @@ struct JobConfigBody<'a> {
     timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     queue: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_backoff: Option<BackoffStrategy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_delay_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_max_delay_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jitter_factor: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -211,6 +239,11 @@ impl JobEvents {
                     if let Some(v) = line.strip_prefix("event:") {
                         name = v.trim();
                     } else if let Some(v) = line.strip_prefix("data:") {
+                        // Per the SSE spec, multiple data lines join with a
+                        // newline.
+                        if !data.is_empty() {
+                            data.push('\n');
+                        }
                         data.push_str(v.trim_start());
                     }
                 }
@@ -309,6 +342,10 @@ impl Client {
                 max_retries: opts.max_retries,
                 timeout: opts.timeout_secs,
                 queue: opts.queue.as_deref(),
+                retry_backoff: opts.retry_backoff,
+                retry_delay_secs: opts.retry_delay_secs,
+                retry_max_delay_secs: opts.retry_max_delay_secs,
+                jitter_factor: opts.jitter_factor,
             },
         });
         if let Some(run_at) = &opts.run_at {
@@ -715,6 +752,9 @@ fn apply_list_query(req: reqwest::RequestBuilder, q: &ListQuery) -> reqwest::Req
     }
     if q.include_total {
         params.push(("include_total", "true".into()));
+    }
+    if let Some(c) = &q.cursor {
+        params.push(("cursor", c.clone()));
     }
     req.query(&params)
 }

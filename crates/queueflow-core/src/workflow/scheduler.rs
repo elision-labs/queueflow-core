@@ -89,7 +89,9 @@ where
 
         for root in &roots {
             if let Some(step) = wf.steps.iter().find(|s| &s.name == root) {
-                self.enqueue_step(&wf, step).await?;
+                // Roots have no dependencies, so the freshly persisted
+                // context is complete as-is; no store read needed.
+                self.enqueue_step(&wf, step, &wf.context).await?;
             }
         }
 
@@ -223,6 +225,12 @@ where
                 .collect();
 
             let mut changed = false;
+            // The context is read at most once per round, lazily, on the
+            // first step that becomes ready. Reading it *after* the status
+            // snapshot above preserves the guarantee fan-in steps rely on:
+            // a dependency observed Completed has already merged its result
+            // (merge-before-status ordering in `on_step_completed`).
+            let mut context: Option<Map> = None;
             for step in &wf.steps {
                 let name = step.name.as_str();
                 let current = status_by_name
@@ -237,7 +245,11 @@ where
                     status_by_name.get(d.as_str()).copied() == Some(StepStatus::Completed)
                 });
                 if step.depends_on.is_empty() || deps_completed {
-                    self.enqueue_step(&wf, step).await?;
+                    if context.is_none() {
+                        context = Some(self.store.get_workflow_context(workflow_id).await?);
+                    }
+                    self.enqueue_step(&wf, step, context.as_ref().unwrap())
+                        .await?;
                     changed = true;
                 } else {
                     let dep_unsatisfiable = step.depends_on.iter().any(|d| {
@@ -273,12 +285,12 @@ where
     /// Recompute and persist the workflow's aggregate status when all steps are
     /// terminal.
     async fn aggregate(&self, workflow_id: &str) -> Result<(), EngineError> {
-        // Don't override an already-decided (terminal) workflow.
+        // Don't override an already-decided (terminal) workflow. Status-only
+        // read: the full workflow (steps included) is not needed here.
         if self
             .store
-            .get_workflow(workflow_id)
+            .get_workflow_status(workflow_id)
             .await?
-            .status
             .is_terminal()
         {
             return Ok(());
@@ -318,24 +330,24 @@ where
     /// Create a job for a single step, injecting the workflow context. The
     /// insert *is* the publish, so the only ordering that matters is the
     /// step->job claim below.
+    ///
+    /// `context` must have been read *after* the caller observed the
+    /// dependency statuses that made this step ready. Combined with the
+    /// merge-before-status ordering in [`Self::on_step_completed`], seeing a
+    /// dependency `Completed` guarantees its result is already visible to
+    /// that read, so a fan-in step can never be scheduled with a partial
+    /// `_context`.
     async fn enqueue_step(
         &self,
         wf: &Workflow,
         step: &WorkflowStep,
+        context: &Map,
     ) -> Result<String, EngineError> {
-        // Read the context *after* the caller observed the dependency
-        // statuses that made this step ready. Combined with the
-        // merge-before-status ordering in [`Self::on_step_completed`], seeing
-        // a dependency `Completed` guarantees its result is already visible
-        // to this read, so a fan-in step can never be scheduled with a
-        // partial `_context`.
-        let context = self.store.get_workflow(&wf.id).await?.context;
-
         let mut payload = step.payload.clone();
         if !context.is_empty() {
             payload.insert(
                 CONTEXT_KEY.to_string(),
-                serde_json::to_value(&context).unwrap_or(Json::Null),
+                serde_json::to_value(context).unwrap_or(Json::Null),
             );
         }
 

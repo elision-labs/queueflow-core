@@ -26,6 +26,11 @@ impl EngineStats {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[inline]
+    pub(crate) fn add(counter: &AtomicU64, n: u64) {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// A consistent-enough point-in-time copy for scraping.
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {

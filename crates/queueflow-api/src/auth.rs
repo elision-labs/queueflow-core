@@ -49,6 +49,23 @@ impl AuthConfig {
     }
 }
 
+/// An [`AuthConfig`] prepared for per-request validation: the JWT decoding
+/// key is derived from the secret once, not on every request.
+pub struct AuthState {
+    pub config: AuthConfig,
+    jwt_key: Option<jsonwebtoken::DecodingKey>,
+}
+
+impl From<AuthConfig> for AuthState {
+    fn from(config: AuthConfig) -> Self {
+        let jwt_key = config
+            .jwt_secret
+            .as_ref()
+            .map(|s| jsonwebtoken::DecodingKey::from_secret(s.as_bytes()));
+        Self { config, jwt_key }
+    }
+}
+
 /// Parse `--api-keys` input: comma-separated `token:tenant` pairs.
 pub fn parse_api_keys(raw: &str) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
@@ -103,7 +120,7 @@ pub async fn bearer_auth(
     let Some(token) = bearer_token(&req) else {
         return Err(ApiError(EngineError::Unauthorized));
     };
-    if let Some(worker_token) = &state.auth.worker_token {
+    if let Some(worker_token) = &state.auth.config.worker_token {
         if ct_eq(token, worker_token) {
             return Err(ApiError(EngineError::Forbidden));
         }
@@ -123,7 +140,7 @@ pub async fn worker_auth(
     let Some(token) = bearer_token(&req) else {
         return Err(ApiError(EngineError::Unauthorized));
     };
-    match &state.auth.worker_token {
+    match &state.auth.config.worker_token {
         Some(expected) if ct_eq(token, expected) => Ok(next.run(req).await),
         Some(_) => {
             // Authenticated as something else (e.g. a tenant): forbidden, not
@@ -152,10 +169,9 @@ struct Claims {
     sub: String,
 }
 
-fn validate_jwt(secret: &str, token: &str) -> Option<String> {
-    let key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
+fn validate_jwt(key: &jsonwebtoken::DecodingKey, token: &str) -> Option<String> {
     let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-    match jsonwebtoken::decode::<Claims>(token, &key, &validation) {
+    match jsonwebtoken::decode::<Claims>(token, key, &validation) {
         Ok(data) => Some(data.claims.sub),
         Err(e) => {
             tracing::debug!(error = %e, "jwt rejected");
@@ -165,19 +181,19 @@ fn validate_jwt(secret: &str, token: &str) -> Option<String> {
 }
 
 /// Validate a tenant credential and return its tenant id.
-fn validate_token(cfg: &AuthConfig, token: &str) -> Option<String> {
+fn validate_token(auth: &AuthState, token: &str) -> Option<String> {
     // Static API keys first: exact, constant-time comparison per key.
-    for (key, tenant) in &cfg.api_keys {
+    for (key, tenant) in &auth.config.api_keys {
         if ct_eq(token, key) {
             return Some(tenant.clone());
         }
     }
-    if let Some(secret) = &cfg.jwt_secret {
-        if let Some(sub) = validate_jwt(secret, token) {
+    if let Some(key) = &auth.jwt_key {
+        if let Some(sub) = validate_jwt(key, token) {
             return Some(sub);
         }
     }
-    if cfg.strict() {
+    if auth.config.strict() {
         // Real auth is configured and nothing matched.
         None
     } else if token.is_empty() {
@@ -190,7 +206,7 @@ fn validate_token(cfg: &AuthConfig, token: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ct_eq, parse_api_keys, validate_token, AuthConfig};
+    use super::{ct_eq, parse_api_keys, validate_token, AuthConfig, AuthState};
 
     #[test]
     fn ct_eq_matches_equal_strings_only() {
@@ -218,23 +234,25 @@ mod tests {
 
     #[test]
     fn strict_mode_disables_the_placeholder() {
-        let dev = AuthConfig::default();
+        let dev: AuthState = AuthConfig::default().into();
         assert_eq!(validate_token(&dev, "anything"), Some("tenant1".into()));
 
-        let strict = AuthConfig {
+        let strict: AuthState = AuthConfig {
             api_keys: vec![("k1".into(), "acme".into())],
             ..Default::default()
-        };
+        }
+        .into();
         assert_eq!(validate_token(&strict, "k1"), Some("acme".into()));
         assert_eq!(validate_token(&strict, "anything"), None);
     }
 
     #[test]
     fn jwt_subject_becomes_the_tenant() {
-        let cfg = AuthConfig {
+        let cfg: AuthState = AuthConfig {
             jwt_secret: Some("s3cret".into()),
             ..Default::default()
-        };
+        }
+        .into();
         let exp = (chrono::Utc::now().timestamp() + 3600) as usize;
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::default(), // HS256

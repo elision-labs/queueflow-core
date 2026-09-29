@@ -312,6 +312,12 @@ pub struct ServeArgs {
     #[arg(long, env = "QUEUEFLOW_API_KEYS")]
     pub api_keys: Option<String>,
 
+    /// Comma-separated list of origins allowed by CORS
+    /// (e.g. "https://app.example.com,https://admin.example.com").
+    /// Unset = permissive CORS (development mode).
+    #[arg(long, env = "QUEUEFLOW_CORS_ORIGINS")]
+    pub cors_origins: Option<String>,
+
     /// Maximum database connections in the pool.
     #[arg(long, env = "QUEUEFLOW_MAX_DB_CONNECTIONS", default_value_t = 50)]
     pub max_db_connections: u32,

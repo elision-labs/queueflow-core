@@ -22,6 +22,16 @@ fn map(v: serde_json::Value) -> Map {
         .collect()
 }
 
+fn batch_item(task: &str, payload: Map, config: Option<JobConfig>) -> BatchItem {
+    BatchItem {
+        task_name: task.into(),
+        payload,
+        config,
+        queue: None,
+        run_at: None,
+    }
+}
+
 struct Harness {
     engine: Arc<Mem>,
     store: Arc<InMemoryJobStore>,
@@ -466,7 +476,7 @@ async fn expired_lease_consumes_retry_budget_then_dead_letters() {
         .unwrap();
 
     // "Crash" 1: claim directly (simulating a worker that died mid-run).
-    let claimed = h.store.claim_jobs("default", 1, 30).await.unwrap();
+    let claimed = h.store.claim_jobs("default", 1, 30, false).await.unwrap();
     assert_eq!(claimed.jobs.len(), 1);
     h.clock.advance_secs(31);
     let report = h.engine.janitor_sweep().await;
@@ -478,7 +488,7 @@ async fn expired_lease_consumes_retry_budget_then_dead_letters() {
 
     // "Crash" 2 after the backoff: budget exhausted → DLQ.
     h.clock.advance_secs(61);
-    let claimed = h.store.claim_jobs("default", 1, 30).await.unwrap();
+    let claimed = h.store.claim_jobs("default", 1, 30, false).await.unwrap();
     assert_eq!(claimed.jobs.len(), 1);
     h.clock.advance_secs(31);
     let report = h.engine.janitor_sweep().await;
@@ -661,9 +671,9 @@ async fn batch_enqueue_creates_all_jobs() {
         .engine
         .enqueue_batch(
             vec![
-                ("echo".into(), map(json!({"i": 1})), None),
-                ("echo".into(), map(json!({"i": 2})), None),
-                ("echo".into(), map(json!({"i": 3})), None),
+                batch_item("echo", map(json!({"i": 1})), None),
+                batch_item("echo", map(json!({"i": 2})), None),
+                batch_item("echo", map(json!({"i": 3})), None),
             ],
             Some("tenant-a".into()),
         )
@@ -819,8 +829,8 @@ async fn absurd_job_config_is_rejected_at_enqueue() {
     let err = h
         .engine
         .enqueue_batch(
-            vec![(
-                "echo".into(),
+            vec![batch_item(
+                "echo",
                 Map::new(),
                 Some(JobConfig {
                     timeout_secs: 0,

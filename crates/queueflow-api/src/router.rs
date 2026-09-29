@@ -1,11 +1,13 @@
 //! HTTP router assembly.
 
-use axum::http::header;
+use std::sync::LazyLock;
+
+use axum::http::{header, HeaderValue};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
-use axum::{middleware, Json, Router};
+use axum::{middleware, Router};
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 
@@ -13,6 +15,18 @@ use crate::auth::{bearer_auth, worker_auth};
 use crate::handlers;
 use crate::openapi::ApiDoc;
 use crate::ApiState;
+
+/// The OpenAPI document, rendered once: it is immutable for the process
+/// lifetime, so serializing it per request is pure waste.
+static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
+    serde_json::to_string(&ApiDoc::openapi()).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to serialize the OpenAPI document");
+        String::from("{}")
+    })
+});
+
+static OPENAPI_YAML: LazyLock<String> =
+    LazyLock::new(|| ApiDoc::openapi().to_yaml().unwrap_or_default());
 
 /// Build the full application router for the given engine state.
 pub fn build_router(state: ApiState) -> Router {
@@ -60,6 +74,29 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/jobs/{id}/heartbeat", post(handlers::heartbeat_job))
         .route_layer(middleware::from_fn_with_state(state.clone(), worker_auth));
 
+    // CORS: permissive is the development default; configured origins
+    // restrict it (invalid entries are skipped with a warning rather than
+    // silently allowing everything).
+    let cors = if state.cors_origins.is_empty() {
+        CorsLayer::permissive()
+    } else {
+        let origins: Vec<HeaderValue> = state
+            .cors_origins
+            .iter()
+            .filter_map(|o| match o.parse::<HeaderValue>() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    tracing::warn!(origin = %o, "ignoring invalid CORS origin");
+                    None
+                }
+            })
+            .collect();
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any)
+    };
+
     Router::new()
         .route("/health", get(handlers::health))
         .route("/ready", get(handlers::ready))
@@ -68,18 +105,23 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/docs", get(docs_ui))
         .nest("/api/v1", tenant.merge(worker))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .layer(CompressionLayer::new())
         .with_state(state)
 }
 
-async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
+async fn openapi_json() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        OPENAPI_JSON.as_str(),
+    )
 }
 
 async fn openapi_yaml() -> impl IntoResponse {
-    let yaml = ApiDoc::openapi().to_yaml().unwrap_or_default();
-    ([(header::CONTENT_TYPE, "application/yaml")], yaml)
+    (
+        [(header::CONTENT_TYPE, "application/yaml")],
+        OPENAPI_YAML.as_str(),
+    )
 }
 
 /// Minimal Swagger UI page (loaded from a CDN) pointed at `/openapi.json`.
