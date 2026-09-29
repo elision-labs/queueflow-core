@@ -163,11 +163,16 @@ impl QueueFlow {
         schedule: &str,
         task: &str,
     ) -> Result<String, FacadeError> {
-        let req = models::CreateCronRequest::new(
-            name.to_owned(),
-            schedule.to_owned(),
-            task.to_owned(),
-        );
+        // Named fields, not the positional constructor: name/cron_expr are
+        // both strings and were once swapped silently.
+        let req = models::CreateCronRequest {
+            config: None,
+            cron_expr: schedule.to_owned(),
+            name: name.to_owned(),
+            payload: None,
+            queue: None,
+            task_name: task.to_owned(),
+        };
         let resp = cron_api::create_cron(&self.config, req)
             .await
             .map_err(api_err)?;

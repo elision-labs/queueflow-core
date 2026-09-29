@@ -61,6 +61,14 @@ paths:
         required: false
         schema:
           type: boolean
+      - name: cursor
+        in: query
+        description: |-
+          Opaque keyset cursor from a previous page's `next_cursor`. When set,
+          `offset` is ignored and listing continues where that page ended.
+        required: false
+        schema:
+          type: string
       responses:
         '200':
           description: Page of cron schedules (`status`/`queue` filters do not apply)
@@ -302,6 +310,14 @@ paths:
         required: false
         schema:
           type: boolean
+      - name: cursor
+        in: query
+        description: |-
+          Opaque keyset cursor from a previous page's `next_cursor`. When set,
+          `offset` is ignored and listing continues where that page ended.
+        required: false
+        schema:
+          type: string
       responses:
         '200':
           description: Page of dead letters, newest first (the `status` filter does not apply)
@@ -449,6 +465,14 @@ paths:
         required: false
         schema:
           type: boolean
+      - name: cursor
+        in: query
+        description: |-
+          Opaque keyset cursor from a previous page's `next_cursor`. When set,
+          `offset` is ignored and listing continues where that page ended.
+        required: false
+        schema:
+          type: string
       responses:
         '200':
           description: Page of jobs
@@ -905,6 +929,14 @@ paths:
         required: false
         schema:
           type: boolean
+      - name: cursor
+        in: query
+        description: |-
+          Opaque keyset cursor from a previous page's `next_cursor`. When set,
+          `offset` is ignored and listing continues where that page ended.
+        required: false
+        schema:
+          type: string
       responses:
         '200':
           description: Page of workflows
@@ -1530,13 +1562,17 @@ components:
           description: The owning workflow step's name (steps are addressed by name).
     JobConfig:
       type: object
-      description: Per-job execution configuration. All durations are in seconds.
-      required:
-      - max_retries
-      - retry_delay_secs
-      - timeout_secs
-      - priority
-      - retry_max_delay_secs
+      description: |-
+        Per-job execution configuration. All durations are in seconds.
+
+        Deserialization is partial-friendly: any omitted field takes its
+        [`JobConfig::default`] value (via per-field serde defaults), so
+        workflow-step and cron config overrides can name just the fields they
+        change, and out-of-band rows with sparse `config` JSONB still load.
+        Per-field functions rather than a struct-level `#[serde(default)]`:
+        the struct-level form makes utoipa attach a `default` beside the
+        `BackoffStrategy` `$ref`, which forces a synthetic wrapper type into
+        every generated SDK.
       properties:
         jitter_factor:
           type:
@@ -1574,6 +1610,12 @@ components:
       type: object
       description: Optional per-job configuration overrides.
       properties:
+        jitter_factor:
+          type:
+          - number
+          - 'null'
+          format: double
+          description: Retry-delay jitter in `0.0..=1.0` (e.g. `0.1` = +/-10%).
         max_retries:
           type:
           - integer
@@ -1591,6 +1633,25 @@ components:
           - string
           - 'null'
           description: Override the destination queue.
+        retry_backoff:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/BackoffStrategy'
+            description: How retry delays grow between attempts (default exponential).
+        retry_delay_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Base retry delay, in seconds.
+          minimum: 0
+        retry_max_delay_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Upper bound on any computed retry delay, in seconds.
+          minimum: 0
         timeout:
           type:
           - integer
@@ -1675,6 +1736,14 @@ components:
         limit:
           type: integer
           format: int64
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Opaque keyset cursor for the next page (present when `has_more`).
+            Pass it back as `cursor` to continue where this page ended; cheaper
+            than deep OFFSET paging.
         offset:
           type: integer
           format: int64
@@ -1701,6 +1770,14 @@ components:
         limit:
           type: integer
           format: int64
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Opaque keyset cursor for the next page (present when `has_more`).
+            Pass it back as `cursor` to continue where this page ended; cheaper
+            than deep OFFSET paging.
         offset:
           type: integer
           format: int64
@@ -1727,6 +1804,14 @@ components:
         limit:
           type: integer
           format: int64
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Opaque keyset cursor for the next page (present when `has_more`).
+            Pass it back as `cursor` to continue where this page ended; cheaper
+            than deep OFFSET paging.
         offset:
           type: integer
           format: int64
@@ -1752,6 +1837,14 @@ components:
         limit:
           type: integer
           format: int64
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Opaque keyset cursor for the next page (present when `has_more`).
+            Pass it back as `cursor` to continue where this page ended; cheaper
+            than deep OFFSET paging.
         offset:
           type: integer
           format: int64

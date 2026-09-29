@@ -48,3 +48,24 @@ dependencies, cycles) and raises `WorkflowValidationError` before any network ro
 The facade is injected at generation time from the queueflow-core-rs template
 (`sdk-templates/python/facade.mustache`), so it is regenerated alongside the generated core and can
 never drift from the server. Do not edit `queueflow/facade.py` directly; edit the template.
+
+## Worker protocol notes
+
+`qf.worker` exposes the raw worker endpoints (lease, heartbeat, complete, fail); no worker
+runtime ships with this SDK. Three rules keep the at-least-once contract honest:
+
+1. Worker routes authenticate with the **worker token**, not a tenant token. Pass it as
+   `QueueFlow(base_url, token, worker_token=...)` and `qf.worker` will use it; without it,
+   `qf.worker` reuses the tenant token, which only works in the server's development mode.
+2. Heartbeat every in-flight job at roughly half its lease interval. A heartbeat whose `status`
+   is anything other than `running` (or an HTTP 409) means the server owns the outcome: abandon
+   the handler and report nothing. Never process a leased batch sequentially without
+   heartbeating the jobs still waiting - their leases expire and the server redelivers them.
+3. Delivery is at-least-once, so handlers must be idempotent. Report permanent failures with
+   `retryable=False` so they dead-letter immediately instead of burning retries.
+
+## Known limitation: stream_job_events
+
+`JobsApi.stream_job_events` cannot stream: it buffers the whole SSE response until the server
+closes it (terminal status or the 15-minute cap). Use `wait_for_job` (polling) instead, or the
+`stream_job_events_without_preload_content` variant with a hand-rolled SSE parser.

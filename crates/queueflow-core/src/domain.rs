@@ -130,16 +130,30 @@ pub enum BackoffStrategy {
 }
 
 /// Per-job execution configuration. All durations are in seconds.
+///
+/// Deserialization is partial-friendly: any omitted field takes its
+/// [`JobConfig::default`] value (via per-field serde defaults), so
+/// workflow-step and cron config overrides can name just the fields they
+/// change, and out-of-band rows with sparse `config` JSONB still load.
+/// Per-field functions rather than a struct-level `#[serde(default)]`:
+/// the struct-level form makes utoipa attach a `default` beside the
+/// `BackoffStrategy` `$ref`, which forces a synthetic wrapper type into
+/// every generated SDK.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct JobConfig {
+    #[serde(default = "defaults::max_retries")]
     pub max_retries: u32,
+    #[serde(default = "defaults::retry_delay_secs")]
     pub retry_delay_secs: u64,
+    #[serde(default = "defaults::timeout_secs")]
     pub timeout_secs: u64,
     /// Higher is claimed first within a queue; ties break on `scheduled_at`,
     /// then `created_at`.
+    #[serde(default)]
     pub priority: i32,
     #[serde(default)]
     pub retry_backoff: BackoffStrategy,
+    #[serde(default = "defaults::retry_max_delay_secs")]
     pub retry_max_delay_secs: u64,
     /// Optional jitter in `0.0..=1.0`. `0.1` => +/-10% randomization of each
     /// retry delay, which spreads out thundering-herd retries.
@@ -147,17 +161,34 @@ pub struct JobConfig {
     pub jitter_factor: Option<f64>,
 }
 
+/// Per-field serde defaults for [`JobConfig`]; keep in sync with
+/// [`JobConfig::default`].
+mod defaults {
+    pub(super) fn max_retries() -> u32 {
+        3
+    }
+    pub(super) fn retry_delay_secs() -> u64 {
+        60
+    }
+    pub(super) fn timeout_secs() -> u64 {
+        300
+    }
+    pub(super) fn retry_max_delay_secs() -> u64 {
+        3600
+    }
+}
+
 impl Default for JobConfig {
     /// Sensible defaults: 3 retries, 60s base delay, 5m timeout, exponential
     /// backoff capped at 1h, plus a little jitter.
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            retry_delay_secs: 60,
-            timeout_secs: 300,
+            max_retries: defaults::max_retries(),
+            retry_delay_secs: defaults::retry_delay_secs(),
+            timeout_secs: defaults::timeout_secs(),
             priority: 0,
             retry_backoff: BackoffStrategy::Exponential,
-            retry_max_delay_secs: 3600,
+            retry_max_delay_secs: defaults::retry_max_delay_secs(),
             jitter_factor: Some(0.1),
         }
     }
@@ -473,6 +504,28 @@ mod tests {
     #[test]
     fn on_failure_defaults_to_halt() {
         assert_eq!(OnFailure::default(), OnFailure::Halt);
+    }
+
+    #[test]
+    fn partial_job_config_fills_defaults() {
+        // Workflow-step and cron config overrides name only the fields they
+        // change; everything else must come from the defaults.
+        let c: JobConfig = serde_json::from_str(r#"{"max_retries": 7}"#).unwrap();
+        assert_eq!(c.max_retries, 7);
+        assert_eq!(c.timeout_secs, JobConfig::default().timeout_secs);
+        assert_eq!(c.retry_backoff, BackoffStrategy::Exponential);
+
+        // jitter_factor keeps its field-level default (None when absent):
+        // stored configs omit a None jitter, so absent-means-None is what
+        // keeps round-trips faithful.
+        let empty: JobConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            empty,
+            JobConfig {
+                jitter_factor: None,
+                ..JobConfig::default()
+            }
+        );
     }
 
     #[test]

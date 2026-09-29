@@ -86,6 +86,15 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page's `next_cursor`. When set,\n`offset` is ignored and listing continues where that page ended.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -483,6 +492,15 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page's `next_cursor`. When set,\n`offset` is ignored and listing continues where that page ended.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -719,6 +737,15 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page's `next_cursor`. When set,\n`offset` is ignored and listing continues where that page ended.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1476,6 +1503,15 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page's `next_cursor`. When set,\n`offset` is ignored and listing continues where that page ended.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -2382,14 +2418,7 @@
       },
       "JobConfig": {
         "type": "object",
-        "description": "Per-job execution configuration. All durations are in seconds.",
-        "required": [
-          "max_retries",
-          "retry_delay_secs",
-          "timeout_secs",
-          "priority",
-          "retry_max_delay_secs"
-        ],
+        "description": "Per-job execution configuration. All durations are in seconds.\n\nDeserialization is partial-friendly: any omitted field takes its\n[`JobConfig::default`] value (via per-field serde defaults), so\nworkflow-step and cron config overrides can name just the fields they\nchange, and out-of-band rows with sparse `config` JSONB still load.\nPer-field functions rather than a struct-level `#[serde(default)]`:\nthe struct-level form makes utoipa attach a `default` beside the\n`BackoffStrategy` `$ref`, which forces a synthetic wrapper type into\nevery generated SDK.",
         "properties": {
           "jitter_factor": {
             "type": [
@@ -2433,6 +2462,14 @@
         "type": "object",
         "description": "Optional per-job configuration overrides.",
         "properties": {
+          "jitter_factor": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Retry-delay jitter in `0.0..=1.0` (e.g. `0.1` = +/-10%)."
+          },
           "max_retries": {
             "type": [
               "integer",
@@ -2455,6 +2492,35 @@
               "null"
             ],
             "description": "Override the destination queue."
+          },
+          "retry_backoff": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BackoffStrategy",
+                "description": "How retry delays grow between attempts (default exponential)."
+              }
+            ]
+          },
+          "retry_delay_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Base retry delay, in seconds.",
+            "minimum": 0
+          },
+          "retry_max_delay_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Upper bound on any computed retry delay, in seconds.",
+            "minimum": 0
           },
           "timeout": {
             "type": [
@@ -2564,6 +2630,13 @@
             "type": "integer",
             "format": "int64"
           },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque keyset cursor for the next page (present when `has_more`).\nPass it back as `cursor` to continue where this page ended; cheaper\nthan deep OFFSET paging."
+          },
           "offset": {
             "type": "integer",
             "format": "int64"
@@ -2599,6 +2672,13 @@
           "limit": {
             "type": "integer",
             "format": "int64"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque keyset cursor for the next page (present when `has_more`).\nPass it back as `cursor` to continue where this page ended; cheaper\nthan deep OFFSET paging."
           },
           "offset": {
             "type": "integer",
@@ -2636,6 +2716,13 @@
             "type": "integer",
             "format": "int64"
           },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque keyset cursor for the next page (present when `has_more`).\nPass it back as `cursor` to continue where this page ended; cheaper\nthan deep OFFSET paging."
+          },
           "offset": {
             "type": "integer",
             "format": "int64"
@@ -2665,6 +2752,13 @@
           "limit": {
             "type": "integer",
             "format": "int64"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque keyset cursor for the next page (present when `has_more`).\nPass it back as `cursor` to continue where this page ended; cheaper\nthan deep OFFSET paging."
           },
           "offset": {
             "type": "integer",

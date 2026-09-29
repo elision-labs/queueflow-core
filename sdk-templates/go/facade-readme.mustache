@@ -63,3 +63,25 @@ dependencies, cycles) and returns an error before any network round-trip.
 The facade is injected at generation time from the queueflow-core-rs template
 (`sdk-templates/go/facade.mustache`), so it is regenerated alongside the generated core and can never
 drift from the server. Do not edit `facade.go` directly; edit the template.
+
+## Worker protocol notes
+
+The worker endpoints (`WorkerAPI`: lease, heartbeat, complete, fail) are exposed as raw calls;
+no worker runtime ships with this SDK. If you build one on top, three rules keep the
+at-least-once contract honest:
+
+1. Worker routes authenticate with the **worker token**, not a tenant token. Build a second
+   client for it (`NewConfiguration()` + `AddDefaultHeader("Authorization", "Bearer "+workerToken)`).
+2. Heartbeat every in-flight job at roughly half its lease interval. A heartbeat whose `status`
+   is anything other than `running` (or an HTTP 409) means the server owns the outcome: abandon
+   the handler and report nothing. Never process a leased batch sequentially without
+   heartbeating the jobs still waiting - their leases expire and the server redelivers them.
+3. Delivery is at-least-once, so handlers must be idempotent. Report permanent failures with
+   `retryable: false` so they dead-letter immediately instead of burning retries.
+
+## Known limitation: StreamJobEvents
+
+`JobsAPI.StreamJobEvents` cannot consume the server's SSE stream: it buffers the whole response
+until the stream closes (terminal status or the 15-minute cap) and returns it as one string.
+Use `WaitForJob` (polling) instead, or a hand-rolled SSE consumer over
+`GET /api/v1/jobs/{id}/events`.

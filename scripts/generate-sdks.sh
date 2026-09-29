@@ -142,6 +142,20 @@ generate() {
       echo "WARNING: go toolchain not found; run 'go mod tidy' in ${out} manually." >&2
     fi
   fi
+
+  # The python generator's built-in pyproject/setup templates ship
+  # openapitools placeholders and point mypy at a nonexistent tests/ dir
+  # (ours is test/). Patch them post-generation so the published metadata is
+  # ours and the hand-written test/test_facade.py is actually type-checked.
+  if [[ "${name}" == "python" ]]; then
+    sed -i '' \
+      -e 's|authors = \["QueueFlow <team@openapitools.org>"\]|authors = ["QueueFlow"]|' \
+      -e 's|https://github.com/GIT_USER_ID/GIT_REPO_ID|https://github.com/queueflow/queueflow-sdk-python|' \
+      -e 's|#"test",  # auto-generated tests|"test",|' \
+      -e 's|"tests", # hand-written tests||' \
+      "${out}/pyproject.toml"
+    sed -i '' 's|team@openapitools.org|team@queueflow.dev|' "${out}/setup.py"
+  fi
 }
 
 targets=("$@")

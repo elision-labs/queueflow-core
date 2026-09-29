@@ -70,10 +70,14 @@ func (q *QueueFlow) WaitForJob(jobID string, timeout, interval time.Duration) (*
 }
 
 // CreateCron registers a recurring enqueue (5-field crontab, evaluated in
-// UTC) and returns the schedule id. Use q.Client.CronAPI for list, pause,
-// resume, and delete.
-func (q *QueueFlow) CreateCron(name, cronExpr, task string) (string, error) {
-	req := CreateCronRequest{Name: name, CronExpr: cronExpr, TaskName: task}
+// UTC) and returns the schedule id. payload is sent with every firing; nil
+// means an empty payload. Use q.Client.CronAPI for list, pause, resume, and
+// delete.
+func (q *QueueFlow) CreateCron(name, cronExpr, task string, payload map[string]interface{}) (string, error) {
+	if payload == nil {
+		payload = map[string]interface{}{}
+	}
+	req := CreateCronRequest{Name: name, CronExpr: cronExpr, TaskName: task, Payload: payload}
 	resp, _, err := q.Client.CronAPI.CreateCron(q.ctx).CreateCronRequest(req).Execute()
 	if err != nil {
 		return "", err

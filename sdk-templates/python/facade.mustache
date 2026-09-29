@@ -46,15 +46,27 @@ class QueueFlow:
     qf = QueueFlow("http://localhost:8000", "dev")
     job = qf.create_job("echo", payload={"hi": 1})
     done = qf.wait_for_job(job.id)
+
+    The worker-protocol routes (``qf.worker``: lease, heartbeat, complete,
+    fail) authenticate with the server's *worker token*, not a tenant token.
+    Pass it as ``worker_token=``; without it, ``qf.worker`` reuses the tenant
+    token, which only works in the server's development mode.
     """
 
-    def __init__(self, base_url: str, token: str) -> None:
+    def __init__(self, base_url: str, token: str, worker_token: Optional[str] = None) -> None:
         config = Configuration(host=base_url.rstrip("/"))
         config.access_token = token
         self._client = ApiClient(config)
         self.jobs = JobsApi(self._client)
         self.workflows = WorkflowsApi(self._client)
-        self.worker = WorkerApi(self._client)
+        if worker_token is not None:
+            worker_config = Configuration(host=base_url.rstrip("/"))
+            worker_config.access_token = worker_token
+            self._worker_client: Optional[ApiClient] = ApiClient(worker_config)
+            self.worker = WorkerApi(self._worker_client)
+        else:
+            self._worker_client = None
+            self.worker = WorkerApi(self._client)
         self.cron = CronApi(self._client)
         self.dlq = DlqApi(self._client)
         self.system = SystemApi(self._client)
@@ -70,15 +82,35 @@ class QueueFlow:
         max_retries: Optional[int] = None,
         timeout: Optional[int] = None,
         queue: Optional[str] = None,
+        retry_backoff: Optional[str] = None,
+        retry_delay_secs: Optional[int] = None,
+        retry_max_delay_secs: Optional[int] = None,
+        jitter_factor: Optional[float] = None,
         idempotency_key: Optional[str] = None,
+        run_at: Optional[Any] = None,
     ) -> Job:
-        """Enqueue a job and return its freshly-created record."""
+        """Enqueue a job and return its freshly-created record.
+
+        run_at (a datetime) delays the first run: the job is created
+        immediately but stays invisible to workers until then.
+        """
         config = None
-        if any(v is not None for v in (priority, max_retries, timeout, queue)):
+        overrides = (
+            priority, max_retries, timeout, queue,
+            retry_backoff, retry_delay_secs, retry_max_delay_secs, jitter_factor,
+        )
+        if any(v is not None for v in overrides):
             config = JobConfigRequest(
-                priority=priority, max_retries=max_retries, timeout=timeout, queue=queue
+                priority=priority,
+                max_retries=max_retries,
+                timeout=timeout,
+                queue=queue,
+                retry_backoff=retry_backoff,
+                retry_delay_secs=retry_delay_secs,
+                retry_max_delay_secs=retry_max_delay_secs,
+                jitter_factor=jitter_factor,
             )
-        req = CreateJobRequest(task_name=task, payload=payload or {}, config=config)
+        req = CreateJobRequest(task_name=task, payload=payload or {}, config=config, run_at=run_at)
         created = self.jobs.create_job(req, idempotency_key=idempotency_key)
         return self.jobs.get_job(created.job_id)
 
@@ -159,7 +191,11 @@ class WorkflowBuilder:
         after: Optional[List[str]] = None,
         payload: Optional[Dict[str, Any]] = None,
         on_failure: Optional[str] = None,
+        on_success: Optional[str] = None,
+        config: Optional[Any] = None,
     ) -> "WorkflowBuilder":
+        """Add a step. config is a models.JobConfig override for this step;
+        the server fills defaults for any field left unset."""
         self._steps.append(
             WorkflowStep(
                 name=name,
@@ -167,6 +203,8 @@ class WorkflowBuilder:
                 depends_on=after or [],
                 payload=payload or {},
                 on_failure=on_failure,
+                on_success=on_success,
+                config=config,
             )
         )
         return self
