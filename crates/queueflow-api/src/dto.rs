@@ -192,6 +192,23 @@ pub struct ReplayDeadLetterResponse {
     pub job_id: String,
 }
 
+/// Runtime status of one workflow step (the live progress view).
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct WorkflowStepState {
+    /// The step's name (its address within the workflow).
+    pub name: String,
+    pub status: queueflow_core::StepStatus,
+    /// The job executing this step, once one has been scheduled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct WorkflowStepStatesResponse {
+    /// One entry per step, in declaration order.
+    pub steps: Vec<WorkflowStepState>,
+}
+
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct WorkflowDiagramResponse {
     /// Diagram source format. Always `mermaid` today.

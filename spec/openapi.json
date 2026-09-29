@@ -1778,6 +1778,72 @@
         ]
       }
     },
+    "/api/v1/workflows/{id}/steps": {
+      "get": {
+        "tags": [
+          "workflows"
+        ],
+        "operationId": "getWorkflowStepStates",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Workflow id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Runtime status of every step, in declaration order. The workflow record carries only step definitions; this is the live progress view.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowStepStatesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/health": {
       "get": {
         "tags": [
@@ -2875,6 +2941,18 @@
           }
         }
       },
+      "StepStatus": {
+        "type": "string",
+        "description": "Lifecycle state of a single workflow step.",
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "cancelled",
+          "skipped"
+        ]
+      },
       "TasksResponse": {
         "type": "object",
         "required": [
@@ -3034,6 +3112,45 @@
           },
           "task_name": {
             "type": "string"
+          }
+        }
+      },
+      "WorkflowStepState": {
+        "type": "object",
+        "description": "Runtime status of one workflow step (the live progress view).",
+        "required": [
+          "name",
+          "status"
+        ],
+        "properties": {
+          "job_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The job executing this step, once one has been scheduled."
+          },
+          "name": {
+            "type": "string",
+            "description": "The step's name (its address within the workflow)."
+          },
+          "status": {
+            "$ref": "#/components/schemas/StepStatus"
+          }
+        }
+      },
+      "WorkflowStepStatesResponse": {
+        "type": "object",
+        "required": [
+          "steps"
+        ],
+        "properties": {
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStepState"
+            },
+            "description": "One entry per step, in declaration order."
           }
         }
       }

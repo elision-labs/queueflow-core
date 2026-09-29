@@ -338,6 +338,40 @@ pub async fn get_workflow_diagram(
     }))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/workflows/{id}/steps", tag = "workflows", operation_id = "getWorkflowStepStates",
+    params(("id" = String, Path, description = "Workflow id")),
+    responses(
+        (status = 200, description = "Runtime status of every step, in declaration order. The workflow \
+                                      record carries only step definitions; this is the live progress view.",
+         body = WorkflowStepStatesResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn get_workflow_step_states(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> Result<Json<WorkflowStepStatesResponse>, ApiError> {
+    let wf = s.engine.get_workflow(&id).await?;
+    ensure_owner(wf.tenant_id.as_deref(), &t)?;
+    let steps = s
+        .engine
+        .workflow_step_statuses(&id)
+        .await?
+        .into_iter()
+        .map(|r| WorkflowStepState {
+            name: r.name,
+            status: r.status,
+            job_id: r.job_id,
+        })
+        .collect();
+    Ok(Json(WorkflowStepStatesResponse { steps }))
+}
+
 /// Stream a job's status transitions as Server-Sent Events until it reaches a
 /// terminal state. Lets clients await completion without polling the REST
 /// endpoint themselves.

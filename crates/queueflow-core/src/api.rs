@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::domain::*;
 use crate::engine::{BatchItem, Engine, EnqueueOptions};
 use crate::error::EngineError;
-use crate::ports::{JobStore, ListFilter, Page};
+use crate::ports::{JobStore, ListFilter, Page, StepRecord};
 use crate::stats::StatsSnapshot;
 
 /// The operations the HTTP API needs from the engine.
@@ -53,6 +53,9 @@ pub trait JobApi: Send + Sync {
     async fn list_workflows(&self, filter: ListFilter) -> Result<Page<Workflow>, EngineError>;
     async fn cancel_workflow(&self, id: &str) -> Result<(), EngineError>;
     async fn workflow_diagram(&self, id: &str) -> Result<String, EngineError>;
+    /// Runtime status of every step, in declaration order (the live
+    /// progress view; the workflow record itself carries only definitions).
+    async fn workflow_step_statuses(&self, id: &str) -> Result<Vec<StepRecord>, EngineError>;
 
     // Dead-letter admin: inspect and replay terminally-failed jobs.
     async fn list_dead_letters(&self, filter: ListFilter) -> Result<Page<DeadLetter>, EngineError>;
@@ -181,6 +184,10 @@ where
 
     async fn workflow_diagram(&self, id: &str) -> Result<String, EngineError> {
         Engine::workflow_diagram(self, id).await
+    }
+
+    async fn workflow_step_statuses(&self, id: &str) -> Result<Vec<StepRecord>, EngineError> {
+        Engine::workflow_step_statuses(self, id).await
     }
 
     async fn create_cron(

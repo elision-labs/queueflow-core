@@ -48,6 +48,10 @@ pub fn build_router(state: ApiState) -> Router {
             get(handlers::get_workflow_diagram),
         )
         .route(
+            "/workflows/{id}/steps",
+            get(handlers::get_workflow_step_states),
+        )
+        .route(
             "/cron",
             post(handlers::create_cron).get(handlers::list_crons),
         )

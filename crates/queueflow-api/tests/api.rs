@@ -776,3 +776,53 @@ async fn cron_endpoints_validate_conflict_and_pause_resume() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn workflow_step_states_expose_live_progress() {
+    let app = app();
+    let body = json!({
+        "name": "progress",
+        "steps": [
+            {"name": "a", "task_name": "echo"},
+            {"name": "b", "task_name": "echo", "depends_on": ["a"]}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/workflows", Some("key"), Some(body)))
+        .await
+        .unwrap();
+    let id = json_body(resp).await["workflow_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/api/v1/workflows/{id}/steps"),
+            Some("key"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let steps = body["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2);
+    // Declaration order preserved; the root step already has a scheduled job,
+    // the gated one does not.
+    assert_eq!(steps[0]["name"], "a");
+    assert!(steps[0]["job_id"].is_string());
+    assert_eq!(steps[1]["name"], "b");
+    assert_eq!(steps[1]["status"], "pending");
+    assert!(steps[1].get("job_id").is_none());
+
+    // Missing workflow: 404, not an empty list.
+    let resp = app
+        .oneshot(req("GET", "/api/v1/workflows/nope/steps", Some("key"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

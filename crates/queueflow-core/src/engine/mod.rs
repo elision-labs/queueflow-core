@@ -387,6 +387,15 @@ where
         self.scheduler.diagram(id).await
     }
 
+    /// Runtime status of every step of a workflow, in declaration order.
+    /// This is the progress view (`GET /workflows/{id}` carries only the
+    /// step *definitions*); a UI rendering live DAG progress needs it.
+    pub async fn workflow_step_statuses(&self, id: &str) -> Result<Vec<StepRecord>, EngineError> {
+        // 404 for a missing workflow rather than an empty list.
+        self.store.get_workflow_status(id).await?;
+        Ok(self.store.workflow_step_statuses(id).await?)
+    }
+
     // ---- Cron schedules ---------------------------------------------------
 
     /// Create a recurring enqueue. The expression (standard 5-field crontab,
