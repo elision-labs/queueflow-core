@@ -72,10 +72,10 @@ fn workflow_terminal(status: models::WorkflowStatus) -> bool {
 /// QueueFlow is an ergonomic wrapper over the generated API modules.
 ///
 /// ```no_run
-/// # async fn demo() -> Result<(), queueflow::FacadeError> {
+/// # async fn demo() -> Result<(), queueflow_sdk::FacadeError> {
 /// use std::time::Duration;
 ///
-/// let qf = queueflow::QueueFlow::new("http://localhost:8000", "dev");
+/// let qf = queueflow_sdk::QueueFlow::new("http://localhost:8000", "dev");
 /// let job = qf.create_job("echo", None).await?;
 /// let done = qf
 ///     .wait_for_job(&job.id, Duration::from_secs(60), Duration::from_millis(500))

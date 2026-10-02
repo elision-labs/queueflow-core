@@ -9,7 +9,7 @@ anything the helpers do not cover.
 ```rust
 use std::time::Duration;
 
-use queueflow::{QueueFlow, WorkflowBuilder};
+use queueflow_sdk::{QueueFlow, WorkflowBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   network round-trip.
 
 Everything else (leasing, heartbeats, batch enqueue, stats, diagrams) is available on the generated
-modules, e.g. `queueflow::apis::worker_api::lease_jobs(&qf.config, ...)`.
+modules, e.g. `queueflow_sdk::apis::worker_api::lease_jobs(&qf.config, ...)`.
 
 ## Worker protocol: use `queueflow-client` instead
 

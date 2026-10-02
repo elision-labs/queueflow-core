@@ -10,9 +10,11 @@
 # generator's built-in default.
 generatorName: rust
 # Baked into git_push.sh and the README; matches the actual GitHub remote.
+# The crate is `queueflow-sdk`: the bare `queueflow` crates.io name belongs to
+# the server/CLI binary (see queueflow-core PUBLISHING.md).
 gitHost: github.com
-gitUserId: queue-flow
-gitRepoId: sdk-rust
+gitUserId: elision-labs
+gitRepoId: queueflow-sdk-rust
 templateDir: /templates
 files:
   facade.mustache:
@@ -22,9 +24,9 @@ files:
     destinationFilename: FACADE.md
     templateType: SupportingFiles
 additionalProperties:
-  packageName: queueflow
+  packageName: queueflow-sdk
   packageVersion: 0.1.0
   hideGenerationTimestamp: true
   # Rendered into Cargo.toml [package] by the Cargo.mustache override.
-  repositoryUrl: https://github.com/queue-flow/sdk-rust
+  repositoryUrl: https://github.com/elision-labs/queueflow-sdk-rust
   homePageUrl: https://queueflow.dev
