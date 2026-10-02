@@ -669,7 +669,11 @@ where
             if self.shutdown.is_cancelled() {
                 break;
             }
-            match self.store.claim_jobs(&queue, 1, self.lease_secs, true).await {
+            match self
+                .store
+                .claim_jobs(&queue, 1, self.lease_secs, true)
+                .await
+            {
                 Ok(mut claimed) => {
                     if let Some(lease) = claimed.jobs.pop() {
                         self.process_job(lease).await;
@@ -714,7 +718,10 @@ where
     /// Claim and process at most one job. Returns whether a job was handled.
     /// Primarily used to drive the engine deterministically in tests.
     pub async fn process_once(&self, queue: &str) -> Result<bool, EngineError> {
-        let mut claimed = self.store.claim_jobs(queue, 1, self.lease_secs, true).await?;
+        let mut claimed = self
+            .store
+            .claim_jobs(queue, 1, self.lease_secs, true)
+            .await?;
         match claimed.jobs.pop() {
             Some(lease) => {
                 self.process_job(lease).await;
@@ -738,7 +745,10 @@ where
     /// `cover_timeout` (as the worker loop's are) guarantee it, so no
     /// per-job lease extension is needed here.
     pub async fn process_job(&self, lease: LeasedJob) {
-        let LeasedJob { mut job, lease_token } = lease;
+        let LeasedJob {
+            mut job,
+            lease_token,
+        } = lease;
 
         let Some(handler) = self.handlers.get(&job.task_name).cloned() else {
             let err = format!("no handler registered for task '{}'", job.task_name);
@@ -944,7 +954,10 @@ where
         loop {
             // cover_timeout = false: remote workers heartbeat, so short
             // leases keep crash recovery fast.
-            let claimed = self.store.claim_jobs(queue, count, lease_secs, false).await?;
+            let claimed = self
+                .store
+                .claim_jobs(queue, count, lease_secs, false)
+                .await?;
             if !claimed.jobs.is_empty() {
                 return Ok(claimed.jobs);
             }

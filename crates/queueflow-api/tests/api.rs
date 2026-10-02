@@ -821,7 +821,12 @@ async fn workflow_step_states_expose_live_progress() {
 
     // Missing workflow: 404, not an empty list.
     let resp = app
-        .oneshot(req("GET", "/api/v1/workflows/nope/steps", Some("key"), None))
+        .oneshot(req(
+            "GET",
+            "/api/v1/workflows/nope/steps",
+            Some("key"),
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);

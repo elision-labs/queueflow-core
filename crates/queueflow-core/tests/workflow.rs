@@ -678,7 +678,12 @@ async fn janitor_heals_a_crash_between_context_merge_and_status_write() {
     let id = c.engine.create_workflow(req, None).await.unwrap();
 
     // Claim both root jobs; drive x through the engine normally.
-    let claimed = c.store.claim_jobs("default", 2, 30, false).await.unwrap().jobs;
+    let claimed = c
+        .store
+        .claim_jobs("default", 2, 30, false)
+        .await
+        .unwrap()
+        .jobs;
     let by_step = |name: &str| {
         claimed
             .iter()

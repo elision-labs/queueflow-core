@@ -1,6 +1,6 @@
 # queueflow-core
 
-The core engine of [QueueFlow](https://github.com/sjriddle/queueflow-core): a
+The core engine of [QueueFlow](https://github.com/elision-labs/queueflow-core): a
 PostgreSQL-native distributed job queue and workflow (DAG) engine.
 
 The jobs table *is* the queue: workers claim due rows with

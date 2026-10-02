@@ -6,7 +6,7 @@
 
 Durable background jobs and real DAG workflows on a database you already run — no Redis, no broker, no separate state store.
 
-[![CI](https://github.com/sjriddle/queueflow-core/actions/workflows/ci.yml/badge.svg)](https://github.com/sjriddle/queueflow-core/actions/workflows/ci.yml)
+[![CI](https://github.com/elision-labs/queueflow-core/actions/workflows/ci.yml/badge.svg)](https://github.com/elision-labs/queueflow-core/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](./rust-toolchain.toml)
 [![OpenAPI 3.1](https://img.shields.io/badge/OpenAPI-3.1-6BA539.svg)](./spec/openapi.yaml)
@@ -379,7 +379,7 @@ Contributions welcome — these are the planned next steps, roughly in priority 
 ## Contributing
 
 ```bash
-git clone https://github.com/sjriddle/queueflow-core
+git clone https://github.com/elision-labs/queueflow-core
 cd queueflow-core
 make test && make clippy && make fmt-check
 ```
@@ -396,8 +396,8 @@ against the in-memory adapters; new endpoints/types are reflected in the OpenAPI
 
 ## Star history
 
-<a href="https://star-history.com/#sjriddle/queueflow-core&Date">
-  <img src="https://api.star-history.com/svg?repos=sjriddle/queueflow-core&type=Date" alt="Star History Chart" width="600">
+<a href="https://star-history.com/#elision-labs/queueflow-core&Date">
+  <img src="https://api.star-history.com/svg?repos=elision-labs/queueflow-core&type=Date" alt="Star History Chart" width="600">
 </a>
 
 ## License

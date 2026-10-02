@@ -1,6 +1,6 @@
 # queueflow-client
 
-Rust client for the [QueueFlow](https://github.com/sjriddle/queueflow-core)
+Rust client for the [QueueFlow](https://github.com/elision-labs/queueflow-core)
 REST API, including a remote worker runtime with automatic heartbeating.
 
 QueueFlow is a PostgreSQL-native job queue and workflow engine. This crate

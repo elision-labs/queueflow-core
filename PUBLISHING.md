@@ -35,7 +35,7 @@ settle any naming debate before step 4.
 - Per-crate `README.md` files: the repository links in the first paragraph.
 - `scripts/publish-crates.sh`: the User-Agent comment URL.
 
-`grep -rn "sjriddle" --include="*.md" --include="*.toml" --include="*.sh"`
+`grep -rn "elision-labs" --include="*.md" --include="*.toml" --include="*.sh"`
 finds every remaining reference.
 
 ## 3. Verify locally

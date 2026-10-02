@@ -1,6 +1,6 @@
 # queueflow-api
 
-The HTTP surface of [QueueFlow](https://github.com/sjriddle/queueflow-core):
+The HTTP surface of [QueueFlow](https://github.com/elision-labs/queueflow-core):
 an axum router plus the utoipa-generated OpenAPI document for the
 PostgreSQL-native job queue and workflow engine.
 

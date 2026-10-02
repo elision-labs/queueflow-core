@@ -25,9 +25,11 @@ test-pg: ## Run Postgres integration tests (needs TEST_DATABASE_URL; any plain P
 
 check-package: ## Prove the packaged queueflow-core builds standalone (catches files missing from the .crate)
 	$(CARGO) package -p queueflow-core --allow-dirty
-	rm -rf target/package-check && mkdir -p target/package-check
-	tar -xzf target/package/queueflow-core-$$($(CARGO) pkgid -p queueflow-core | sed 's/.*#//').crate -C target/package-check
-	cd target/package-check/queueflow-core-* && $(CARGO) build --features postgres
+	# Extract OUTSIDE the workspace tree: in-tree, the standalone build walks
+	# up, finds this workspace manifest, and refuses to build a non-member.
+	rm -rf "$${TMPDIR:-/tmp}/queueflow-package-check" && mkdir -p "$${TMPDIR:-/tmp}/queueflow-package-check"
+	tar -xzf target/package/queueflow-core-$$($(CARGO) pkgid -p queueflow-core | sed 's/.*#//').crate -C "$${TMPDIR:-/tmp}/queueflow-package-check"
+	cd "$${TMPDIR:-/tmp}/queueflow-package-check"/queueflow-core-* && $(CARGO) build --features postgres
 
 fmt: ## Format the code
 	$(CARGO) fmt --all

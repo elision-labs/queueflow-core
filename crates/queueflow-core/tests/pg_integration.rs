@@ -242,7 +242,15 @@ async fn pg_notify_wakes_an_idle_waiter() {
         start.elapsed()
     );
     let _ = q;
-    assert_eq!(store.claim_jobs(queue, 1, 30, false).await.unwrap().jobs.len(), 1);
+    assert_eq!(
+        store
+            .claim_jobs(queue, 1, 30, false)
+            .await
+            .unwrap()
+            .jobs
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

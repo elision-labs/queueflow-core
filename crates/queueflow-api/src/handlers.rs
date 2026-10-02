@@ -149,7 +149,11 @@ pub async fn list_jobs(
     let page = s.engine.list_jobs(filter.clone()).await?;
     let next_cursor = page
         .has_more
-        .then(|| page.items.last().map(|j| encode_cursor(j.created_at, &j.id)))
+        .then(|| {
+            page.items
+                .last()
+                .map(|j| encode_cursor(j.created_at, &j.id))
+        })
         .flatten();
     Ok(Json(ListJobsResponse {
         jobs: page.items,
@@ -254,7 +258,11 @@ pub async fn list_workflows(
     let page = s.engine.list_workflows(filter.clone()).await?;
     let next_cursor = page
         .has_more
-        .then(|| page.items.last().map(|w| encode_cursor(w.created_at, &w.id)))
+        .then(|| {
+            page.items
+                .last()
+                .map(|w| encode_cursor(w.created_at, &w.id))
+        })
         .flatten();
     Ok(Json(ListWorkflowsResponse {
         workflows: page.items,
@@ -590,7 +598,11 @@ pub async fn list_crons(
     let page = s.engine.list_crons(filter.clone()).await?;
     let next_cursor = page
         .has_more
-        .then(|| page.items.last().map(|c| encode_cursor(c.created_at, &c.id)))
+        .then(|| {
+            page.items
+                .last()
+                .map(|c| encode_cursor(c.created_at, &c.id))
+        })
         .flatten();
     Ok(Json(ListCronsResponse {
         crons: page.items,

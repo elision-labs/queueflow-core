@@ -100,7 +100,12 @@ impl WorkHub {
     /// immediately when the epoch advanced past `since_epoch` (a wakeup
     /// raced the caller's empty claim). May wake spuriously; callers
     /// re-claim in a loop.
-    pub(crate) async fn await_work(self: &Arc<Self>, queue: &str, since_epoch: u64, max_wait: Duration) {
+    pub(crate) async fn await_work(
+        self: &Arc<Self>,
+        queue: &str,
+        since_epoch: u64,
+        max_wait: Duration,
+    ) {
         self.ensure_listener().await;
         let signal = self.signal(queue);
         // Register before the epoch re-check so no notification can slip
@@ -180,7 +185,10 @@ impl WorkHub {
                     continue;
                 }
             };
-            if let Err(e) = listener.listen_all([WORK_CHANNEL, JOB_EVENTS_CHANNEL]).await {
+            if let Err(e) = listener
+                .listen_all([WORK_CHANNEL, JOB_EVENTS_CHANNEL])
+                .await
+            {
                 tracing::warn!(error = %e, "LISTEN failed; waiters fall back to bounded polling");
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;

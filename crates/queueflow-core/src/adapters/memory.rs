@@ -322,9 +322,10 @@ impl JobStore for InMemoryJobStore {
             job.started_at.get_or_insert(now);
             job.delivery_count += 1;
             let lease = if cover_timeout {
-                lease_secs
-                    .max((job.config.timeout_secs.saturating_add(LEASE_GRACE_SECS))
-                        .min(u32::MAX as u64) as u32)
+                lease_secs.max(
+                    (job.config.timeout_secs.saturating_add(LEASE_GRACE_SECS)).min(u32::MAX as u64)
+                        as u32,
+                )
             } else {
                 lease_secs
             };
@@ -1102,7 +1103,14 @@ mod tests {
         assert_eq!(c.next_due, Some(j.scheduled_at));
 
         clock.advance_secs(61);
-        assert_eq!(s.claim_jobs("default", 1, 30, false).await.unwrap().jobs.len(), 1);
+        assert_eq!(
+            s.claim_jobs("default", 1, 30, false)
+                .await
+                .unwrap()
+                .jobs
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1201,11 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn await_work_wakes_on_new_job() {
         let (s, _) = store();
-        let epoch = s
-            .claim_jobs("default", 1, 30, false)
-            .await
-            .unwrap()
-            .epoch;
+        let epoch = s.claim_jobs("default", 1, 30, false).await.unwrap().epoch;
         let s2 = s.clone();
         tokio::spawn(async move {
             tokio::time::sleep(StdDuration::from_millis(50)).await;
@@ -1217,7 +1221,14 @@ mod tests {
             .await
             .unwrap();
         assert!(start.elapsed() < StdDuration::from_secs(4));
-        assert_eq!(s.claim_jobs("default", 1, 30, false).await.unwrap().jobs.len(), 1);
+        assert_eq!(
+            s.claim_jobs("default", 1, 30, false)
+                .await
+                .unwrap()
+                .jobs
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1225,11 +1236,7 @@ mod tests {
         // A job enqueued between an empty claim and the park must not cost
         // the full wait: the epoch snapshot detects it.
         let (s, _) = store();
-        let epoch = s
-            .claim_jobs("default", 1, 30, false)
-            .await
-            .unwrap()
-            .epoch;
+        let epoch = s.claim_jobs("default", 1, 30, false).await.unwrap().epoch;
         s.create_job(&job("racy", "default", 0)).await.unwrap();
         let start = std::time::Instant::now();
         s.await_work("default", epoch, StdDuration::from_secs(5))
@@ -1244,7 +1251,14 @@ mod tests {
         let mut j = job("a", "default", 0);
         j.config.timeout_secs = 120;
         s.create_job(&j).await.unwrap();
-        assert_eq!(s.claim_jobs("default", 1, 30, true).await.unwrap().jobs.len(), 1);
+        assert_eq!(
+            s.claim_jobs("default", 1, 30, true)
+                .await
+                .unwrap()
+                .jobs
+                .len(),
+            1
+        );
 
         // Well past the raw 30s lease but inside timeout + grace: not reaped.
         clock.advance_secs(120);

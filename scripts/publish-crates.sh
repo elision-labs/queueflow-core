@@ -21,7 +21,7 @@ version() {
 published() {
   local crate="$1" ver="$2"
   curl -fsSL --max-time 30 \
-    -H "User-Agent: queueflow-release (github.com/sjriddle/queueflow-core)" \
+    -H "User-Agent: queueflow-release (github.com/elision-labs/queueflow-core)" \
     "https://crates.io/api/v1/crates/${crate}/${ver}" >/dev/null 2>&1
 }
 

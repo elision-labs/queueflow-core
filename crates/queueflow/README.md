@@ -1,6 +1,6 @@
 # queueflow
 
-The [QueueFlow](https://github.com/sjriddle/queueflow-core) server and CLI: a
+The [QueueFlow](https://github.com/elision-labs/queueflow-core) server and CLI: a
 high-performance, PostgreSQL-native distributed job queue and workflow engine.
 
 Durable background jobs and real DAG workflows on a database you already run:
