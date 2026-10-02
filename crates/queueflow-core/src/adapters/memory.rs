@@ -164,6 +164,12 @@ fn past_cursor(created_at: DateTime<Utc>, id: &str, filter: &ListFilter) -> bool
     }
 }
 
+/// Time-range predicate shared by the list methods: `[after, before)`.
+fn in_time_range(created_at: DateTime<Utc>, f: &ListFilter) -> bool {
+    f.created_after.is_none_or(|t| created_at >= t)
+        && f.created_before.is_none_or(|t| created_at < t)
+}
+
 fn matches_filter(job: &Job, f: &ListFilter) -> bool {
     if let Some(t) = &f.tenant_id {
         if job.tenant_id.as_deref() != Some(t.as_str()) {
@@ -180,7 +186,7 @@ fn matches_filter(job: &Job, f: &ListFilter) -> bool {
             return false;
         }
     }
-    true
+    in_time_range(job.created_at, f)
 }
 
 #[async_trait]
@@ -553,6 +559,7 @@ impl JobStore for InMemoryJobStore {
                         .as_ref()
                         .map(|q| d.queue_name.as_deref() == Some(q.as_str()))
                         .unwrap_or(true)
+                    && in_time_range(d.created_at, filter)
             })
             .cloned()
             .collect();
@@ -625,6 +632,7 @@ impl JobStore for InMemoryJobStore {
                     .as_ref()
                     .map(|t| c.tenant_id.as_deref() == Some(t.as_str()))
                     .unwrap_or(true)
+                    && in_time_range(c.created_at, filter)
             })
             .cloned()
             .collect();
@@ -869,6 +877,7 @@ impl JobStore for InMemoryJobStore {
                         .as_ref()
                         .map(|t| w.tenant_id.as_deref() == Some(t.as_str()))
                         .unwrap_or(true)
+                    && in_time_range(w.created_at, filter)
             })
             .cloned()
             .collect();

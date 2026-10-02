@@ -826,3 +826,50 @@ async fn workflow_step_states_expose_live_progress() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn list_jobs_filters_by_created_time_range() {
+    let app = app();
+    for i in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v1/jobs",
+                Some("key"),
+                Some(json!({"task_name": "echo", "payload": {"i": i}})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // A window entirely in the future matches nothing...
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/api/v1/jobs?created_after=2099-01-01T00:00:00Z",
+            Some("key"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["jobs"].as_array().unwrap().len(), 0);
+
+    // ...a window around now matches everything, and total honours it too.
+    let resp = app
+        .oneshot(req(
+            "GET",
+            "/api/v1/jobs?created_after=2020-01-01T00:00:00Z&created_before=2099-01-01T00:00:00Z&include_total=true",
+            Some("key"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["jobs"].as_array().unwrap().len(), 3);
+    assert_eq!(body["total"], 3);
+}

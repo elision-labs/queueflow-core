@@ -69,6 +69,23 @@ paths:
         required: false
         schema:
           type: string
+      - name: created_after
+        in: query
+        description: |-
+          Only rows created at or after this instant (RFC 3339, inclusive).
+          With `created_before` this forms the half-open range `[after, before)`
+          — the natural shape for walking history period by period.
+        required: false
+        schema:
+          type: string
+          format: date-time
+      - name: created_before
+        in: query
+        description: Only rows created strictly before this instant (RFC 3339, exclusive).
+        required: false
+        schema:
+          type: string
+          format: date-time
       responses:
         '200':
           description: Page of cron schedules (`status`/`queue` filters do not apply)
@@ -318,6 +335,23 @@ paths:
         required: false
         schema:
           type: string
+      - name: created_after
+        in: query
+        description: |-
+          Only rows created at or after this instant (RFC 3339, inclusive).
+          With `created_before` this forms the half-open range `[after, before)`
+          — the natural shape for walking history period by period.
+        required: false
+        schema:
+          type: string
+          format: date-time
+      - name: created_before
+        in: query
+        description: Only rows created strictly before this instant (RFC 3339, exclusive).
+        required: false
+        schema:
+          type: string
+          format: date-time
       responses:
         '200':
           description: Page of dead letters, newest first (the `status` filter does not apply)
@@ -473,6 +507,23 @@ paths:
         required: false
         schema:
           type: string
+      - name: created_after
+        in: query
+        description: |-
+          Only rows created at or after this instant (RFC 3339, inclusive).
+          With `created_before` this forms the half-open range `[after, before)`
+          — the natural shape for walking history period by period.
+        required: false
+        schema:
+          type: string
+          format: date-time
+      - name: created_before
+        in: query
+        description: Only rows created strictly before this instant (RFC 3339, exclusive).
+        required: false
+        schema:
+          type: string
+          format: date-time
       responses:
         '200':
           description: Page of jobs
@@ -937,6 +988,23 @@ paths:
         required: false
         schema:
           type: string
+      - name: created_after
+        in: query
+        description: |-
+          Only rows created at or after this instant (RFC 3339, inclusive).
+          With `created_before` this forms the half-open range `[after, before)`
+          — the natural shape for walking history period by period.
+        required: false
+        schema:
+          type: string
+          format: date-time
+      - name: created_before
+        in: query
+        description: Only rows created strictly before this instant (RFC 3339, exclusive).
+        required: false
+        schema:
+          type: string
+          format: date-time
       responses:
         '200':
           description: Page of workflows

@@ -95,6 +95,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "created_after",
+            "in": "query",
+            "description": "Only rows created at or after this instant (RFC 3339, inclusive).\nWith `created_before` this forms the half-open range `[after, before)`\n— the natural shape for walking history period by period.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "created_before",
+            "in": "query",
+            "description": "Only rows created strictly before this instant (RFC 3339, exclusive).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
           }
         ],
         "responses": {
@@ -501,6 +521,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "created_after",
+            "in": "query",
+            "description": "Only rows created at or after this instant (RFC 3339, inclusive).\nWith `created_before` this forms the half-open range `[after, before)`\n— the natural shape for walking history period by period.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "created_before",
+            "in": "query",
+            "description": "Only rows created strictly before this instant (RFC 3339, exclusive).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
           }
         ],
         "responses": {
@@ -746,6 +786,26 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "created_after",
+            "in": "query",
+            "description": "Only rows created at or after this instant (RFC 3339, inclusive).\nWith `created_before` this forms the half-open range `[after, before)`\n— the natural shape for walking history period by period.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "created_before",
+            "in": "query",
+            "description": "Only rows created strictly before this instant (RFC 3339, exclusive).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
             }
           }
         ],
@@ -1512,6 +1572,26 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "created_after",
+            "in": "query",
+            "description": "Only rows created at or after this instant (RFC 3339, inclusive).\nWith `created_before` this forms the half-open range `[after, before)`\n— the natural shape for walking history period by period.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "created_before",
+            "in": "query",
+            "description": "Only rows created strictly before this instant (RFC 3339, exclusive).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
             }
           }
         ],

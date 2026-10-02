@@ -80,6 +80,12 @@ pub struct ListFilter {
     /// `offset` is ignored. `total`, when requested, still counts the whole
     /// filtered set, not the remainder.
     pub after: Option<PageCursor>,
+    /// Only rows created at or after this instant (inclusive). Combined with
+    /// `created_before` this is a half-open range `[after, before)` — the
+    /// natural shape for paging through history day by day.
+    pub created_after: Option<DateTime<Utc>>,
+    /// Only rows created strictly before this instant (exclusive).
+    pub created_before: Option<DateTime<Utc>>,
 }
 
 impl Default for ListFilter {
@@ -93,6 +99,8 @@ impl Default for ListFilter {
             order_desc: true,
             include_total: false,
             after: None,
+            created_after: None,
+            created_before: None,
         }
     }
 }

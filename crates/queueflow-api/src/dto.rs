@@ -279,6 +279,12 @@ pub struct ListQuery {
     /// Opaque keyset cursor from a previous page's `next_cursor`. When set,
     /// `offset` is ignored and listing continues where that page ended.
     pub cursor: Option<String>,
+    /// Only rows created at or after this instant (RFC 3339, inclusive).
+    /// With `created_before` this forms the half-open range `[after, before)`
+    /// — the natural shape for walking history period by period.
+    pub created_after: Option<DateTime<Utc>>,
+    /// Only rows created strictly before this instant (RFC 3339, exclusive).
+    pub created_before: Option<DateTime<Utc>>,
 }
 
 impl ListQuery {
@@ -301,6 +307,8 @@ impl ListQuery {
             order_desc,
             include_total: self.include_total.unwrap_or(false),
             after,
+            created_after: self.created_after,
+            created_before: self.created_before,
         })
     }
 }

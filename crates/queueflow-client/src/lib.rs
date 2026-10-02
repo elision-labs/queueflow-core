@@ -91,6 +91,10 @@ pub struct ListQuery {
     /// Opaque keyset cursor from a previous page's `next_cursor`. When set,
     /// `offset` is ignored server-side; cheaper than deep OFFSET paging.
     pub cursor: Option<String>,
+    /// Only rows created at or after this instant (inclusive).
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Only rows created strictly before this instant (exclusive).
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One page of jobs or workflows.
@@ -755,6 +759,12 @@ fn apply_list_query(req: reqwest::RequestBuilder, q: &ListQuery) -> reqwest::Req
     }
     if let Some(c) = &q.cursor {
         params.push(("cursor", c.clone()));
+    }
+    if let Some(t) = &q.created_after {
+        params.push(("created_after", t.to_rfc3339()));
+    }
+    if let Some(t) = &q.created_before {
+        params.push(("created_before", t.to_rfc3339()));
     }
     req.query(&params)
 }

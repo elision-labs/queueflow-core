@@ -66,6 +66,14 @@ if [[ ! -f "${SPEC}" ]]; then
   exit 1
 fi
 
+# The generation below WIPES each target repo before regenerating; a dead
+# docker daemon after the wipe would leave the repo gutted. Fail here, before
+# touching anything.
+if ! docker info >/dev/null 2>&1; then
+  echo "docker daemon is not reachable; refusing to wipe/regenerate SDK repos." >&2
+  exit 1
+fi
+
 generate() {
   local name="$1"
 

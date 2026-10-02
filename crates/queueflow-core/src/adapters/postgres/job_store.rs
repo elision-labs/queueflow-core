@@ -1347,7 +1347,19 @@ fn cron_from_row(row: &sqlx::postgres::PgRow) -> Result<CronSchedule, StorageErr
     })
 }
 
+/// Time-range predicates: `[created_after, created_before)`. A true filter,
+/// so it applies to both the COUNT and the page query (unlike the cursor).
+fn push_time_range(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
+    if let Some(t) = filter.created_after {
+        qb.push(" AND created_at >= ").push_bind(t);
+    }
+    if let Some(t) = filter.created_before {
+        qb.push(" AND created_at < ").push_bind(t);
+    }
+}
+
 fn push_cron_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
+    push_time_range(qb, filter);
     if let Some(t) = &filter.tenant_id {
         qb.push(" AND tenant_id = ").push_bind(t.clone());
     }
@@ -1369,6 +1381,7 @@ fn dead_letter_from_row(row: &sqlx::postgres::PgRow) -> Result<DeadLetter, Stora
 }
 
 fn push_dlq_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
+    push_time_range(qb, filter);
     if let Some(t) = &filter.tenant_id {
         qb.push(" AND tenant_id = ").push_bind(t.clone());
     }
@@ -1378,6 +1391,7 @@ fn push_dlq_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
 }
 
 fn push_job_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
+    push_time_range(qb, filter);
     if let Some(t) = &filter.tenant_id {
         qb.push(" AND tenant_id = ").push_bind(t.clone());
     }
@@ -1390,6 +1404,7 @@ fn push_job_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
 }
 
 fn push_workflow_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
+    push_time_range(qb, filter);
     if let Some(t) = &filter.tenant_id {
         qb.push(" AND tenant_id = ").push_bind(t.clone());
     }
