@@ -37,13 +37,11 @@ jobs:
       # `cargo publish` verifies with default features only, which excludes
       # the Postgres adapter; this proves the .crate really contains
       # everything the `postgres` feature needs (notably migrations/).
+      # Shared with local dev via the Makefile target, which extracts OUTSIDE
+      # the workspace tree (in-tree, the standalone build finds this
+      # workspace's manifest and refuses to build a non-member).
       - name: Package queueflow-core and build it from the .crate
-        run: |
-          cargo package -p queueflow-core
-          mkdir -p target/package-check
-          tar -xzf target/package/queueflow-core-*.crate -C target/package-check
-          cd target/package-check/queueflow-core-*
-          cargo build --features postgres
+        run: make check-package
 
   spec:
     name: OpenAPI spec (generate + no-drift + validate)
@@ -104,7 +102,9 @@ jobs:
             -v "${out}:/out" \
             "${OPENAPI_GENERATOR_IMAGE}" generate -i /spec/openapi.json -c /config.yaml -o /out
           test -f "${out}/queueflow/facade.py" || { echo "::error::python facade was not generated" >&2; exit 1; }
-          python3 -m py_compile "${out}/queueflow/facade.py"
+          # The generator container runs as root, so ${out} is root-owned on
+          # Linux runners; write the bytecode cache somewhere writable.
+          PYTHONPYCACHEPREFIX="$(mktemp -d)" python3 -m py_compile "${out}/queueflow/facade.py"
       - name: Generate Rust SDK and compile (core + facade)
         run: |
           out="$(mktemp -d)"

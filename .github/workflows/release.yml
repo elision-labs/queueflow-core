@@ -27,7 +27,7 @@ jobs:
       # in the crates.io UI, then replace the token with
       # rust-lang/crates-io-auth-action and drop the long-lived secret — see
       # PUBLISHING.md.
-      - name: Publish (ordered: core -> api -> client -> queueflow)
+      - name: "Publish (ordered: core -> api -> client -> queueflow)"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
