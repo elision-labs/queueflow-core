@@ -8,8 +8,11 @@ the per-tag api clients come from the generated modules and are never edited.
 
 from __future__ import annotations
 
+import inspect
+import logging
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .api_client import ApiClient
 from .configuration import Configuration
@@ -20,7 +23,12 @@ from .api.system_api import SystemApi
 from .api.health_api import HealthApi
 from .api.cron_api import CronApi
 from .api.dlq_api import DlqApi
+from .exceptions import ApiException
+from .models.complete_job_request import CompleteJobRequest
 from .models.create_job_request import CreateJobRequest
+from .models.fail_job_request import FailJobRequest
+from .models.heartbeat_request import HeartbeatRequest
+from .models.lease_jobs_request import LeaseJobsRequest
 from .models.job_config_request import JobConfigRequest
 from .models.create_workflow_request import CreateWorkflowRequest
 from .models.create_cron_request import CreateCronRequest
@@ -38,6 +46,35 @@ class WaitTimeout(TimeoutError):
 
 class WorkflowValidationError(ValueError):
     """Raised by WorkflowBuilder.build() for a structurally invalid DAG."""
+
+
+class NonRetryableError(Exception):
+    """Raise from a worker handler to mark the failure PERMANENT: the job
+    skips its remaining retries and dead-letters immediately (e.g. invalid
+    input). Any raised exception carrying ``retryable = False`` behaves the
+    same; this class is the convenient spelling."""
+
+    retryable = False
+
+
+class WorkerContext:
+    """Per-job context handed to two-argument worker handlers.
+
+    ``cancelled`` flips to True when the job's lease is lost (the job was
+    cancelled mid-run, or the lease expired and was reclaimed). From then on
+    the server owns the outcome: long handlers should check it periodically
+    and stop, because any further work is discarded.
+    """
+
+    def __init__(self) -> None:
+        self._lost = threading.Event()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._lost.is_set()
+
+
+_logger = logging.getLogger("queueflow.worker")
 
 
 class QueueFlow:
@@ -158,6 +195,179 @@ class QueueFlow:
         """
         replayed = self.dlq.replay_dead_letter(dead_letter_id)
         return self.jobs.get_job(replayed.job_id)
+
+    # --- worker runtime -------------------------------------------------------
+
+    def run_worker(
+        self,
+        queue: str,
+        handlers: Dict[str, Callable[..., Optional[Dict[str, Any]]]],
+        lease_secs: int = 30,
+        wait_secs: int = 20,
+        stop: Optional["threading.Event"] = None,
+        on_error: Optional[Callable[[Exception], None]] = None,
+    ) -> None:
+        """Run a worker loop: lease jobs from ``queue``, dispatch to
+        ``handlers`` by task name, heartbeat while a handler runs, and report
+        the outcome. The engine owns retries, backoff, the dead-letter queue,
+        and workflow advancement.
+
+        Semantics (matching the Node SDK's ``qf.worker.run``):
+
+        * Delivery is **at-least-once** — make handlers idempotent.
+        * A handler returns the job's result dict (or None for ``{}``).
+          Raising fails the job through the engine's retry policy; raise
+          :class:`NonRetryableError` (or any exception with
+          ``retryable = False``) to dead-letter immediately.
+        * Each in-flight job is heartbeated at half the lease interval. A
+          heartbeat showing the job is no longer running (cancelled mid-run,
+          or the lease was reclaimed) abandons reporting — the server owns
+          the outcome — and flips ``ctx.cancelled`` so a two-argument handler
+          ``(job, ctx)`` can stop early.
+        * A failed *report* is never re-reported as a job failure: the lease
+          expires and the engine redelivers.
+        * Lease errors with HTTP 401/403 raise (a wrong or missing
+          ``worker_token`` cannot heal by retrying); other lease errors go to
+          ``on_error`` (or a throttled log) with a 1s backoff.
+
+        Blocks until ``stop`` (a ``threading.Event``) is set.
+        """
+        _logger.info("worker leasing %r (tasks: %s)", queue, ", ".join(sorted(handlers)))
+        failures = 0
+        while stop is None or not stop.is_set():
+            try:
+                leased = self.worker.lease_jobs(
+                    queue,
+                    LeaseJobsRequest(max_jobs=1, lease_secs=lease_secs, wait_secs=wait_secs),
+                ).jobs
+                failures = 0
+            except ApiException as err:
+                if err.status in (401, 403):
+                    raise
+                failures += 1
+                self._lease_failed(err, failures, on_error)
+                if self._sleep_interruptibly(1.0, stop):
+                    break
+                continue
+            except Exception as err:  # noqa: BLE001 - transport-level failure
+                failures += 1
+                self._lease_failed(err, failures, on_error)
+                if self._sleep_interruptibly(1.0, stop):
+                    break
+                continue
+            for lease in leased:
+                self._run_one(lease, handlers, lease_secs)
+        _logger.info("worker stopped")
+
+    def _lease_failed(self, err, failures, on_error) -> None:
+        if on_error is not None:
+            on_error(err)
+        elif failures == 1 or failures % 30 == 0:
+            _logger.warning("lease failed (%d consecutive): %s", failures, err)
+
+    @staticmethod
+    def _sleep_interruptibly(seconds: float, stop: Optional["threading.Event"]) -> bool:
+        """Sleep; returns True if ``stop`` fired."""
+        if stop is None:
+            time.sleep(seconds)
+            return False
+        return stop.wait(seconds)
+
+    def _run_one(self, lease, handlers, lease_secs: int) -> None:
+        job = lease.job
+        handler = handlers.get(job.task_name)
+        if handler is None:
+            self._report(
+                job.id,
+                FailJobRequest(
+                    lease_token=lease.lease_token,
+                    error="no worker handler for task '" + job.task_name + "'",
+                    retryable=False,
+                ),
+            )
+            return
+
+        ctx = WorkerContext()
+        hb_done = threading.Event()
+        hb = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(job.id, lease.lease_token, lease_secs, ctx, hb_done),
+            daemon=True,
+        )
+        hb.start()
+
+        # Handler outcome and outcome *reporting* are separate concerns: a
+        # reporting error must never be re-reported as a job failure.
+        outcome_error: Optional[BaseException] = None
+        result: Dict[str, Any] = {}
+        try:
+            result = self._call_handler(handler, job, ctx) or {}
+        except Exception as err:  # noqa: BLE001 - the engine applies policy
+            outcome_error = err
+        finally:
+            hb_done.set()
+            hb.join(timeout=5)
+
+        if ctx.cancelled:
+            return  # the server owns the outcome
+
+        if outcome_error is None:
+            self._report(job.id, CompleteJobRequest(lease_token=lease.lease_token, result=result))
+        else:
+            retryable = getattr(outcome_error, "retryable", True) is not False
+            self._report(
+                job.id,
+                FailJobRequest(
+                    lease_token=lease.lease_token,
+                    error=str(outcome_error) or type(outcome_error).__name__,
+                    retryable=retryable,
+                ),
+            )
+
+    @staticmethod
+    def _call_handler(handler, job, ctx):
+        """Call ``handler(job)`` or ``handler(job, ctx)`` by arity."""
+        try:
+            params = [
+                p
+                for p in inspect.signature(handler).parameters.values()
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            ]
+            wants_ctx = len(params) >= 2
+        except (TypeError, ValueError):
+            wants_ctx = False
+        return handler(job, ctx) if wants_ctx else handler(job)
+
+    def _report(self, job_id: str, request) -> None:
+        try:
+            if isinstance(request, CompleteJobRequest):
+                self.worker.complete_job(job_id, request)
+            else:
+                self.worker.fail_job(job_id, request)
+        except Exception as err:  # noqa: BLE001 - lease expiry redelivers
+            _logger.warning(
+                "failed to report job %s outcome; the lease will expire and the engine redelivers: %s",
+                job_id,
+                err,
+            )
+
+    def _heartbeat_loop(self, job_id, lease_token, lease_secs, ctx, done) -> None:
+        interval = max(1.0, lease_secs / 2.0)
+        while not done.wait(interval):
+            try:
+                status = self.worker.heartbeat_job(
+                    job_id,
+                    HeartbeatRequest(lease_token=lease_token, extend_secs=lease_secs),
+                ).status
+                if status != "running":
+                    ctx._lost.set()
+                    return
+            except ApiException as err:
+                if err.status == 409:
+                    ctx._lost.set()
+                    return
+            except Exception:  # noqa: BLE001 - transient; next tick retries
+                pass
 
     # --- internal -----------------------------------------------------------
 

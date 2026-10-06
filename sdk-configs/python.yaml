@@ -17,7 +17,7 @@ files:
 additionalProperties:
   packageName: queueflow
   projectName: queueflow
-  packageVersion: 0.1.0
+  packageVersion: 0.2.0
   packageUrl: https://github.com/elision-labs/queueflow-sdk-python
   library: urllib3
   hideGenerationTimestamp: true

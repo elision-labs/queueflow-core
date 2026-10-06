@@ -49,20 +49,48 @@ The facade is injected at generation time from the queueflow-core-rs template
 (`sdk-templates/python/facade.mustache`), so it is regenerated alongside the generated core and can
 never drift from the server. Do not edit `queueflow/facade.py` directly; edit the template.
 
-## Worker protocol notes
+## Worker runtime
 
-`qf.worker` exposes the raw worker endpoints (lease, heartbeat, complete, fail); no worker
-runtime ships with this SDK. Three rules keep the at-least-once contract honest:
+Run task handlers in this process with `run_worker` — it leases jobs, heartbeats each one at
+half the lease interval while the handler runs, and reports the outcome. The engine owns
+retries, backoff, the dead-letter queue, and workflow advancement.
+
+```python
+import threading
+from queueflow.facade import QueueFlow, NonRetryableError
+
+qf = QueueFlow("http://localhost:8000", "tenant-key", worker_token="worker-secret")
+
+def send_email(job):
+    if not job.payload.get("to"):
+        raise NonRetryableError("no recipient")   # straight to the dead-letter queue
+    ...                                           # raising anything else retries per policy
+    return {"sent": True}
+
+def transcode(job, ctx):
+    for chunk in chunks(job.payload):
+        if ctx.cancelled:                         # lease lost / cancelled mid-run: stop,
+            return {}                             # the server owns the outcome now
+        process(chunk)
+    return {"ok": True}
+
+stop = threading.Event()                          # set it (e.g. from a signal handler) to drain
+qf.run_worker("orders", {"send_email": send_email, "transcode": transcode}, stop=stop)
+```
+
+Rules the runtime enforces for you — and that any hand-rolled loop over the raw `qf.worker`
+endpoints must honour too:
 
 1. Worker routes authenticate with the **worker token**, not a tenant token. Pass it as
-   `QueueFlow(base_url, token, worker_token=...)` and `qf.worker` will use it; without it,
-   `qf.worker` reuses the tenant token, which only works in the server's development mode.
-2. Heartbeat every in-flight job at roughly half its lease interval. A heartbeat whose `status`
-   is anything other than `running` (or an HTTP 409) means the server owns the outcome: abandon
-   the handler and report nothing. Never process a leased batch sequentially without
-   heartbeating the jobs still waiting - their leases expire and the server redelivers them.
-3. Delivery is at-least-once, so handlers must be idempotent. Report permanent failures with
-   `retryable=False` so they dead-letter immediately instead of burning retries.
+   `QueueFlow(base_url, token, worker_token=...)`; without it, `qf.worker` reuses the tenant
+   token, which only works in the server's development mode. `run_worker` raises on 401/403
+   rather than spinning against a bad credential.
+2. Every in-flight job is heartbeated at half its lease interval; a heartbeat showing the job
+   no longer running (or an HTTP 409) abandons reporting and flips `ctx.cancelled`.
+3. Delivery is at-least-once, so handlers must be idempotent. Raise `NonRetryableError` (or any
+   exception with `retryable = False`) for permanent failures so they dead-letter immediately.
+   A failed outcome *report* is never converted into a job failure — the lease expires and the
+   engine redelivers.
 
 ## Known limitation: stream_job_events
 
