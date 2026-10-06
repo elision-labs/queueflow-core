@@ -8,10 +8,10 @@
 # back to the generator's built-in default.
 generatorName: go
 # Module path baked into go.mod; matches the import in FACADE.md and the
-# actual GitHub remote (github.com/queue-flow/sdk-go).
+# actual GitHub remote (github.com/elision-labs/queueflow-sdk-go).
 gitHost: github.com
-gitUserId: queue-flow
-gitRepoId: sdk-go
+gitUserId: elision-labs
+gitRepoId: queueflow-sdk-go
 templateDir: /templates
 files:
   facade.mustache:
