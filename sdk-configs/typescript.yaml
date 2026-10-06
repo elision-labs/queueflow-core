@@ -8,7 +8,7 @@ generatorName: typescript-fetch
 additionalProperties:
   npmName: "@queueflow/sdk"
   npmVersion: 0.1.0
-  npmRepository: https://github.com/queueflow/queueflow-sdk-nodejs
+  npmRepository: https://github.com/elision-labs/queueflow-sdk-nodejs
   supportsES6: true
   withInterfaces: true
   typescriptThreePlus: true

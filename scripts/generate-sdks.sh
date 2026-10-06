@@ -158,7 +158,7 @@ generate() {
   if [[ "${name}" == "python" ]]; then
     sed -i '' \
       -e 's|authors = \["QueueFlow <team@openapitools.org>"\]|authors = ["QueueFlow"]|' \
-      -e 's|https://github.com/GIT_USER_ID/GIT_REPO_ID|https://github.com/queueflow/queueflow-sdk-python|' \
+      -e 's|https://github.com/GIT_USER_ID/GIT_REPO_ID|https://github.com/elision-labs/queueflow-sdk-python|' \
       -e 's|#"test",  # auto-generated tests|"test",|' \
       -e 's|"tests", # hand-written tests||' \
       "${out}/pyproject.toml"
