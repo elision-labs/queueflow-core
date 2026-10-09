@@ -49,7 +49,7 @@ axum = "0.8"
 # rust_crypto backend: pure Rust, no cmake/nasm toolchain requirements.
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "compression-gzip"] }
 utoipa = { version = "5", features = ["axum_extras", "chrono", "yaml"] }
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.10"
