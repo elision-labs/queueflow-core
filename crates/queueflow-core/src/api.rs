@@ -104,7 +104,12 @@ pub trait JobApi: Send + Sync {
     async fn ping(&self) -> Result<(), EngineError>;
     fn is_running(&self) -> bool;
     fn registered_tasks(&self) -> Vec<String>;
+    /// Process-local engine counters (reset on restart, not tenant-scoped).
+    /// Meant for the metrics endpoint, not for tenant-facing responses.
     fn stats(&self) -> StatsSnapshot;
+    /// Durable counts scoped to `tenant_id` (see
+    /// [`crate::JobStore::count_stats`]); this is what `/api/v1/stats` serves.
+    async fn tenant_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, EngineError>;
 }
 
 #[async_trait]
@@ -278,5 +283,9 @@ where
 
     fn stats(&self) -> StatsSnapshot {
         Engine::stats(self).snapshot()
+    }
+
+    async fn tenant_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, EngineError> {
+        Engine::tenant_stats(self, tenant_id).await
     }
 }

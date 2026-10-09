@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::domain::*;
+use crate::stats::StatsSnapshot;
 
 /// Abstract clock so time-dependent behaviour (retry backoff, timestamps) is
 /// deterministic in tests via [`crate::adapters::clock::TestClock`].
@@ -268,6 +269,17 @@ pub trait JobStore: Send + Sync {
     async fn move_to_dlq(&self, id: &str, reason: &str, error: &str) -> Result<(), StorageError>;
 
     async fn count_dead_letters(&self) -> Result<i64, StorageError>;
+
+    /// Durable counts for one tenant (or everything, when `tenant_id` is
+    /// `None`), shaped like the engine's process-local counters so the two
+    /// can be read side by side: `jobs_created` is the number of jobs in the
+    /// store, `jobs_completed` / `jobs_failed` the rows in those statuses,
+    /// `jobs_retried` the sum of every job's `retry_count`,
+    /// `jobs_dead_lettered` the dead letters, and the workflow fields the
+    /// same over workflows (`workflows_failed` includes `partially_failed`).
+    /// Unlike the process counters these survive restarts and are scoped,
+    /// but they shrink when retention deletes history.
+    async fn count_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, StorageError>;
 
     /// List dead letters, honouring the filter's tenant/queue scoping and
     /// paging (`status` does not apply and is ignored).

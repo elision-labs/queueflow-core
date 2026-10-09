@@ -10,7 +10,7 @@ Durable background jobs and real DAG workflows on a database you already run —
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](./rust-toolchain.toml)
 [![OpenAPI 3.1](https://img.shields.io/badge/OpenAPI-3.1-6BA539.svg)](./spec/openapi.yaml)
-[![Tests](https://img.shields.io/badge/tests-118%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-128%20passing-brightgreen.svg)](#testing)
 
 [Quick start](#quick-start) · [Workflows](#workflows) · [How-to](#how-to-rest-api) · [Docs](#documentation) · [Roadmap](#roadmap)
 
@@ -27,13 +27,13 @@ is generated from the code and ships with every release.
 ## Design highlights
 
 - **Workflows as a real DAG orchestrator** — dependency gating, context propagation, per-step failure policies, cycle detection, a builder DSL, and a Mermaid diagram endpoint.
-- **Thoroughly tested** — 92 tests; the entire engine, scheduler, HTTP API, and Rust client run against a deterministic in-memory adapter with **no database**, plus opt-in Postgres integration tests.
+- **Thoroughly tested** — 128 tests; the entire engine, scheduler, HTTP API, and Rust client run against a deterministic in-memory adapter with **no database**, plus opt-in Postgres integration tests.
 - **Durable retries & scheduling** — a retry (or a `run_at` job) is just a row whose `scheduled_at` lies in the future, so delays survive restarts.
 - **Delivery safety** — lease tokens guard every outcome write (no stale worker can overwrite a finished or cancelled job), and a janitor reclaims expired leases through the normal retry policy, so a crashed worker consumes retry budget instead of crash-looping.
 - **Ports & adapters** — the engine depends on the `JobStore` trait; Postgres and in-memory adapters implement it (the store doubles as the queue).
 - **Code-generated OpenAPI** — the spec is generated **from the code** (utoipa), so it can't drift; emitted by `queueflow spec`.
 - **Ergonomic API** — durations are plain integer seconds; statuses and backoff are exhaustive enums, so illegal states are unrepresentable.
-- **Multi-tenancy** — tenant isolation enforced on every job/workflow endpoint.
+- **Multi-tenancy** — tenant isolation enforced on every job/workflow endpoint, and the API fails closed: no credentials configured means no access, unless `--dev` is passed explicitly.
 - **Polyglot workers** — a lease/heartbeat/complete/fail HTTP protocol lets handlers run in any language, with the same retry/DLQ/workflow semantics as in-process handlers.
 - **Idempotent enqueue** — an `Idempotency-Key` header makes client retries safe (no duplicate jobs).
 - **Clients** — a native Rust crate (`queueflow-client`), a hand-written TypeScript SDK, and self-serve generation for anything else from the released spec.
@@ -123,19 +123,32 @@ cargo run --example workflow       -p queueflow-core
 docker run -d --name pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16-alpine
 
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
-cargo run -p queueflow -- serve --mode all --workers 10 --api-port 8000
+cargo run -p queueflow -- serve --dev --mode all --workers 10 --api-port 8000
 ```
 
 The server applies migrations on startup, exposes the REST API on `:8000`, Prometheus metrics on `:9090`,
 and interactive docs at <http://localhost:8000/docs>.
 
+`--dev` runs without credentials for local development (any non-empty bearer token is tenant
+`tenant1`). Without it the server **refuses to start** until you configure tenant credentials
+(`--api-keys` and/or `--jwt-secret`) and a `--worker-token`:
+
+```bash
+cargo run -p queueflow -- serve --mode all \
+  --api-keys "$(openssl rand -hex 24):acme" \
+  --worker-token "$(openssl rand -hex 24)"
+```
+
 ### With Docker
 
 ```bash
-make docker                       # builds ghcr.io/queueflow/queueflow:dev
 docker run -p 8000:8000 -p 9090:9090 \
   -e DATABASE_URL=postgres://… \
-  ghcr.io/queueflow/queueflow:dev serve
+  -e QUEUEFLOW_API_KEYS=my-token:acme \
+  -e QUEUEFLOW_WORKER_TOKEN=my-worker-token \
+  ghcr.io/elision-labs/queueflow:0.2 serve
+
+make docker                       # builds ghcr.io/elision-labs/queueflow:dev locally
 ```
 
 ## Workflows
@@ -175,10 +188,11 @@ graph TD
 
 ## How-to (REST API)
 
-Every `/api/v1` route needs a bearer token. Configure real tenant credentials with `--jwt-secret`
-(HS256; the `sub` claim is the tenant) and/or `--api-keys "token:tenant,..."`; with neither set the
-server runs in development mode, where any non-empty token maps to one fixed tenant (and `serve`
-warns at startup). Worker-protocol endpoints take the separate `--worker-token` credential.
+Every `/api/v1` route needs a bearer token. Configure tenant credentials with `--jwt-secret`
+(HS256; the `sub` claim is the tenant) and/or `--api-keys "token:tenant,..."`. Worker-protocol
+endpoints take the separate `--worker-token` credential. The server fails closed: without both a
+tenant credential source and a worker token it refuses to start, unless `--dev` is passed, in which
+case any non-empty token maps to the fixed tenant `tenant1` (the examples below assume `--dev`).
 
 ```bash
 # Enqueue a job
@@ -231,8 +245,8 @@ curl -s http://localhost:9090/metrics
 Handlers do not have to be compiled into the server. A worker in any language can drain a queue
 over HTTP with at-least-once semantics, durable retries, and workflow advancement handled
 server-side. Workers execute arbitrary tenants' jobs, so give them their own credential: set
-`--worker-token` on the server and use that token below (without one configured the server runs
-in development mode and accepts any authenticated token, warning at startup):
+`--worker-token` on the server and use that token below (only in `--dev` mode do the worker
+endpoints accept any authenticated token):
 
 ```bash
 # 1. Lease (long-polls up to wait_secs when the queue is empty)
@@ -295,9 +309,14 @@ queueflow stats
 | `--workers` | `QUEUEFLOW_WORKERS` | `10` | Workers per queue |
 | `--metrics-port` | `QUEUEFLOW_METRICS_PORT` | `9090` | Prometheus port |
 | `--default-queue` | `QUEUEFLOW_DEFAULT_QUEUE` | `default` | Default queue name |
-| `--worker-token` | `QUEUEFLOW_WORKER_TOKEN` | unset | Credential required by the worker-protocol endpoints (lease/heartbeat/complete/fail). Unset = development mode: any authenticated token is accepted, with a startup warning |
+| `--worker-token` | `QUEUEFLOW_WORKER_TOKEN` | unset | Credential required by the worker-protocol endpoints (lease/heartbeat/complete/fail). Required in `api`/`all` mode unless `--dev` |
 | `--jwt-secret` | `QUEUEFLOW_JWT_SECRET` | unset | HS256 secret for tenant JWTs (`sub` = tenant id, `exp` enforced) |
-| `--api-keys` | `QUEUEFLOW_API_KEYS` | unset | Static tenant API keys, `token:tenant,...`. With neither this nor `--jwt-secret`, tenant auth is the development placeholder |
+| `--api-keys` | `QUEUEFLOW_API_KEYS` | unset | Static tenant API keys, `token:tenant,...`. One of this or `--jwt-secret` is required in `api`/`all` mode unless `--dev` |
+| `--dev` | `QUEUEFLOW_DEV` | off | Development mode: run without credentials. Any non-empty token is tenant `tenant1`; without a worker token the worker endpoints accept any authenticated caller. Never on a reachable server |
+| `--cors-origins` | `QUEUEFLOW_CORS_ORIGINS` | unset | Comma-separated allowed origins. Unset = permissive CORS (warns) |
+| `--max-db-connections` | `QUEUEFLOW_MAX_DB_CONNECTIONS` | `50` | Connection pool size |
+| `--auto-migrate` | `QUEUEFLOW_AUTO_MIGRATE` | `true` | Apply migrations on startup; `--auto-migrate false` to run them separately with `queueflow migrate` |
+| `--retention-hours` | `QUEUEFLOW_RETENTION_HOURS` | unset | Delete terminal jobs/workflows/dead letters older than this. Unset keeps history forever |
 
 ## Testing
 
@@ -374,7 +393,10 @@ Contributions welcome — these are the planned next steps, roughly in priority 
 - [ ] **Sub-workflows & fan-out** — a step that spawns a child workflow or a dynamic batch.
 - [ ] **OpenTelemetry** — distributed tracing export alongside the Prometheus metrics.
 - [ ] **Per-tenant rate limiting & quotas.**
-- [ ] **Publish** — crates.io release (pipeline and runbook ready, see [`PUBLISHING.md`](./PUBLISHING.md)) and a Helm chart.
+- [x] **Publish** — crates.io, GHCR image, and GitHub release binaries ship from the tag pipeline
+      (see [`PUBLISHING.md`](./PUBLISHING.md)).
+- [ ] **Helm chart** and one-click deploy templates.
+- [ ] **Web dashboard** — queues, jobs, workflow DAGs, DLQ, and cron in a browser.
 
 ## Contributing
 

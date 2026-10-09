@@ -40,7 +40,7 @@ stat() { # stat jobs_completed -> number
 }
 
 start_server() { # start_server <mode> <workers>
-  (target/release/queueflow serve --mode "$1" --workers "$2" \
+  (target/release/queueflow serve --dev --mode "$1" --workers "$2" \
      --api-port "${API_PORT}" --metrics-port 0 --default-queue bench \
      >/tmp/queueflow-bench-server.log 2>&1) &
   SERVER_PID=$!

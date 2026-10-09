@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use queueflow_api::auth::AuthConfig;
 use queueflow_api::{build_router, ApiState};
 use queueflow_client::{Client, CreateJobOptions, ListQuery};
 use queueflow_core::{Engine, InMemoryJobStore, JobStatus, Map, SystemClock};
@@ -19,7 +20,7 @@ async fn start_server() -> Client {
     let engine = Engine::builder(store, clock).build();
     engine.mark_running();
 
-    let app = build_router(ApiState::new(engine));
+    let app = build_router(ApiState::new(engine).with_auth(AuthConfig::development()));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();

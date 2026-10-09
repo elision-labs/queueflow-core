@@ -36,7 +36,6 @@ impl Modify for SecurityAddon {
 #[openapi(
     info(
         title = "QueueFlow API",
-        version = "1.0.0",
         description = "REST API for QueueFlow, a PostgreSQL-native distributed job queue and workflow engine.",
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "QueueFlow", url = "https://queueflow.dev"),

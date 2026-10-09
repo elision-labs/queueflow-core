@@ -15,6 +15,13 @@ use crate::cli::{Mode, ServeArgs};
 use crate::metrics;
 
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
+    // Credentials are validated first: an API that would start without them
+    // must not get as far as touching the database.
+    let auth = match args.mode {
+        Mode::Worker => None,
+        Mode::Api | Mode::All => Some(auth_config(&args)?),
+    };
+
     let pool = connect(&args.database_url, args.max_db_connections)
         .await
         .context("connect to PostgreSQL")?;
@@ -88,32 +95,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             }
         }
         Mode::Api | Mode::All => {
-            let auth = AuthConfig {
-                worker_token: args.worker_token.clone(),
-                jwt_secret: args.jwt_secret.clone(),
-                api_keys: args
-                    .api_keys
-                    .as_deref()
-                    .map(parse_api_keys)
-                    .transpose()
-                    .map_err(anyhow::Error::msg)
-                    .context("--api-keys")?
-                    .unwrap_or_default(),
-            };
-            if !auth.strict() {
-                tracing::warn!(
-                    "no --jwt-secret or --api-keys configured: tenant authentication is the \
-                     development placeholder (any non-empty token maps to one tenant). Configure \
-                     real credentials before exposing this API."
-                );
-            }
-            if auth.worker_token.is_none() {
-                tracing::warn!(
-                    "no --worker-token / QUEUEFLOW_WORKER_TOKEN configured: the worker-protocol \
-                     endpoints (lease/heartbeat/complete/fail) will accept ANY authenticated \
-                     token. Set one for any deployment with more than one tenant."
-                );
-            }
+            let auth = auth.expect("auth config is built for api/all mode");
             let cors_origins: Vec<String> = args
                 .cors_origins
                 .as_deref()
@@ -161,6 +143,56 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let _ = janitor_handle.await;
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Build the API's authentication configuration from the CLI and refuse to
+/// run without credentials unless `--dev` was passed. Called before anything
+/// else (even the database connection) so a misconfigured deployment fails
+/// immediately and obviously.
+fn auth_config(args: &ServeArgs) -> anyhow::Result<AuthConfig> {
+    let auth = AuthConfig {
+        worker_token: args.worker_token.clone(),
+        jwt_secret: args.jwt_secret.clone(),
+        api_keys: args
+            .api_keys
+            .as_deref()
+            .map(parse_api_keys)
+            .transpose()
+            .map_err(anyhow::Error::msg)
+            .context("--api-keys")?
+            .unwrap_or_default(),
+        dev_mode: args.dev,
+    };
+    // Fail closed: the API only starts without credentials when
+    // development mode was requested explicitly.
+    if !args.dev {
+        let mut missing = Vec::new();
+        if !auth.strict() {
+            missing.push("--jwt-secret or --api-keys (QUEUEFLOW_JWT_SECRET / QUEUEFLOW_API_KEYS)");
+        }
+        if auth.worker_token.is_none() {
+            missing.push("--worker-token (QUEUEFLOW_WORKER_TOKEN)");
+        }
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "refusing to serve the API without credentials: set {}. For local \
+                 development only, pass --dev (QUEUEFLOW_DEV=1) to run with the \
+                 placeholder tenant and open worker endpoints.",
+                missing.join(" and ")
+            );
+        }
+    } else {
+        tracing::warn!(
+            "--dev: development mode is ON. Never expose this server: any non-empty \
+             token authenticates as tenant 'tenant1'{}",
+            if auth.worker_token.is_none() {
+                " and the worker-protocol endpoints accept any authenticated token"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(auth)
 }
 
 async fn wait_for_signal() {

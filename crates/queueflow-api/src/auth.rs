@@ -11,14 +11,19 @@
 //!   - **Static API keys**: configure `--api-keys "token:tenant,..."`; the
 //!     token maps to its tenant.
 //!
-//!   With neither configured the server runs in **development mode**: any
-//!   non-empty token authenticates as tenant `tenant1` (and `serve` warns).
+//!   With neither configured, every tenant route answers `401`: the API
+//!   fails closed.
 //! * **The worker token** authenticates the worker protocol (lease,
 //!   heartbeat, complete, fail). Workers are deployment infrastructure: they
 //!   execute arbitrary tenants' jobs and see their payloads, so a tenant
 //!   credential must never lease work. Configure it with `--worker-token`;
-//!   when unset the worker routes fall back to accepting any authenticated
-//!   caller (development mode, again with a loud warning).
+//!   when unset the worker routes also answer `401`.
+//!
+//! **Development mode** ([`AuthConfig::development`], `serve --dev`) is the
+//! only way to relax this: any non-empty token then authenticates as tenant
+//! `tenant1`, and without a worker token the worker routes accept any
+//! authenticated caller. It must be requested explicitly; the default
+//! configuration never grants access without configured credentials.
 
 use axum::extract::{Request, State};
 use axum::middleware::Next;
@@ -39,11 +44,26 @@ pub struct AuthConfig {
     pub jwt_secret: Option<String>,
     /// Static API keys as `(token, tenant)` pairs.
     pub api_keys: Vec<(String, String)>,
+    /// Development mode: with no tenant credentials configured, any non-empty
+    /// token authenticates as tenant `tenant1`; with no worker token, any
+    /// authenticated caller may act as a worker. `false` (the default) fails
+    /// closed: unconfigured credential classes reject every request.
+    pub dev_mode: bool,
 }
 
 impl AuthConfig {
-    /// True when real tenant authentication is configured; false means the
-    /// development-mode placeholder is in effect.
+    /// The development placeholder: no credentials required. Never use this
+    /// for a reachable deployment.
+    pub fn development() -> Self {
+        Self {
+            dev_mode: true,
+            ..Self::default()
+        }
+    }
+
+    /// True when real tenant authentication is configured; false means
+    /// either the development-mode placeholder is in effect or (outside
+    /// development mode) every tenant request is rejected.
     pub fn strict(&self) -> bool {
         self.jwt_secret.is_some() || !self.api_keys.is_empty()
     }
@@ -131,7 +151,8 @@ pub async fn bearer_auth(
 }
 
 /// Worker-protocol endpoints: require the configured worker token. Without
-/// one configured, any authenticated caller is accepted (development mode).
+/// one configured, requests are rejected, unless development mode is on, in
+/// which case any authenticated caller is accepted.
 pub async fn worker_auth(
     State(state): State<ApiState>,
     req: Request,
@@ -153,7 +174,7 @@ pub async fn worker_auth(
             }
         }
         None => {
-            if validate_token(&state.auth, token).is_some() {
+            if state.auth.config.dev_mode && validate_token(&state.auth, token).is_some() {
                 Ok(next.run(req).await)
             } else {
                 Err(ApiError(EngineError::Unauthorized))
@@ -193,10 +214,9 @@ fn validate_token(auth: &AuthState, token: &str) -> Option<String> {
             return Some(sub);
         }
     }
-    if auth.config.strict() {
-        // Real auth is configured and nothing matched.
-        None
-    } else if token.is_empty() {
+    if auth.config.strict() || !auth.config.dev_mode || token.is_empty() {
+        // Real auth is configured and nothing matched, or nothing is
+        // configured and development mode was not requested: fail closed.
         None
     } else {
         // Development mode: any non-empty token maps to a fixed tenant.
@@ -233,9 +253,18 @@ mod tests {
     }
 
     #[test]
+    fn the_default_configuration_fails_closed() {
+        let closed: AuthState = AuthConfig::default().into();
+        assert_eq!(validate_token(&closed, "anything"), None);
+        assert_eq!(validate_token(&closed, "dev"), None);
+        assert_eq!(validate_token(&closed, ""), None);
+    }
+
+    #[test]
     fn strict_mode_disables_the_placeholder() {
-        let dev: AuthState = AuthConfig::default().into();
+        let dev: AuthState = AuthConfig::development().into();
         assert_eq!(validate_token(&dev, "anything"), Some("tenant1".into()));
+        assert_eq!(validate_token(&dev, ""), None);
 
         let strict: AuthState = AuthConfig {
             api_keys: vec![("k1".into(), "acme".into())],

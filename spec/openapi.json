@@ -11,7 +11,7 @@
       "name": "MIT",
       "url": "https://opensource.org/licenses/MIT"
     },
-    "version": "1.0.0"
+    "version": "0.2.0"
   },
   "servers": [
     {
@@ -1460,7 +1460,7 @@
         "operationId": "getStats",
         "responses": {
           "200": {
-            "description": "Engine counters. Process-local and reset on restart: in a split api/worker deployment this reflects only the process serving the request; query the database for fleet-wide history.",
+            "description": "Durable counts for the caller's tenant, read from the store: jobs in the store (`jobs_created`), jobs completed / failed, the sum of retries, dead letters, and the same for workflows. Fleet-wide and restart-safe, but retention deletes history, so counts can go down. Process-local engine counters are exposed on the Prometheus metrics port instead.",
             "content": {
               "application/json": {
                 "schema": {

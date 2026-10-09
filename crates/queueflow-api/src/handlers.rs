@@ -803,14 +803,19 @@ pub async fn list_tasks(State(s): State<ApiState>) -> Json<TasksResponse> {
 #[utoipa::path(
     get, path = "/api/v1/stats", tag = "system", operation_id = "getStats",
     responses((status = 200,
-        description = "Engine counters. Process-local and reset on restart: in a split \
-                       api/worker deployment this reflects only the process serving the \
-                       request; query the database for fleet-wide history.",
+        description = "Durable counts for the caller's tenant, read from the store: jobs in the \
+                       store (`jobs_created`), jobs completed / failed, the sum of retries, dead \
+                       letters, and the same for workflows. Fleet-wide and restart-safe, but \
+                       retention deletes history, so counts can go down. Process-local engine \
+                       counters are exposed on the Prometheus metrics port instead.",
         body = queueflow_core::StatsSnapshot)),
     security(("bearerAuth" = []))
 )]
-pub async fn get_stats(State(s): State<ApiState>) -> Json<queueflow_core::StatsSnapshot> {
-    Json(s.engine.stats())
+pub async fn get_stats(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+) -> Result<Json<queueflow_core::StatsSnapshot>, ApiError> {
+    Ok(Json(s.engine.tenant_stats(Some(&t.0)).await?))
 }
 
 // ---- Health (no auth) ------------------------------------------------------

@@ -185,6 +185,15 @@ where
         self.stats.clone()
     }
 
+    /// Durable, tenant-scoped counts read from the store (`None` = all
+    /// tenants). See [`JobStore::count_stats`].
+    pub async fn tenant_stats(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<crate::stats::StatsSnapshot, EngineError> {
+        Ok(self.store.count_stats(tenant_id).await?)
+    }
+
     /// A child token that fires when the engine shuts down.
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()

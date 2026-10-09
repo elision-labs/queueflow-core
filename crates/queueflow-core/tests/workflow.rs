@@ -830,6 +830,9 @@ impl JobStore for OrderProbe {
     async fn count_dead_letters(&self) -> Result<i64, StorageError> {
         self.inner.count_dead_letters().await
     }
+    async fn count_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, StorageError> {
+        self.inner.count_stats(tenant_id).await
+    }
     async fn list_dead_letters(
         &self,
         filter: &ListFilter,

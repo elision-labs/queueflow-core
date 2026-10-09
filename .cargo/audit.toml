@@ -1,0 +1,10 @@
+# cargo-audit configuration (also read by rustsec/audit-check in CI).
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin attack on the `rsa` crate). `rsa` is pulled in
+    # transitively by jsonwebtoken's rust_crypto backend. QueueFlow validates
+    # HS256 (HMAC) tokens only and never performs RSA operations, so the
+    # timing side channel is unreachable. No patched `rsa` release exists;
+    # revisit when jsonwebtoken drops the dependency or RSA support is added.
+    "RUSTSEC-2023-0071",
+]

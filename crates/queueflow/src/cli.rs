@@ -295,17 +295,24 @@ pub struct ServeArgs {
 
     /// Credential required by the worker-protocol endpoints (lease,
     /// heartbeat, complete, fail). Workers execute arbitrary tenants' jobs,
-    /// so this must not be a tenant token. Unset = development mode: any
-    /// authenticated caller may lease work (the server warns loudly).
+    /// so this must not be a tenant token. Required in `api` and `all` mode
+    /// unless --dev is set.
     #[arg(long, env = "QUEUEFLOW_WORKER_TOKEN")]
     pub worker_token: Option<String>,
 
     /// HS256 secret for validating tenant JWTs on `/api/v1` (the token's
     /// `sub` claim is the tenant id; `exp` is enforced). May be combined
-    /// with --api-keys. Unset (and no API keys) = development mode: any
-    /// non-empty token authenticates as a fixed tenant.
+    /// with --api-keys. In `api` and `all` mode at least one of
+    /// --jwt-secret / --api-keys is required unless --dev is set.
     #[arg(long, env = "QUEUEFLOW_JWT_SECRET")]
     pub jwt_secret: Option<String>,
+
+    /// Development mode: run the API without configured credentials. Any
+    /// non-empty bearer token authenticates as tenant `tenant1`, and without
+    /// --worker-token the worker-protocol endpoints accept any authenticated
+    /// caller. Never set this on a reachable deployment.
+    #[arg(long, env = "QUEUEFLOW_DEV", default_value_t = false)]
+    pub dev: bool,
 
     /// Static tenant API keys, comma-separated `token:tenant` pairs
     /// (e.g. "k1:acme,k2:globex"). May be combined with --jwt-secret.
@@ -322,8 +329,17 @@ pub struct ServeArgs {
     #[arg(long, env = "QUEUEFLOW_MAX_DB_CONNECTIONS", default_value_t = 50)]
     pub max_db_connections: u32,
 
-    /// Apply migrations on startup (idempotent).
-    #[arg(long, env = "QUEUEFLOW_AUTO_MIGRATE", default_value_t = true)]
+    /// Apply migrations on startup (idempotent). Pass `--auto-migrate false`
+    /// (or QUEUEFLOW_AUTO_MIGRATE=false) to skip them, e.g. when migrations
+    /// are run as a separate `queueflow migrate` step.
+    #[arg(
+        long,
+        env = "QUEUEFLOW_AUTO_MIGRATE",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     pub auto_migrate: bool,
 
     /// Delete terminal jobs/workflows/dead letters older than this many

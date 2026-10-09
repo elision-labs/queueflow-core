@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
@@ -58,9 +58,9 @@ reqwest = { version = "0.13", features = ["json", "query"] }
 # Internal crates. The `version` alongside `path` is what makes the crates
 # publishable: local builds resolve the path, `cargo publish` rewrites the
 # dependency to the registry version.
-queueflow-core = { path = "crates/queueflow-core", version = "0.1.0" }
-queueflow-api = { path = "crates/queueflow-api", version = "0.1.0" }
-queueflow-client = { path = "crates/queueflow-client", version = "0.1.0" }
+queueflow-core = { path = "crates/queueflow-core", version = "0.2.0" }
+queueflow-api = { path = "crates/queueflow-api", version = "0.2.0" }
+queueflow-client = { path = "crates/queueflow-client", version = "0.2.0" }
 
 [profile.release]
 opt-level = 3

@@ -51,7 +51,7 @@ Push a branch and let the full CI matrix pass on the org repo (it was
 re-enabled together with this file; the pg job needs nothing but the workflow
 itself).
 
-## 4. First publish (0.1.0)
+## 4. First publish (0.1.0, done 2026-10-02)
 
 1. Create a crates.io account (log in with the GitHub account that owns the
    org), verify the email address.
@@ -95,5 +95,9 @@ itself).
 
 1. Bump `workspace.package.version` and the three internal dependency
    versions in the root `Cargo.toml` (they move in lockstep).
-2. Update CHANGELOG/README as needed; `make spec` if the API changed.
-3. Tag `vX.Y.Z` and push the tag.
+2. Move the `[Unreleased]` entries in `CHANGELOG.md` under the new version
+   and date; update the README if flags or behaviour changed; `make spec`
+   if the API changed (CI fails on a stale spec).
+3. Tag `vX.Y.Z` and push the tag. The release workflow publishes the crates,
+   builds the binaries and the spec asset, and pushes the
+   `ghcr.io/elision-labs/queueflow` image tagged `X.Y.Z`, `X.Y`, and `latest`.

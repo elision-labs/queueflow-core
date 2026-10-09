@@ -23,7 +23,9 @@ pub struct ApiState {
     pub engine: Arc<dyn JobApi>,
     /// How callers authenticate (tenant JWTs / API keys, worker token),
     /// prepared for per-request use (the JWT decoding key is built once).
-    /// The default is development mode; see [`auth::AuthConfig`].
+    /// The default fails closed (no credentials configured, nothing
+    /// authenticates); see [`auth::AuthConfig`] and
+    /// [`auth::AuthConfig::development`].
     pub auth: Arc<auth::AuthState>,
     /// Origins allowed by CORS. Empty = permissive (the development
     /// default); set via [`ApiState::with_cors_origins`] to restrict.

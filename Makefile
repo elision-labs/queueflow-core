@@ -4,7 +4,7 @@
 CARGO ?= cargo
 BIN := queueflow
 SPEC_DIR := spec
-DOCKER_REGISTRY ?= ghcr.io/queueflow
+DOCKER_REGISTRY ?= ghcr.io/elision-labs
 DOCKER_TAG ?= dev
 OPENAPI_IMAGE := openapitools/openapi-generator-cli:v7.10.0
 

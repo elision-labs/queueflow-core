@@ -15,6 +15,7 @@ use super::listener::WorkHub;
 use super::{enum_from_str, to_jsonb};
 use crate::domain::*;
 use crate::ports::*;
+use crate::stats::StatsSnapshot;
 
 /// Advisory lock key for the retention sweep ("qflow_rt" as big-endian bytes):
 /// concurrent janitors must not race the same bulk delete.
@@ -575,6 +576,56 @@ impl JobStore for PostgresJobStore {
             .await
             .map_err(db)?;
         row.try_get(0).map_err(db)
+    }
+
+    async fn count_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, StorageError> {
+        // `$1 IS NULL OR tenant_id = $1` keeps one statement for both the
+        // scoped and the unscoped read; the scoped case uses idx_jobs_tenant.
+        let jobs = sqlx::query(
+            "SELECT COUNT(*) AS created, \
+                    COUNT(*) FILTER (WHERE status = 'completed') AS completed, \
+                    COUNT(*) FILTER (WHERE status = 'failed') AS failed, \
+                    COALESCE(SUM(retry_count), 0)::BIGINT AS retried \
+             FROM queueflow.jobs WHERE ($1::text IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)?;
+        let workflows = sqlx::query(
+            "SELECT COUNT(*) AS created, \
+                    COUNT(*) FILTER (WHERE status = 'completed') AS completed, \
+                    COUNT(*) FILTER (WHERE status IN ('failed', 'partially_failed')) AS failed \
+             FROM queueflow.workflows WHERE ($1::text IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)?;
+        let dead: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM queueflow.dead_letters WHERE ($1::text IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)?
+        .try_get(0)
+        .map_err(db)?;
+        let n = |row: &sqlx::postgres::PgRow, col: &str| -> Result<u64, StorageError> {
+            row.try_get::<i64, _>(col)
+                .map(|v| v.max(0) as u64)
+                .map_err(db)
+        };
+        Ok(StatsSnapshot {
+            jobs_created: n(&jobs, "created")?,
+            jobs_completed: n(&jobs, "completed")?,
+            jobs_failed: n(&jobs, "failed")?,
+            jobs_retried: n(&jobs, "retried")?,
+            jobs_dead_lettered: dead.max(0) as u64,
+            workflows_created: n(&workflows, "created")?,
+            workflows_completed: n(&workflows, "completed")?,
+            workflows_failed: n(&workflows, "failed")?,
+        })
     }
 
     async fn list_dead_letters(

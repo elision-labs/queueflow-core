@@ -7,6 +7,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use queueflow_api::auth::AuthConfig;
 use queueflow_api::{build_router, ApiState};
 use queueflow_core::task::builtin;
 use queueflow_core::*;
@@ -22,7 +23,16 @@ fn test_state() -> ApiState {
     // Pretend workers are running so /ready reports ready.
     let _ = engine.run_workers("default");
     engine.shutdown(); // we only needed the running flag flipped; stop the tasks
-    ApiState::new(engine)
+    ApiState::new(engine).with_auth(AuthConfig::development())
+}
+
+/// The library default: no credentials configured and no development mode,
+/// so every protected route must answer 401 whatever the token.
+fn fail_closed_app() -> axum::Router {
+    let clock = Arc::new(SystemClock);
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    let engine = Engine::builder(store, clock).build();
+    build_router(ApiState::new(engine))
 }
 
 fn app() -> axum::Router {
@@ -232,7 +242,7 @@ async fn cannot_cancel_another_tenants_job() {
         )
         .await
         .unwrap();
-    let app = build_router(ApiState::new(engine));
+    let app = build_router(ApiState::new(engine).with_auth(AuthConfig::development()));
 
     // The API authenticates every token as "tenant1", so this is cross-tenant.
     let resp = app
@@ -261,7 +271,7 @@ async fn job_events_stream_emits_status_and_closes_on_terminal() {
         .await
         .unwrap();
     engine.process_once("default").await.unwrap();
-    let app = build_router(ApiState::new(engine));
+    let app = build_router(ApiState::new(engine).with_auth(AuthConfig::development()));
 
     let resp = app
         .oneshot(req(
@@ -497,7 +507,7 @@ async fn dlq_endpoints_are_tenant_scoped_and_replay_once() {
         .find(|d| d.tenant_id.as_deref() == Some("someone-else"))
         .unwrap()
         .id;
-    let app = build_router(ApiState::new(engine));
+    let app = build_router(ApiState::new(engine).with_auth(AuthConfig::development()));
 
     // The list is scoped to the caller's tenant.
     let resp = app
@@ -589,11 +599,11 @@ async fn dlq_endpoints_are_tenant_scoped_and_replay_once() {
 
 #[tokio::test]
 async fn strict_auth_maps_credentials_to_tenants_and_rejects_the_rest() {
-    use queueflow_api::auth::AuthConfig;
     let app = build_router(test_state().with_auth(AuthConfig {
         jwt_secret: Some("s3cret".into()),
         api_keys: vec![("k-acme".into(), "acme".into())],
         worker_token: Some("wt".into()),
+        ..Default::default()
     }));
 
     // Placeholder tokens no longer authenticate once real auth is configured.
@@ -877,4 +887,96 @@ async fn list_jobs_filters_by_created_time_range() {
     let body = json_body(resp).await;
     assert_eq!(body["jobs"].as_array().unwrap().len(), 3);
     assert_eq!(body["total"], 3);
+}
+
+#[tokio::test]
+async fn the_default_state_fails_closed_on_every_protected_route() {
+    let app = fail_closed_app();
+    for (method, uri, body) in [
+        ("GET", "/api/v1/jobs", None),
+        (
+            "POST",
+            "/api/v1/jobs",
+            Some(json!({"task_name": "echo", "payload": {}})),
+        ),
+        ("GET", "/api/v1/stats", None),
+        ("GET", "/api/v1/tasks", None),
+        (
+            "POST",
+            "/api/v1/queues/default/lease",
+            Some(json!({"count": 1, "lease_secs": 30, "wait_secs": 0})),
+        ),
+    ] {
+        for token in [Some("dev"), Some("anything-at-all"), None] {
+            let resp = app
+                .clone()
+                .oneshot(req(method, uri, token, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} with token {token:?} must be rejected"
+            );
+        }
+    }
+    // Unauthenticated probes are unaffected.
+    let resp = app
+        .oneshot(req("GET", "/health", None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn stats_are_scoped_to_the_callers_tenant() {
+    let clock = Arc::new(SystemClock);
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    let engine = Engine::builder(store, clock)
+        .register("echo", builtin::echo())
+        .build();
+    // Two jobs for the caller (one completed), three for someone else.
+    for _ in 0..2 {
+        engine
+            .enqueue(
+                "echo",
+                Map::new(),
+                EnqueueOptions {
+                    tenant_id: Some("tenant1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    for _ in 0..3 {
+        engine
+            .enqueue(
+                "echo",
+                Map::new(),
+                EnqueueOptions {
+                    tenant_id: Some("other-tenant".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    engine.process_once("default").await.unwrap();
+    let app = build_router(ApiState::new(engine).with_auth(AuthConfig::development()));
+
+    let resp = app
+        .oneshot(req("GET", "/api/v1/stats", Some("dev"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["jobs_created"], 2, "{body}");
+    assert!(body["jobs_completed"].as_u64().unwrap() <= 2, "{body}");
+    assert_eq!(body["jobs_dead_lettered"], 0);
 }

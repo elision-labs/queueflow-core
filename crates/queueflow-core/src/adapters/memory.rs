@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::domain::*;
 use crate::ports::*;
+use crate::stats::StatsSnapshot;
 
 #[derive(Clone)]
 struct StepState {
@@ -540,6 +541,45 @@ impl JobStore for InMemoryJobStore {
 
     async fn count_dead_letters(&self) -> Result<i64, StorageError> {
         Ok(self.inner.dead_letters.lock().unwrap().len() as i64)
+    }
+
+    async fn count_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, StorageError> {
+        let owned = |t: &Option<String>| tenant_id.is_none_or(|want| t.as_deref() == Some(want));
+        let mut snap = StatsSnapshot::default();
+        {
+            let jobs = self.inner.jobs.lock().unwrap();
+            for j in jobs.values().filter(|j| owned(&j.tenant_id)) {
+                snap.jobs_created += 1;
+                snap.jobs_retried += u64::from(j.retry_count);
+                match j.status {
+                    JobStatus::Completed => snap.jobs_completed += 1,
+                    JobStatus::Failed => snap.jobs_failed += 1,
+                    _ => {}
+                }
+            }
+        }
+        {
+            let wfs = self.inner.workflows.lock().unwrap();
+            for w in wfs.values().filter(|w| owned(&w.tenant_id)) {
+                snap.workflows_created += 1;
+                match w.status {
+                    WorkflowStatus::Completed => snap.workflows_completed += 1,
+                    WorkflowStatus::Failed | WorkflowStatus::PartiallyFailed => {
+                        snap.workflows_failed += 1
+                    }
+                    _ => {}
+                }
+            }
+        }
+        snap.jobs_dead_lettered = self
+            .inner
+            .dead_letters
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| owned(&d.tenant_id))
+            .count() as u64;
+        Ok(snap)
     }
 
     async fn list_dead_letters(
