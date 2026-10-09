@@ -237,17 +237,19 @@ jobs:
       # Each SDK lives in its own public repo under the same owner. Its live
       # suite skips itself unless QUEUEFLOW_URL is set, so these are the only
       # places the suites actually run.
+      # Cloned OUTSIDE the checkout: inside it, cargo would treat the Rust SDK
+      # as a stray member of this repo's workspace and refuse to build it.
       - name: Checkout SDKs
         run: |
           for r in nodejs python go rust; do
-            git clone --depth 1 "https://github.com/${{ github.repository_owner }}/queueflow-sdk-${r}.git" ".sdk-${r}"
+            git clone --depth 1 "https://github.com/${{ github.repository_owner }}/queueflow-sdk-${r}.git" "${RUNNER_TEMP}/sdk-${r}"
           done
 
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
       - name: TypeScript SDK
-        working-directory: .sdk-nodejs
+        working-directory: ${{ runner.temp }}/sdk-nodejs
         run: |
           npm ci
           npm run build
@@ -257,7 +259,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Python SDK
-        working-directory: .sdk-python
+        working-directory: ${{ runner.temp }}/sdk-python
         run: |
           python -m pip install -q . pytest
           pytest -q -m live test/test_live.py
@@ -266,11 +268,11 @@ jobs:
         with:
           go-version: "1.24"
       - name: Go SDK
-        working-directory: .sdk-go
+        working-directory: ${{ runner.temp }}/sdk-go
         run: go test -count=1 -run Live ./...
 
       - name: Rust SDK
-        working-directory: .sdk-rust
+        working-directory: ${{ runner.temp }}/sdk-rust
         run: cargo test --test live
 
       - name: Server log on failure
