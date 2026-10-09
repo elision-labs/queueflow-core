@@ -85,11 +85,15 @@ itself).
    done
    ```
 
-2. Switch CI to crates.io **Trusted Publishing** (GitHub OIDC, no long-lived
-   token): each crate's crates.io Settings -> Trusted Publishing -> add the
-   org repo + `release.yml` workflow. Then, in `release.yml`, mint the token
-   with `rust-lang/crates-io-auth-action` instead of reading
-   `CARGO_REGISTRY_TOKEN`, and delete the repository secret.
+2. CI publishes through crates.io **Trusted Publishing** (GitHub OIDC, no
+   long-lived token). Trusted publishers are configured per crate: on
+   crates.io, open each of `queueflow-core`, `queueflow-api`,
+   `queueflow-client`, and `queueflow` -> Settings -> Trusted Publishing ->
+   add GitHub repository `elision-labs/queueflow-core`, workflow
+   `release.yml`, no environment. `release.yml` then mints one token with
+   `rust-lang/crates-io-auth-action` that covers all four. The
+   `CARGO_REGISTRY_TOKEN` repository secret is no longer read and can be
+   deleted once every crate has its trusted publisher.
 
 ## 6. Releasing after 0.1.0
 
