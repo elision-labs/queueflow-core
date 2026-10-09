@@ -48,14 +48,18 @@ out_dir_for() {
   esac
 }
 
-# Hand-written facade tests live inside the generated repos, but the generator
-# never emits them; without this list the pre-generation wipe would destroy
-# them on every regen.
+# Hand-written files live inside the generated repos, but the generator never
+# emits them; without this list the pre-generation wipe would destroy them on
+# every regen. They are restored BEFORE generation so the repo's
+# .openapi-generator-ignore is in place and the generator leaves them alone
+# (README.md, LICENSE, pyproject.toml and the CI workflows would otherwise be
+# overwritten by the generator's stock templates). Paths may be directories.
 handwritten_for() {
+  local common="README.md LICENSE FACADE.md .openapi-generator-ignore .github"
   case "$1" in
-    python) echo "test/test_facade.py" ;;
-    go)     echo "facade_test.go" ;;
-    rust)   echo "tests/facade.rs" ;;
+    python) echo "${common} pyproject.toml test/test_facade.py test/test_live.py" ;;
+    go)     echo "${common} facade_test.go live_test.go" ;;
+    rust)   echo "${common} tests/facade.rs tests/live.rs" ;;
     *)      echo "" ;;
   esac
 }
@@ -102,16 +106,26 @@ generate() {
   fi
 
   # Stash the hand-written files the wipe below would otherwise destroy.
-  local keep tmp_keep=""
-  keep="$(handwritten_for "${name}")"
-  if [[ -n "${keep}" && -e "${out}/${keep}" ]]; then
-    tmp_keep="$(mktemp -d)"
-    mkdir -p "${tmp_keep}/$(dirname "${keep}")"
-    cp "${out}/${keep}" "${tmp_keep}/${keep}"
-  fi
+  local keep tmp_keep
+  tmp_keep="$(mktemp -d)"
+  for keep in $(handwritten_for "${name}"); do
+    if [[ -e "${out}/${keep}" ]]; then
+      mkdir -p "${tmp_keep}/$(dirname "${keep}")"
+      cp -R "${out}/${keep}" "${tmp_keep}/${keep}"
+    fi
+  done
 
-  # Wipe everything except .git so stale generated files do not linger.
+  # Wipe everything except .git so stale generated files do not linger, then
+  # put the hand-written files straight back so the generator sees the
+  # .openapi-generator-ignore and skips everything it lists.
   find "${out}" -mindepth 1 -maxdepth 1 -not -name '.git' -exec rm -rf {} +
+  for keep in $(handwritten_for "${name}"); do
+    if [[ -e "${tmp_keep}/${keep}" ]]; then
+      mkdir -p "${out}/$(dirname "${keep}")"
+      cp -R "${tmp_keep}/${keep}" "${out}/${keep}"
+    fi
+  done
+  rm -rf "${tmp_keep}"
 
   echo "==> Generating ${name} SDK into ${out}"
   # Mount the spec, config, and output dir individually so a generation can
@@ -133,12 +147,7 @@ generate() {
       -c /config.yaml \
       -o /out
 
-  # Restore the stashed hand-written files.
-  if [[ -n "${tmp_keep}" ]]; then
-    mkdir -p "${out}/$(dirname "${keep}")"
-    cp "${tmp_keep}/${keep}" "${out}/${keep}"
-    rm -rf "${tmp_keep}"
-  fi
+  # (Hand-written files were restored before generation; see above.)
 
   # The generator emits a go.mod with an empty require block, but the
   # generated test/ package imports testify; without a tidy the SDK ships
@@ -151,17 +160,9 @@ generate() {
     fi
   fi
 
-  # The python generator's built-in pyproject/setup templates ship
-  # openapitools placeholders and point mypy at a nonexistent tests/ dir
-  # (ours is test/). Patch them post-generation so the published metadata is
-  # ours and the hand-written test/test_facade.py is actually type-checked.
-  if [[ "${name}" == "python" ]]; then
-    sed -i '' \
-      -e 's|authors = \["QueueFlow <team@openapitools.org>"\]|authors = ["QueueFlow"]|' \
-      -e 's|https://github.com/GIT_USER_ID/GIT_REPO_ID|https://github.com/elision-labs/queueflow-sdk-python|' \
-      -e 's|#"test",  # auto-generated tests|"test",|' \
-      -e 's|"tests", # hand-written tests||' \
-      "${out}/pyproject.toml"
+  # pyproject.toml is hand-written (PEP 621, preserved above); the generator's
+  # built-in setup.py still ships an openapitools contact address.
+  if [[ "${name}" == "python" && -f "${out}/setup.py" ]]; then
     sed -i '' 's|team@openapitools.org|team@queueflow.dev|' "${out}/setup.py"
   fi
 }

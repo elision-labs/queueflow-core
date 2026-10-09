@@ -1,13 +1,13 @@
-# DEPRECATED / UNUSED: the TypeScript SDK (../queueflow-sdk-nodejs) is now
-# hand-written for better ergonomics and is no longer produced by
-# openapi-generator. This config is kept only for reference; `make sdks` and
-# scripts/generate-sdks.sh skip the `typescript` target.
+# NOT USED by scripts/generate-sdks.sh. The TypeScript SDK
+# (../queueflow-sdk-nodejs) regenerates its own generated core/ from this
+# spec with `npm run generate-core` and keeps a hand-written facade, worker
+# runtime, and SSE watcher in src/. Kept for reference only;
+# scripts/check-ts-sdk.mjs guards that repo against spec drift.
 #
-# openapi-generator config for the TypeScript SDK (Fetch API, no axios).
 generatorName: typescript-fetch
 additionalProperties:
   npmName: "@queueflow/sdk"
-  npmVersion: 0.1.0
+  npmVersion: 0.2.0
   npmRepository: https://github.com/elision-labs/queueflow-sdk-nodejs
   supportsES6: true
   withInterfaces: true
