@@ -548,3 +548,66 @@ async fn pg_keyset_cursor_pages_without_offset() {
     }
     assert_eq!(walked, all, "cursor paging must reproduce the full listing");
 }
+
+#[tokio::test]
+async fn pg_count_stats_are_scoped_to_the_tenant() {
+    let queue = "test_count_stats";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    let engine = Engine::builder(store, Arc::new(SystemClock))
+        .default_queue(queue)
+        .register("echo", builtin::echo())
+        .build();
+
+    // Tenants are database-wide (not per queue), so pick ids no other test or
+    // earlier run can have used.
+    let mine = format!("stats-mine-{}", uuid::Uuid::new_v4());
+    let theirs = format!("stats-theirs-{}", uuid::Uuid::new_v4());
+    for tenant in [&mine, &mine, &theirs] {
+        engine
+            .enqueue(
+                "echo",
+                Map::new(),
+                EnqueueOptions {
+                    tenant_id: Some(tenant.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    // An unknown task for the other tenant lands in the DLQ immediately.
+    engine
+        .enqueue(
+            "no_such_task",
+            Map::new(),
+            EnqueueOptions {
+                tenant_id: Some(theirs.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        engine.process_once(queue).await.unwrap();
+    }
+
+    let snap = engine.tenant_stats(Some(&mine)).await.unwrap();
+    assert_eq!(snap.jobs_created, 2);
+    assert_eq!(snap.jobs_completed, 2);
+    assert_eq!(snap.jobs_failed, 0);
+    assert_eq!(snap.jobs_dead_lettered, 0);
+    assert_eq!(snap.workflows_created, 0);
+
+    let snap = engine.tenant_stats(Some(&theirs)).await.unwrap();
+    assert_eq!(snap.jobs_created, 2);
+    assert_eq!(snap.jobs_completed, 1);
+    assert_eq!(snap.jobs_dead_lettered, 1);
+
+    let nobody = engine
+        .tenant_stats(Some("stats-nobody-ever"))
+        .await
+        .unwrap();
+    assert_eq!(nobody, StatsSnapshot::default());
+}
