@@ -16,6 +16,7 @@ on:
 permissions:
   contents: read
   issues: write # the audit action opens an issue when a vuln is found
+  checks: write # and reports the result as a check run
 
 jobs:
   audit:
