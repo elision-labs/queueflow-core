@@ -319,8 +319,10 @@ pub struct ServeArgs {
     #[arg(long, env = "QUEUEFLOW_DEV", default_value_t = false)]
     pub dev: bool,
 
-    /// Static tenant API keys, comma-separated `token:tenant` pairs
-    /// (e.g. "k1:acme,k2:globex"). May be combined with --jwt-secret.
+    /// Static tenant API keys, comma-separated `token:tenant` entries
+    /// (e.g. "k1:acme,k2:globex"). Append `:ro` for a read-only key
+    /// ("viewer:acme:ro") that may call GET routes and the dashboard but
+    /// gets 403 on every write. May be combined with --jwt-secret.
     #[arg(long, env = "QUEUEFLOW_API_KEYS")]
     pub api_keys: Option<String>,
 

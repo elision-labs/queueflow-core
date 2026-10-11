@@ -191,8 +191,11 @@ graph TD
 ## How-to (REST API)
 
 Every `/api/v1` route needs a bearer token. Configure tenant credentials with `--jwt-secret`
-(HS256; the `sub` claim is the tenant) and/or `--api-keys "token:tenant,..."`. Worker-protocol
-endpoints take the separate `--worker-token` credential. The server fails closed: without both a
+(HS256; the `sub` claim is the tenant) and/or `--api-keys "token:tenant,..."`. A key with a
+third field `ro` (`viewer:acme:ro`), or a JWT whose `scope` claim is `read`, is **read-only**: it
+can call every `GET` route, the SSE streams, and the dashboard, and gets `403` on anything that
+writes. Hand those to dashboards and support staff. Worker-protocol endpoints take the separate
+`--worker-token` credential. The server fails closed: without both a
 tenant credential source and a worker token it refuses to start, unless `--dev` is passed, in which
 case any non-empty token maps to the fixed tenant `tenant1` (the examples below assume `--dev`).
 
@@ -339,7 +342,7 @@ queueflow stats
 | `--default-queue` | `QUEUEFLOW_DEFAULT_QUEUE` | `default` | Default queue name |
 | `--worker-token` | `QUEUEFLOW_WORKER_TOKEN` | unset | Credential required by the worker-protocol endpoints (lease/heartbeat/complete/fail). Required in `api`/`all` mode unless `--dev` |
 | `--jwt-secret` | `QUEUEFLOW_JWT_SECRET` | unset | HS256 secret for tenant JWTs (`sub` = tenant id, `exp` enforced) |
-| `--api-keys` | `QUEUEFLOW_API_KEYS` | unset | Static tenant API keys, `token:tenant,...`. One of this or `--jwt-secret` is required in `api`/`all` mode unless `--dev` |
+| `--api-keys` | `QUEUEFLOW_API_KEYS` | unset | Static tenant API keys, `token:tenant,...`; append `:ro` for a read-only key (`viewer:acme:ro`). One of this or `--jwt-secret` is required in `api`/`all` mode unless `--dev` |
 | `--dev` | `QUEUEFLOW_DEV` | off | Development mode: run without credentials. Any non-empty token is tenant `tenant1`; without a worker token the worker endpoints accept any authenticated caller. Never on a reachable server |
 | `--cors-origins` | `QUEUEFLOW_CORS_ORIGINS` | unset | Comma-separated allowed origins. Unset = permissive CORS (warns) |
 | `--max-db-connections` | `QUEUEFLOW_MAX_DB_CONNECTIONS` | `50` | Connection pool size |

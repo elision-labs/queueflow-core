@@ -656,7 +656,7 @@ async fn dlq_endpoints_are_tenant_scoped_and_replay_once() {
 async fn strict_auth_maps_credentials_to_tenants_and_rejects_the_rest() {
     let app = build_router(test_state().with_auth(AuthConfig {
         jwt_secret: Some("s3cret".into()),
-        api_keys: vec![("k-acme".into(), "acme".into())],
+        api_keys: vec![queueflow_api::auth::ApiKey::new("k-acme", "acme")],
         worker_token: Some("wt".into()),
         ..Default::default()
     }));
@@ -1106,4 +1106,120 @@ async fn queues_report_backlog_for_the_callers_tenant_only() {
     assert_eq!(queues[1]["scheduled"], 1);
     assert_eq!(queues[1]["running"], 0);
     assert!(queues[1]["oldest_pending_age_secs"].is_u64());
+}
+
+#[tokio::test]
+async fn read_only_keys_can_read_everything_but_write_nothing() {
+    use queueflow_api::auth::ApiKey;
+    let clock = Arc::new(SystemClock);
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    let engine = Engine::builder(store, clock)
+        .register("echo", builtin::echo())
+        .build();
+    engine.mark_running();
+    let id = engine
+        .enqueue(
+            "echo",
+            Map::new(),
+            EnqueueOptions {
+                tenant_id: Some("acme".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let app = build_router(ApiState::new(engine).with_auth(AuthConfig {
+        api_keys: vec![
+            ApiKey::read_only("viewer", "acme"),
+            ApiKey::new("writer", "acme"),
+        ],
+        worker_token: Some("wt".into()),
+        ..Default::default()
+    }));
+
+    // Reads work for the viewer, scoped to its tenant.
+    for uri in [
+        "/api/v1/jobs",
+        &format!("/api/v1/jobs/{id}"),
+        "/api/v1/queues",
+        "/api/v1/stats",
+        "/api/v1/workflows",
+        "/api/v1/dlq",
+        "/api/v1/cron",
+        "/api/v1/tasks",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(req("GET", uri, Some("viewer"), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET {uri} with the viewer key"
+        );
+    }
+
+    // Every write is refused with 403, before any handler runs.
+    for (method, uri, body) in [
+        (
+            "POST",
+            "/api/v1/jobs",
+            Some(json!({"task_name": "echo", "payload": {}})),
+        ),
+        ("POST", &format!("/api/v1/jobs/{id}/cancel"), None),
+        (
+            "POST",
+            "/api/v1/workflows",
+            Some(json!({"name": "w", "steps": []})),
+        ),
+        (
+            "POST",
+            "/api/v1/cron",
+            Some(json!({"name": "c", "cron_expr": "* * * * *", "task_name": "echo"})),
+        ),
+        ("DELETE", "/api/v1/cron/nope", None),
+        ("POST", "/api/v1/dlq/1/replay", None),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(req(method, uri, Some("viewer"), body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} with the viewer key"
+        );
+    }
+    // The job was not cancelled by the refused request.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/api/v1/jobs/{id}"),
+            Some("writer"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["status"], "pending", "{body}");
+
+    // The writer key can still write.
+    let resp = app
+        .oneshot(req(
+            "POST",
+            "/api/v1/jobs",
+            Some("writer"),
+            Some(json!({"task_name": "echo", "payload": {}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
 }

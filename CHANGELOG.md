@@ -10,6 +10,21 @@ versions may contain breaking changes, which are called out explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **Read-only tenant credentials.** `--api-keys` accepts `token:tenant:ro`
+  entries and JWTs may carry a `scope` claim (`"read"` makes the token
+  read-only). Read-only credentials pass every `GET` route, the SSE streams,
+  and the dashboard, and get `403` on writes, enforced in the auth
+  middleware before any handler runs. The request extensions now carry an
+  `auth::Access` value next to `Tenant`.
+
+### Breaking
+
+- Library users: `AuthConfig::api_keys` is `Vec<auth::ApiKey>` instead of
+  `Vec<(String, String)>`; `parse_api_keys` returns the same. Use
+  `ApiKey::new(token, tenant)` or `ApiKey::read_only(token, tenant)`.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added

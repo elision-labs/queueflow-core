@@ -9,7 +9,12 @@
 //!   - **JWTs** (HS256): configure `--jwt-secret`; the token's `sub` claim is
 //!     the tenant id and `exp` is enforced.
 //!   - **Static API keys**: configure `--api-keys "token:tenant,..."`; the
-//!     token maps to its tenant.
+//!     token maps to its tenant. A third field makes a key read-only
+//!     (`token:tenant:ro`): it may call every `GET` route, including the
+//!     dashboard and SSE streams, and gets `403` on anything that writes.
+//!   - JWTs can carry an optional `scope` claim; `"read"` (or any
+//!     space-separated scope list without `write`) makes the token read-only
+//!     in the same way.
 //!
 //!   With neither configured, every tenant route answers `401`: the API
 //!   fails closed.
@@ -33,6 +38,39 @@ use queueflow_core::EngineError;
 use crate::error::ApiError;
 use crate::ApiState;
 
+/// One static tenant credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiKey {
+    pub token: String,
+    pub tenant: String,
+    /// Read-only keys pass `GET`/`HEAD` routes only; writes answer `403`.
+    pub read_only: bool,
+}
+
+impl ApiKey {
+    pub fn new(token: impl Into<String>, tenant: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+            tenant: tenant.into(),
+            read_only: false,
+        }
+    }
+
+    pub fn read_only(token: impl Into<String>, tenant: impl Into<String>) -> Self {
+        Self {
+            read_only: true,
+            ..Self::new(token, tenant)
+        }
+    }
+}
+
+/// What a validated tenant credential is allowed to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    ReadWrite,
+    ReadOnly,
+}
+
 /// How the API authenticates callers. Attached to [`ApiState`].
 #[derive(Clone, Debug, Default)]
 pub struct AuthConfig {
@@ -40,10 +78,10 @@ pub struct AuthConfig {
     /// authenticated caller may act as a worker (development mode).
     pub worker_token: Option<String>,
     /// HS256 secret for validating tenant JWTs (`sub` = tenant id, `exp`
-    /// enforced).
+    /// enforced, optional `scope`).
     pub jwt_secret: Option<String>,
-    /// Static API keys as `(token, tenant)` pairs.
-    pub api_keys: Vec<(String, String)>,
+    /// Static API keys.
+    pub api_keys: Vec<ApiKey>,
     /// Development mode: with no tenant credentials configured, any non-empty
     /// token authenticates as tenant `tenant1`; with no worker token, any
     /// authenticated caller may act as a worker. `false` (the default) fails
@@ -86,20 +124,39 @@ impl From<AuthConfig> for AuthState {
     }
 }
 
-/// Parse `--api-keys` input: comma-separated `token:tenant` pairs.
-pub fn parse_api_keys(raw: &str) -> Result<Vec<(String, String)>, String> {
+/// Parse `--api-keys` input: comma-separated `token:tenant` or
+/// `token:tenant:ro` (read-only) / `token:tenant:rw` entries.
+pub fn parse_api_keys(raw: &str) -> Result<Vec<ApiKey>, String> {
     let mut out = Vec::new();
-    for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let Some((token, tenant)) = pair.split_once(':') else {
-            return Err(format!("api key entry '{pair}' is not 'token:tenant'"));
+    for entry in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let mut parts = entry.split(':').map(str::trim);
+        let (Some(token), Some(tenant)) = (parts.next(), parts.next()) else {
+            return Err(format!(
+                "api key entry '{entry}' is not 'token:tenant' or 'token:tenant:ro'"
+            ));
         };
-        let (token, tenant) = (token.trim(), tenant.trim());
         if token.is_empty() || tenant.is_empty() {
             return Err(format!(
-                "api key entry '{pair}' has an empty token or tenant"
+                "api key entry '{entry}' has an empty token or tenant"
             ));
         }
-        out.push((token.to_string(), tenant.to_string()));
+        let read_only = match parts.next() {
+            None | Some("rw") => false,
+            Some("ro") => true,
+            Some(other) => {
+                return Err(format!(
+                    "api key entry '{entry}': role must be 'ro' or 'rw', got '{other}'"
+                ))
+            }
+        };
+        if parts.next().is_some() {
+            return Err(format!("api key entry '{entry}' has too many fields"));
+        }
+        out.push(ApiKey {
+            token: token.to_string(),
+            tenant: tenant.to_string(),
+            read_only,
+        });
     }
     Ok(out)
 }
@@ -107,6 +164,15 @@ pub fn parse_api_keys(raw: &str) -> Result<Vec<(String, String)>, String> {
 /// The authenticated tenant, injected into request extensions.
 #[derive(Clone, Debug)]
 pub struct Tenant(pub String);
+
+/// Methods a read-only credential may use. Every mutating route is a
+/// `POST` or `DELETE`, so the HTTP method is the whole policy.
+fn is_read_method(m: &axum::http::Method) -> bool {
+    matches!(
+        *m,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    )
+}
 
 /// The bearer token on a request, if any.
 fn bearer_token(req: &Request) -> Option<&str> {
@@ -145,8 +211,13 @@ pub async fn bearer_auth(
             return Err(ApiError(EngineError::Forbidden));
         }
     }
-    let tenant = validate_token(&state.auth, token).ok_or(ApiError(EngineError::Unauthorized))?;
+    let (tenant, access) =
+        validate_token(&state.auth, token).ok_or(ApiError(EngineError::Unauthorized))?;
+    if access == Access::ReadOnly && !is_read_method(req.method()) {
+        return Err(ApiError(EngineError::Forbidden));
+    }
     req.extensions_mut().insert(Tenant(tenant));
+    req.extensions_mut().insert(access);
     Ok(next.run(req).await)
 }
 
@@ -184,16 +255,33 @@ pub async fn worker_auth(
 }
 
 /// The `sub` claim carries the tenant id; `exp` is enforced by
-/// [`jsonwebtoken::Validation`]'s defaults.
+/// [`jsonwebtoken::Validation`]'s defaults. An optional `scope` claim
+/// (space-separated) restricts the token: a scope list that names `read`
+/// but not `write` makes it read-only.
 #[derive(serde::Deserialize)]
 struct Claims {
     sub: String,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
-fn validate_jwt(key: &jsonwebtoken::DecodingKey, token: &str) -> Option<String> {
+fn validate_jwt(key: &jsonwebtoken::DecodingKey, token: &str) -> Option<(String, Access)> {
     let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     match jsonwebtoken::decode::<Claims>(token, key, &validation) {
-        Ok(data) => Some(data.claims.sub),
+        Ok(data) => {
+            let access = match data.claims.scope.as_deref() {
+                Some(scope) => {
+                    let scopes: Vec<&str> = scope.split_whitespace().collect();
+                    if scopes.contains(&"read") && !scopes.contains(&"write") {
+                        Access::ReadOnly
+                    } else {
+                        Access::ReadWrite
+                    }
+                }
+                None => Access::ReadWrite,
+            };
+            Some((data.claims.sub, access))
+        }
         Err(e) => {
             tracing::debug!(error = %e, "jwt rejected");
             None
@@ -201,17 +289,22 @@ fn validate_jwt(key: &jsonwebtoken::DecodingKey, token: &str) -> Option<String> 
     }
 }
 
-/// Validate a tenant credential and return its tenant id.
-fn validate_token(auth: &AuthState, token: &str) -> Option<String> {
+/// Validate a tenant credential and return its tenant id and access level.
+fn validate_token(auth: &AuthState, token: &str) -> Option<(String, Access)> {
     // Static API keys first: exact, constant-time comparison per key.
-    for (key, tenant) in &auth.config.api_keys {
-        if ct_eq(token, key) {
-            return Some(tenant.clone());
+    for key in &auth.config.api_keys {
+        if ct_eq(token, &key.token) {
+            let access = if key.read_only {
+                Access::ReadOnly
+            } else {
+                Access::ReadWrite
+            };
+            return Some((key.tenant.clone(), access));
         }
     }
     if let Some(key) = &auth.jwt_key {
-        if let Some(sub) = validate_jwt(key, token) {
-            return Some(sub);
+        if let Some(found) = validate_jwt(key, token) {
+            return Some(found);
         }
     }
     if auth.config.strict() || !auth.config.dev_mode || token.is_empty() {
@@ -220,13 +313,13 @@ fn validate_token(auth: &AuthState, token: &str) -> Option<String> {
         None
     } else {
         // Development mode: any non-empty token maps to a fixed tenant.
-        Some("tenant1".to_string())
+        Some(("tenant1".to_string(), Access::ReadWrite))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ct_eq, parse_api_keys, validate_token, AuthConfig, AuthState};
+    use super::{ct_eq, parse_api_keys, validate_token, Access, ApiKey, AuthConfig, AuthState};
 
     #[test]
     fn ct_eq_matches_equal_strings_only() {
@@ -240,16 +333,64 @@ mod tests {
     #[test]
     fn api_keys_parse_and_reject_malformed() {
         assert_eq!(
-            parse_api_keys("a:t1, b:t2").unwrap(),
+            parse_api_keys("a:t1, b:t2:ro, c:t3:rw").unwrap(),
             vec![
-                ("a".to_string(), "t1".to_string()),
-                ("b".to_string(), "t2".to_string())
+                ApiKey::new("a", "t1"),
+                ApiKey::read_only("b", "t2"),
+                ApiKey::new("c", "t3"),
             ]
         );
         assert!(parse_api_keys("missing-tenant").is_err());
         assert!(parse_api_keys(":t").is_err());
         assert!(parse_api_keys("t:").is_err());
+        assert!(parse_api_keys("t:x:admin").is_err());
+        assert!(parse_api_keys("t:x:ro:extra").is_err());
         assert_eq!(parse_api_keys("").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn read_only_keys_and_scoped_jwts_report_read_only_access() {
+        let cfg: AuthState = AuthConfig {
+            jwt_secret: Some("s3cret".into()),
+            api_keys: vec![
+                ApiKey::read_only("viewer", "acme"),
+                ApiKey::new("writer", "acme"),
+            ],
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            validate_token(&cfg, "viewer"),
+            Some(("acme".into(), Access::ReadOnly))
+        );
+        assert_eq!(
+            validate_token(&cfg, "writer"),
+            Some(("acme".into(), Access::ReadWrite))
+        );
+        let exp = (chrono::Utc::now().timestamp() + 3600) as usize;
+        let mint = |claims: serde_json::Value| {
+            jsonwebtoken::encode(
+                &jsonwebtoken::Header::default(),
+                &claims,
+                &jsonwebtoken::EncodingKey::from_secret(b"s3cret"),
+            )
+            .unwrap()
+        };
+        let ro = mint(serde_json::json!({ "sub": "acme", "exp": exp, "scope": "read" }));
+        let rw = mint(serde_json::json!({ "sub": "acme", "exp": exp, "scope": "read write" }));
+        let plain = mint(serde_json::json!({ "sub": "acme", "exp": exp }));
+        assert_eq!(
+            validate_token(&cfg, &ro),
+            Some(("acme".into(), Access::ReadOnly))
+        );
+        assert_eq!(
+            validate_token(&cfg, &rw),
+            Some(("acme".into(), Access::ReadWrite))
+        );
+        assert_eq!(
+            validate_token(&cfg, &plain),
+            Some(("acme".into(), Access::ReadWrite))
+        );
     }
 
     #[test]
@@ -263,15 +404,21 @@ mod tests {
     #[test]
     fn strict_mode_disables_the_placeholder() {
         let dev: AuthState = AuthConfig::development().into();
-        assert_eq!(validate_token(&dev, "anything"), Some("tenant1".into()));
+        assert_eq!(
+            validate_token(&dev, "anything"),
+            Some(("tenant1".into(), Access::ReadWrite))
+        );
         assert_eq!(validate_token(&dev, ""), None);
 
         let strict: AuthState = AuthConfig {
-            api_keys: vec![("k1".into(), "acme".into())],
+            api_keys: vec![ApiKey::new("k1", "acme")],
             ..Default::default()
         }
         .into();
-        assert_eq!(validate_token(&strict, "k1"), Some("acme".into()));
+        assert_eq!(
+            validate_token(&strict, "k1"),
+            Some(("acme".into(), Access::ReadWrite))
+        );
         assert_eq!(validate_token(&strict, "anything"), None);
     }
 
@@ -289,7 +436,10 @@ mod tests {
             &jsonwebtoken::EncodingKey::from_secret(b"s3cret"),
         )
         .unwrap();
-        assert_eq!(validate_token(&cfg, &token), Some("acme".into()));
+        assert_eq!(
+            validate_token(&cfg, &token),
+            Some(("acme".into(), Access::ReadWrite))
+        );
 
         // Wrong signature and garbage are both rejected outright.
         let forged = jsonwebtoken::encode(
