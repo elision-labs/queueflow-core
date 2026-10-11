@@ -53,13 +53,15 @@ func main() {
 `HTTPClient`) build a client exposing:
 
 - `.Client` and `.WorkerClient`: the generated `*APIClient`s (tenant and worker credential).
-- Jobs: `CreateJob`, `CreateJobWithOptions`, `GetJob`, `ListJobs`, `CancelJob`, `WaitForJob`.
+- Jobs: `CreateJob`, `CreateJobWithOptions`, `GetJob`, `ListJobs`, `CancelJob`, `CancelJobs`
+  (bulk, by filter), `WaitForJob`.
 - Workflows: `CreateWorkflow`, `GetWorkflow`, `ListWorkflows`, `CancelWorkflow`, `WorkflowDiagram`,
   `WorkflowSteps`, `WaitForWorkflow`.
 - Cron: `CreateCron`, `CreateCronWithOptions`, `ListCrons`, `GetCron`, `DeleteCron`, `PauseCron`,
   `ResumeCron`.
-- Dead letters: `ListDeadLetters`, `GetDeadLetter`, `ReplayDeadLetter`.
-- System: `Stats`, `Queues`, `Tasks`, `Health`, `Ready`.
+- Dead letters: `ListDeadLetters`, `GetDeadLetter`, `ReplayDeadLetter`, `ReplayDeadLetters` (bulk,
+  by filter).
+- System: `Stats`, `Queues`, `PauseQueue`, `ResumeQueue`, `Tasks`, `WhoAmI`, `Health`, `Ready`.
 - Worker: `Run` (the runtime) and the raw protocol `LeaseJobs`, `HeartbeatJob`, `CompleteJob`,
   `FailJob`.
 

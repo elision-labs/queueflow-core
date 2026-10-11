@@ -7,9 +7,10 @@ generated package but is never produced by the raw codegen. The wire types and
 the per-tag API services come from the generated files and are never edited.
 
 The facade is the recommended entry point: a QueueFlow client with one method
-per endpoint, WaitForJob/WaitForWorkflow pollers, a workflow builder with local
-DAG validation, typed errors, and a worker runtime (Run) that leases jobs,
-heartbeats them, and reports outcomes.
+per endpoint (including the bulk CancelJobs and ReplayDeadLetters, queue
+PauseQueue/ResumeQueue and WhoAmI), WaitForJob/WaitForWorkflow pollers, a
+workflow builder with local DAG validation, typed errors, and a worker runtime
+(Run) that leases jobs, heartbeats them, and reports outcomes.
 */
 
 package queueflow
@@ -238,6 +239,12 @@ type ListOptions struct {
 	Cursor        string
 	CreatedAfter  *time.Time
 	CreatedBefore *time.Time
+	// TaskName keeps only jobs (ListJobs) or dead letters (ListDeadLetters)
+	// of one task. The workflow and cron lists ignore it.
+	TaskName string
+	// Replayed, when set, keeps only dead letters already replayed (true) or
+	// not yet replayed (false). Only ListDeadLetters sends it.
+	Replayed *bool
 }
 
 // WaitOptions tunes WaitForJob and WaitForWorkflow. Zero values default to a
@@ -403,6 +410,9 @@ func (q *QueueFlow) ListJobs(ctx context.Context, opts ListOptions) (*ListJobsRe
 	if opts.Queue != "" {
 		r = r.Queue(opts.Queue)
 	}
+	if opts.TaskName != "" {
+		r = r.TaskName(opts.TaskName)
+	}
 	if opts.Limit > 0 {
 		r = r.Limit(opts.Limit)
 	}
@@ -435,6 +445,63 @@ func (q *QueueFlow) ListJobs(ctx context.Context, opts ListOptions) (*ListJobsRe
 func (q *QueueFlow) CancelJob(ctx context.Context, id string) error {
 	resp, err := q.Client.JobsAPI.CancelJob(ctx, id).Execute()
 	return wrap("CancelJob", resp, err)
+}
+
+// CancelJobsFilter selects which of the caller's non-terminal jobs CancelJobs
+// cancels. Every field is optional; zero values are not sent, so the zero
+// filter cancels the caller's oldest 100 non-terminal jobs.
+type CancelJobsFilter struct {
+	// Queue keeps only jobs on this queue.
+	Queue string
+	// TaskName keeps only jobs of this task.
+	TaskName string
+	// Status is "pending", "retrying" or "running" (all three when empty).
+	// A terminal status is rejected with a 400: history is never rewritten.
+	Status string
+	// CreatedAfter keeps only jobs created at or after this instant.
+	CreatedAfter *time.Time
+	// CreatedBefore keeps only jobs created strictly before this instant.
+	CreatedBefore *time.Time
+	// Limit caps how many are cancelled, oldest first (default 100; the
+	// maximum is the server's --max-batch, 1000 by default).
+	Limit int64
+}
+
+func (f CancelJobsFilter) request() CancelJobsRequest {
+	req := CancelJobsRequest{}
+	if f.Queue != "" {
+		req.Queue = *NewNullableString(PtrString(f.Queue))
+	}
+	if f.TaskName != "" {
+		req.TaskName = *NewNullableString(PtrString(f.TaskName))
+	}
+	if f.Status != "" {
+		req.Status = *NewNullableString(PtrString(f.Status))
+	}
+	if f.CreatedAfter != nil {
+		t := f.CreatedAfter.UTC()
+		req.CreatedAfter = *NewNullableTime(&t)
+	}
+	if f.CreatedBefore != nil {
+		t := f.CreatedBefore.UTC()
+		req.CreatedBefore = *NewNullableTime(&t)
+	}
+	if f.Limit > 0 {
+		req.Limit = *NewNullableInt64(PtrInt64(f.Limit))
+	}
+	return req
+}
+
+// CancelJobs cancels the caller's non-terminal jobs matching filter, oldest
+// first, up to filter.Limit (default 100), and returns how many it cancelled.
+// A count below the limit means the matching set is exhausted; jobs that
+// finish concurrently are left as they ended.
+func (q *QueueFlow) CancelJobs(ctx context.Context, filter CancelJobsFilter) (int64, error) {
+	out, resp, err := q.Client.JobsAPI.CancelJobs(ctx).CancelJobsRequest(filter.request()).Execute()
+	if err != nil {
+		return 0, wrap("CancelJobs", resp, err)
+	}
+	return out.Cancelled, nil
 }
 
 // WaitForJob polls until the job reaches a terminal state (completed, failed
@@ -664,6 +731,12 @@ func (q *QueueFlow) ListDeadLetters(ctx context.Context, opts ListOptions) (*Lis
 	if opts.Queue != "" {
 		r = r.Queue(opts.Queue)
 	}
+	if opts.TaskName != "" {
+		r = r.TaskName(opts.TaskName)
+	}
+	if opts.Replayed != nil {
+		r = r.Replayed(*opts.Replayed)
+	}
 	if opts.Limit > 0 {
 		r = r.Limit(opts.Limit)
 	}
@@ -711,6 +784,58 @@ func (q *QueueFlow) ReplayDeadLetter(ctx context.Context, id int64) (string, err
 	return out.JobId, nil
 }
 
+// ReplayDeadLettersFilter selects which of the caller's not-yet-replayed dead
+// letters ReplayDeadLetters re-runs. Every field is optional; zero values are
+// not sent, so the zero filter replays the oldest 100 unreplayed entries.
+type ReplayDeadLettersFilter struct {
+	// Queue keeps only dead letters from this queue.
+	Queue string
+	// TaskName keeps only dead letters of this task.
+	TaskName string
+	// CreatedAfter keeps only entries created at or after this instant.
+	CreatedAfter *time.Time
+	// CreatedBefore keeps only entries created strictly before this instant.
+	CreatedBefore *time.Time
+	// Limit caps how many entries are considered, oldest first (default 100;
+	// the maximum is the server's --max-batch).
+	Limit int64
+}
+
+func (f ReplayDeadLettersFilter) request() ReplayDeadLettersRequest {
+	req := ReplayDeadLettersRequest{}
+	if f.Queue != "" {
+		req.Queue = *NewNullableString(PtrString(f.Queue))
+	}
+	if f.TaskName != "" {
+		req.TaskName = *NewNullableString(PtrString(f.TaskName))
+	}
+	if f.CreatedAfter != nil {
+		t := f.CreatedAfter.UTC()
+		req.CreatedAfter = *NewNullableTime(&t)
+	}
+	if f.CreatedBefore != nil {
+		t := f.CreatedBefore.UTC()
+		req.CreatedBefore = *NewNullableTime(&t)
+	}
+	if f.Limit > 0 {
+		req.Limit = *NewNullableInt64(PtrInt64(f.Limit))
+	}
+	return req
+}
+
+// ReplayDeadLetters re-runs the caller's unreplayed dead letters matching
+// filter as fresh jobs, oldest first, up to filter.Limit (default 100). The
+// response lists every considered entry with the new job id (JobId) or the
+// reason it could not be replayed (Error), and Replayed counts the former.
+// Entries already replayed are never considered.
+func (q *QueueFlow) ReplayDeadLetters(ctx context.Context, filter ReplayDeadLettersFilter) (*ReplayDeadLettersResponse, error) {
+	out, resp, err := q.Client.DlqAPI.ReplayDeadLetters(ctx).ReplayDeadLettersRequest(filter.request()).Execute()
+	if err != nil {
+		return nil, wrap("ReplayDeadLetters", resp, err)
+	}
+	return out, nil
+}
+
 // ---------------------------------------------------------------------------
 // System and health
 // ---------------------------------------------------------------------------
@@ -724,14 +849,36 @@ func (q *QueueFlow) Stats(ctx context.Context) (*StatsSnapshot, error) {
 	return out, nil
 }
 
-// Queues returns the live backlog per queue (pending, scheduled, running and
-// the oldest pending age), one entry per queue with non-terminal jobs.
+// Queues returns the live backlog per queue (pending, scheduled, running,
+// the oldest pending age and whether claims are paused), one entry per queue
+// with non-terminal jobs.
 func (q *QueueFlow) Queues(ctx context.Context) ([]QueueStats, error) {
 	out, resp, err := q.Client.SystemAPI.ListQueues(ctx).Execute()
 	if err != nil {
 		return nil, wrap("Queues", resp, err)
 	}
 	return out.Queues, nil
+}
+
+// PauseQueue stops workers from claiming the caller's jobs on queue. Pending
+// jobs accumulate; running ones finish, so the queue is drained once the
+// returned Running count reaches zero. Idempotent: pausing a paused queue
+// just reports its state.
+func (q *QueueFlow) PauseQueue(ctx context.Context, queue string) (*QueueControlResponse, error) {
+	out, resp, err := q.Client.SystemAPI.PauseQueue(ctx, queue).Execute()
+	if err != nil {
+		return nil, wrap("PauseQueue", resp, err)
+	}
+	return out, nil
+}
+
+// ResumeQueue lets workers claim the caller's jobs on queue again. Idempotent.
+func (q *QueueFlow) ResumeQueue(ctx context.Context, queue string) (*QueueControlResponse, error) {
+	out, resp, err := q.Client.SystemAPI.ResumeQueue(ctx, queue).Execute()
+	if err != nil {
+		return nil, wrap("ResumeQueue", resp, err)
+	}
+	return out, nil
 }
 
 // Tasks returns the names of the task handlers registered on the server.
@@ -741,6 +888,16 @@ func (q *QueueFlow) Tasks(ctx context.Context) ([]string, error) {
 		return nil, wrap("Tasks", resp, err)
 	}
 	return out.Tasks, nil
+}
+
+// WhoAmI reports the tenant the configured token is scoped to and its access
+// level: "read_write", or "read_only" for a read-only key.
+func (q *QueueFlow) WhoAmI(ctx context.Context) (*WhoAmIResponse, error) {
+	out, resp, err := q.Client.SystemAPI.WhoAmI(ctx).Execute()
+	if err != nil {
+		return nil, wrap("WhoAmI", resp, err)
+	}
+	return out, nil
 }
 
 // Health is the liveness probe (GET /health).
