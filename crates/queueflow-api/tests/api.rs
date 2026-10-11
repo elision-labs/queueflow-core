@@ -980,3 +980,75 @@ async fn stats_are_scoped_to_the_callers_tenant() {
     assert!(body["jobs_completed"].as_u64().unwrap() <= 2, "{body}");
     assert_eq!(body["jobs_dead_lettered"], 0);
 }
+
+#[tokio::test]
+async fn queues_report_backlog_for_the_callers_tenant_only() {
+    let clock = Arc::new(SystemClock);
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    let engine = Engine::builder(store, clock)
+        .register("echo", builtin::echo())
+        .build();
+    let mine = |queue: &str, run_at: Option<chrono::DateTime<chrono::Utc>>| EnqueueOptions {
+        tenant_id: Some("tenant1".into()),
+        queue: Some(queue.into()),
+        run_at,
+        ..Default::default()
+    };
+    // Two claimable on "orders", one scheduled an hour out on "orders",
+    // one claimable on "emails"; another tenant's job on "orders" is invisible.
+    for _ in 0..2 {
+        engine
+            .enqueue("echo", Map::new(), mine("orders", None))
+            .await
+            .unwrap();
+    }
+    engine
+        .enqueue(
+            "echo",
+            Map::new(),
+            mine(
+                "orders",
+                Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ),
+        )
+        .await
+        .unwrap();
+    engine
+        .enqueue("echo", Map::new(), mine("emails", None))
+        .await
+        .unwrap();
+    engine
+        .enqueue(
+            "echo",
+            Map::new(),
+            EnqueueOptions {
+                tenant_id: Some("other-tenant".into()),
+                queue: Some("orders".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let app = build_router(ApiState::new(engine).with_auth(AuthConfig::development()));
+
+    let resp = app
+        .oneshot(req("GET", "/api/v1/queues", Some("dev"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let queues = body["queues"].as_array().unwrap();
+    assert_eq!(queues.len(), 2, "{body}");
+    assert_eq!(queues[0]["queue"], "emails");
+    assert_eq!(queues[0]["pending"], 1);
+    assert_eq!(queues[1]["queue"], "orders");
+    assert_eq!(queues[1]["pending"], 2, "{body}");
+    assert_eq!(queues[1]["scheduled"], 1);
+    assert_eq!(queues[1]["running"], 0);
+    assert!(queues[1]["oldest_pending_age_secs"].is_u64());
+}

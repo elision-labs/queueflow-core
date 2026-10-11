@@ -13,7 +13,7 @@ use crate::domain::*;
 use crate::engine::{BatchItem, Engine, EnqueueOptions};
 use crate::error::EngineError;
 use crate::ports::{JobStore, ListFilter, Page, StepRecord};
-use crate::stats::StatsSnapshot;
+use crate::stats::{QueueStats, StatsSnapshot};
 
 /// The operations the HTTP API needs from the engine.
 #[async_trait]
@@ -110,6 +110,9 @@ pub trait JobApi: Send + Sync {
     /// Durable counts scoped to `tenant_id` (see
     /// [`crate::JobStore::count_stats`]); this is what `/api/v1/stats` serves.
     async fn tenant_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, EngineError>;
+    /// Per-queue backlog (see [`crate::JobStore::queue_stats`]); serves
+    /// `/api/v1/queues` and the operator metrics.
+    async fn queue_stats(&self, tenant_id: Option<&str>) -> Result<Vec<QueueStats>, EngineError>;
 }
 
 #[async_trait]
@@ -287,5 +290,9 @@ where
 
     async fn tenant_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, EngineError> {
         Engine::tenant_stats(self, tenant_id).await
+    }
+
+    async fn queue_stats(&self, tenant_id: Option<&str>) -> Result<Vec<QueueStats>, EngineError> {
+        Engine::queue_stats(self, tenant_id).await
     }
 }

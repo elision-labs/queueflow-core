@@ -15,7 +15,7 @@ use super::listener::WorkHub;
 use super::{enum_from_str, to_jsonb};
 use crate::domain::*;
 use crate::ports::*;
-use crate::stats::StatsSnapshot;
+use crate::stats::{QueueStats, StatsSnapshot};
 
 /// Advisory lock key for the retention sweep ("qflow_rt" as big-endian bytes):
 /// concurrent janitors must not race the same bulk delete.
@@ -576,6 +576,48 @@ impl JobStore for PostgresJobStore {
             .await
             .map_err(db)?;
         row.try_get(0).map_err(db)
+    }
+
+    async fn queue_stats(
+        &self,
+        tenant_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<QueueStats>, StorageError> {
+        // Non-terminal rows only, so the status index bounds the scan however
+        // large the history grows.
+        let rows = sqlx::query(
+            "SELECT queue_name, \
+                    COUNT(*) FILTER (WHERE status IN ('pending','retrying') AND scheduled_at <= $2) AS pending, \
+                    COUNT(*) FILTER (WHERE status IN ('pending','retrying') AND scheduled_at >  $2) AS scheduled, \
+                    COUNT(*) FILTER (WHERE status = 'running') AS running, \
+                    MIN(scheduled_at) FILTER (WHERE status IN ('pending','retrying') AND scheduled_at <= $2) AS oldest \
+             FROM queueflow.jobs \
+             WHERE status IN ('pending','retrying','running') \
+               AND ($1::text IS NULL OR tenant_id = $1) \
+             GROUP BY queue_name ORDER BY queue_name",
+        )
+        .bind(tenant_id)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|r| {
+                let n = |col: &str| -> Result<u64, StorageError> {
+                    r.try_get::<i64, _>(col)
+                        .map(|v| v.max(0) as u64)
+                        .map_err(db)
+                };
+                let oldest: Option<DateTime<Utc>> = r.try_get("oldest").map_err(db)?;
+                Ok(QueueStats {
+                    queue: r.try_get("queue_name").map_err(db)?,
+                    pending: n("pending")?,
+                    scheduled: n("scheduled")?,
+                    running: n("running")?,
+                    oldest_pending_age_secs: oldest.map(|o| (now - o).num_seconds().max(0) as u64),
+                })
+            })
+            .collect()
     }
 
     async fn count_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, StorageError> {

@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use queueflow_core::*;
 use serde_json::json;
 
@@ -832,6 +833,13 @@ impl JobStore for OrderProbe {
     }
     async fn count_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, StorageError> {
         self.inner.count_stats(tenant_id).await
+    }
+    async fn queue_stats(
+        &self,
+        tenant_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<QueueStats>, StorageError> {
+        self.inner.queue_stats(tenant_id, now).await
     }
     async fn list_dead_letters(
         &self,

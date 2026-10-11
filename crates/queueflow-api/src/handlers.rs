@@ -790,6 +790,25 @@ pub async fn replay_dead_letter(
 // ---- System ----------------------------------------------------------------
 
 #[utoipa::path(
+    get, path = "/api/v1/queues", tag = "system", operation_id = "listQueues",
+    responses((status = 200,
+        description = "Live backlog per queue for the caller's tenant: claimable (`pending`), \
+                       waiting for a future run time (`scheduled`), and `running` counts, plus \
+                       how long the oldest claimable job has waited. Queues with no non-terminal \
+                       jobs are omitted.",
+        body = QueuesResponse)),
+    security(("bearerAuth" = []))
+)]
+pub async fn list_queues(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+) -> Result<Json<QueuesResponse>, ApiError> {
+    Ok(Json(QueuesResponse {
+        queues: s.engine.queue_stats(Some(&t.0)).await?,
+    }))
+}
+
+#[utoipa::path(
     get, path = "/api/v1/tasks", tag = "system", operation_id = "listTasks",
     responses((status = 200, description = "Registered task handlers", body = TasksResponse)),
     security(("bearerAuth" = []))

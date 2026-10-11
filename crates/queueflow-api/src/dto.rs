@@ -223,6 +223,13 @@ pub struct TasksResponse {
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct QueuesResponse {
+    /// One entry per queue that currently has non-terminal jobs, sorted by
+    /// name.
+    pub queues: Vec<queueflow_core::QueueStats>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ErrorBody {
     pub error: String,
     pub timestamp: DateTime<Utc>,

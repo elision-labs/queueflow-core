@@ -66,6 +66,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/dlq/{id}/replay", post(handlers::replay_dead_letter))
         .route("/tasks", get(handlers::list_tasks))
         .route("/stats", get(handlers::get_stats))
+        .route("/queues", get(handlers::list_queues))
         .route_layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
     // Worker protocol: lease / heartbeat / complete / fail. Workers execute

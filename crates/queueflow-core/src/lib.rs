@@ -67,7 +67,7 @@ pub use error::{EngineError, HandlerError};
 pub use ports::{
     Claimed, Clock, FinishedJob, JobStore, ListFilter, Page, PageCursor, StepRecord, StorageError,
 };
-pub use stats::{EngineStats, StatsSnapshot};
+pub use stats::{EngineStats, QueueStats, StatsSnapshot};
 pub use task::{handler_fn, FnHandler, TaskHandler};
 pub use workflow::{CycleError, DependencyGraph, StepBuilder, WorkflowBuilder, WorkflowScheduler};
 

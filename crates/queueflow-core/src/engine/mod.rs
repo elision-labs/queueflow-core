@@ -185,6 +185,15 @@ where
         self.stats.clone()
     }
 
+    /// Per-queue backlog as of now (`None` = all tenants). See
+    /// [`JobStore::queue_stats`].
+    pub async fn queue_stats(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<crate::stats::QueueStats>, EngineError> {
+        Ok(self.store.queue_stats(tenant_id, self.clock.now()).await?)
+    }
+
     /// Durable, tenant-scoped counts read from the store (`None` = all
     /// tenants). See [`JobStore::count_stats`].
     pub async fn tenant_stats(

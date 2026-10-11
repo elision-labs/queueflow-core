@@ -867,6 +867,20 @@ paths:
                 $ref: '#/components/schemas/ErrorBody'
       security:
       - bearerAuth: []
+  /api/v1/queues:
+    get:
+      tags:
+      - system
+      operationId: listQueues
+      responses:
+        '200':
+          description: 'Live backlog per queue for the caller''s tenant: claimable (`pending`), waiting for a future run time (`scheduled`), and `running` counts, plus how long the oldest claimable job has waited. Queues with no non-terminal jobs are omitted.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueuesResponse'
+      security:
+      - bearerAuth: []
   /api/v1/queues/{queue}/lease:
     post:
       tags:
@@ -1977,6 +1991,58 @@ components:
       description: Reserved for future expansion; only `Continue` is meaningful today.
       enum:
       - continue
+    QueueStats:
+      type: object
+      description: |-
+        Live, per-queue backlog figures read from the store: what an operator
+        watches to decide whether to add workers. Only non-terminal jobs are
+        counted, so the query stays cheap on a large history table. Durable
+        totals live in [`StatsSnapshot`] via `JobStore::count_stats`.
+      required:
+      - queue
+      - pending
+      - scheduled
+      - running
+      properties:
+        oldest_pending_age_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Seconds the oldest claimable job has been waiting, `None` when nothing
+            is claimable. The queue's primary health signal: it grows when workers
+            cannot keep up and stays near zero when they can.
+          minimum: 0
+        pending:
+          type: integer
+          format: int64
+          description: 'Claimable now: `pending` or `retrying` with `scheduled_at` in the past.'
+          minimum: 0
+        queue:
+          type: string
+        running:
+          type: integer
+          format: int64
+          description: Currently leased by a worker.
+          minimum: 0
+        scheduled:
+          type: integer
+          format: int64
+          description: Waiting for a future `scheduled_at` (a `run_at` job or a backoff retry).
+          minimum: 0
+    QueuesResponse:
+      type: object
+      required:
+      - queues
+      properties:
+        queues:
+          type: array
+          items:
+            $ref: '#/components/schemas/QueueStats'
+          description: |-
+            One entry per queue that currently has non-terminal jobs, sorted by
+            name.
     ReadyStatus:
       type: object
       required:

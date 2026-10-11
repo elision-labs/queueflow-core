@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::domain::*;
 use crate::ports::*;
-use crate::stats::StatsSnapshot;
+use crate::stats::{QueueStats, StatsSnapshot};
 
 #[derive(Clone)]
 struct StepState {
@@ -541,6 +541,48 @@ impl JobStore for InMemoryJobStore {
 
     async fn count_dead_letters(&self) -> Result<i64, StorageError> {
         Ok(self.inner.dead_letters.lock().unwrap().len() as i64)
+    }
+
+    async fn queue_stats(
+        &self,
+        tenant_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<QueueStats>, StorageError> {
+        let owned = |t: &Option<String>| tenant_id.is_none_or(|want| t.as_deref() == Some(want));
+        let mut by_queue: std::collections::BTreeMap<String, (QueueStats, Option<DateTime<Utc>>)> =
+            Default::default();
+        let jobs = self.inner.jobs.lock().unwrap();
+        for j in jobs.values().filter(|j| owned(&j.tenant_id)) {
+            let entry = by_queue.entry(j.queue_name.clone()).or_insert_with(|| {
+                (
+                    QueueStats {
+                        queue: j.queue_name.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+            });
+            match j.status {
+                JobStatus::Pending | JobStatus::Retrying => {
+                    if j.scheduled_at <= now {
+                        entry.0.pending += 1;
+                        entry.1 = Some(entry.1.map_or(j.scheduled_at, |o| o.min(j.scheduled_at)));
+                    } else {
+                        entry.0.scheduled += 1;
+                    }
+                }
+                JobStatus::Running => entry.0.running += 1,
+                _ => {}
+            }
+        }
+        Ok(by_queue
+            .into_values()
+            .filter(|(q, _)| q.pending + q.scheduled + q.running > 0)
+            .map(|(mut q, oldest)| {
+                q.oldest_pending_age_secs = oldest.map(|o| (now - o).num_seconds().max(0) as u64);
+                q
+            })
+            .collect())
     }
 
     async fn count_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, StorageError> {

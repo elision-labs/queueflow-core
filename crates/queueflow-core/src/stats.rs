@@ -68,3 +68,25 @@ pub struct StatsSnapshot {
     pub workflows_completed: u64,
     pub workflows_failed: u64,
 }
+
+/// Live, per-queue backlog figures read from the store: what an operator
+/// watches to decide whether to add workers. Only non-terminal jobs are
+/// counted, so the query stays cheap on a large history table. Durable
+/// totals live in [`StatsSnapshot`] via `JobStore::count_stats`.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+pub struct QueueStats {
+    pub queue: String,
+    /// Claimable now: `pending` or `retrying` with `scheduled_at` in the past.
+    pub pending: u64,
+    /// Waiting for a future `scheduled_at` (a `run_at` job or a backoff retry).
+    pub scheduled: u64,
+    /// Currently leased by a worker.
+    pub running: u64,
+    /// Seconds the oldest claimable job has been waiting, `None` when nothing
+    /// is claimable. The queue's primary health signal: it grows when workers
+    /// cannot keep up and stays near zero when they can.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_age_secs: Option<u64>,
+}

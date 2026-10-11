@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::domain::*;
-use crate::stats::StatsSnapshot;
+use crate::stats::{QueueStats, StatsSnapshot};
 
 /// Abstract clock so time-dependent behaviour (retry backoff, timestamps) is
 /// deterministic in tests via [`crate::adapters::clock::TestClock`].
@@ -280,6 +280,17 @@ pub trait JobStore: Send + Sync {
     /// Unlike the process counters these survive restarts and are scoped,
     /// but they shrink when retention deletes history.
     async fn count_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, StorageError>;
+
+    /// Per-queue backlog for one tenant (or all, when `tenant_id` is `None`):
+    /// claimable, scheduled-for-later, and running counts plus the age of the
+    /// oldest claimable job, evaluated at `now`. Only non-terminal jobs are
+    /// read. Queues with no non-terminal jobs are not listed. Sorted by queue
+    /// name.
+    async fn queue_stats(
+        &self,
+        tenant_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<QueueStats>, StorageError>;
 
     /// List dead letters, honouring the filter's tenant/queue scoping and
     /// paging (`status` does not apply and is ignored).
