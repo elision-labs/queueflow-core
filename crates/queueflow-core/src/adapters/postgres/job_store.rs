@@ -568,6 +568,13 @@ impl JobStore for PostgresJobStore {
              WHERE status IN ('pending','retrying','running')",
         );
         push_job_filters(&mut qb, filter);
+        // Deterministic order (the filter's, oldest first for the API) with
+        // the id as tie-break, so a capped cancel is repeatable.
+        qb.push(if filter.order_desc {
+            " ORDER BY created_at DESC, id DESC"
+        } else {
+            " ORDER BY created_at ASC, id ASC"
+        });
         let limit = if filter.limit <= 0 { 50 } else { filter.limit };
         qb.push(" LIMIT ").push_bind(limit);
         qb.push(" FOR UPDATE SKIP LOCKED)");
