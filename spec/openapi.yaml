@@ -1303,8 +1303,8 @@ components:
       properties:
         config:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/JobConfig'
+          - type: 'null'
         cron_expr:
           type: string
           description: 5-field crontab (UTC); 6/7 fields with leading seconds also accepted.
@@ -1336,8 +1336,8 @@ components:
       properties:
         config:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/JobConfigRequest'
+          - type: 'null'
         payload:
           type: object
           description: Arbitrary JSON object passed to the handler.
@@ -1411,8 +1411,8 @@ components:
       properties:
         config:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/JobConfig'
+          - type: 'null'
         created_at:
           type: string
           format: date-time
@@ -1756,9 +1756,9 @@ components:
           description: Override the destination queue.
         retry_backoff:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/BackoffStrategy'
             description: How retry delays grow between attempts (default exponential).
+          - type: 'null'
         retry_delay_secs:
           type:
           - integer
@@ -2205,8 +2205,8 @@ components:
       properties:
         config:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/JobConfig'
+          - type: 'null'
         depends_on:
           type: array
           items:

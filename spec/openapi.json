@@ -2087,10 +2087,10 @@
           "config": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/JobConfig"
               },
               {
-                "$ref": "#/components/schemas/JobConfig"
+                "type": "null"
               }
             ]
           },
@@ -2140,10 +2140,10 @@
           "config": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/JobConfigRequest"
               },
               {
-                "$ref": "#/components/schemas/JobConfigRequest"
+                "type": "null"
               }
             ]
           },
@@ -2240,10 +2240,10 @@
           "config": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/JobConfig"
               },
               {
-                "$ref": "#/components/schemas/JobConfig"
+                "type": "null"
               }
             ]
           },
@@ -2667,11 +2667,11 @@
           "retry_backoff": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/BackoffStrategy",
                 "description": "How retry delays grow between attempts (default exponential)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -3236,10 +3236,10 @@
           "config": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/JobConfig"
               },
               {
-                "$ref": "#/components/schemas/JobConfig"
+                "type": "null"
               }
             ]
           },

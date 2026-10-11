@@ -10,6 +10,12 @@ versions may contain breaking changes, which are called out explicitly.
 
 ## [Unreleased]
 
+### Changed
+
+- utoipa 6 generates the OpenAPI document. The only change to the
+  published spec is the member order inside nullable `oneOf` schemas,
+  which generators treat identically.
+
 ## [0.4.0] - 2026-10-11
 
 ### Added
