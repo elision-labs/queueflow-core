@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>QueueFlow</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="top">
+    <a class="brand" href="#/queues" aria-label="QueueFlow overview">
+      <svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6">
+        <rect x="1.5" y="3" width="13" height="3" rx="1"></rect>
+        <rect x="1.5" y="10" width="8" height="3" rx="1"></rect>
+        <path d="M12 11.5h2.5"></path>
+      </svg>
+      QueueFlow
+    </a>
+    <nav aria-label="Sections">
+      <a href="#/queues" data-nav="queues">Overview</a>
+      <a href="#/jobs" data-nav="jobs">Jobs</a>
+      <a href="#/workflows" data-nav="workflows">Workflows</a>
+      <a href="#/dlq" data-nav="dlq">Dead letters</a>
+      <a href="#/cron" data-nav="cron">Cron</a>
+      <a href="#/tasks" data-nav="tasks">Tasks</a>
+    </nav>
+    <div class="top-right">
+      <span class="hide-sm">Read only</span>
+      <button type="button" class="link" id="change-token">Change token</button>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1" aria-live="polite">
+    <div class="state">Loading</div>
+  </main>
+
+  <div id="gate" hidden>
+    <div class="panel gate-card">
+      <h1>QueueFlow</h1>
+      <p>Enter a tenant token to open the dashboard for that tenant.</p>
+      <form id="gate-form" autocomplete="off">
+        <label>
+          Tenant token
+          <input id="gate-token" type="password" name="token" required autocomplete="off" spellcheck="false" placeholder="API key or JWT">
+        </label>
+        <div class="row">
+          <button type="submit" class="btn primary">Open dashboard</button>
+          <span class="msg" id="gate-msg" role="alert"></span>
+        </div>
+      </form>
+      <p class="fine">The token is kept in this tab's session storage and sent only to this server's <code>/api/v1</code> routes. The worker token authenticates the worker protocol only and will not work here.</p>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+  <noscript><div class="state">The dashboard needs JavaScript enabled.</div></noscript>
+</body>
+</html>

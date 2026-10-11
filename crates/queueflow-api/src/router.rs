@@ -3,7 +3,7 @@
 use std::sync::LazyLock;
 
 use axum::http::{header, HeaderValue};
-use axum::response::{Html, IntoResponse};
+use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{middleware, Router};
 use tower_http::compression::CompressionLayer;
@@ -27,6 +27,16 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
 
 static OPENAPI_YAML: LazyLock<String> =
     LazyLock::new(|| ApiDoc::openapi().to_yaml().unwrap_or_default());
+
+/// The read-only dashboard, embedded at compile time and served under `/ui/`.
+/// Static files only (no data), so they take no authentication; the page
+/// itself asks for a tenant token and calls `/api/v1` with it. These are not
+/// API routes and are deliberately absent from the OpenAPI document.
+const UI_INDEX_HTML: &str = include_str!("../ui/index.html");
+const UI_APP_CSS: &str = include_str!("../ui/app.css");
+const UI_APP_JS: &str = include_str!("../ui/app.js");
+const UI_API_JS: &str = include_str!("../ui/api.js");
+const UI_FMT_JS: &str = include_str!("../ui/fmt.js");
 
 /// Build the full application router for the given engine state.
 pub fn build_router(state: ApiState) -> Router {
@@ -108,6 +118,27 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/openapi.json", get(openapi_json))
         .route("/openapi.yaml", get(openapi_yaml))
         .route("/docs", get(docs_ui))
+        .route("/ui", get(|| async { Redirect::permanent("/ui/") }))
+        .route(
+            "/ui/",
+            get(|| async { ui_asset("text/html; charset=utf-8", UI_INDEX_HTML) }),
+        )
+        .route(
+            "/ui/app.css",
+            get(|| async { ui_asset("text/css; charset=utf-8", UI_APP_CSS) }),
+        )
+        .route(
+            "/ui/app.js",
+            get(|| async { ui_asset("text/javascript; charset=utf-8", UI_APP_JS) }),
+        )
+        .route(
+            "/ui/api.js",
+            get(|| async { ui_asset("text/javascript; charset=utf-8", UI_API_JS) }),
+        )
+        .route(
+            "/ui/fmt.js",
+            get(|| async { ui_asset("text/javascript; charset=utf-8", UI_FMT_JS) }),
+        )
         .nest("/api/v1", tenant.merge(worker))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
@@ -126,6 +157,18 @@ async fn openapi_yaml() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/yaml")],
         OPENAPI_YAML.as_str(),
+    )
+}
+
+/// One embedded dashboard file. `no-cache` makes browsers revalidate on every
+/// load, so a server upgrade is picked up immediately; the files are small.
+fn ui_asset(content_type: &'static str, body: &'static str) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
     )
 }
 

@@ -12,6 +12,13 @@ versions may contain breaking changes, which are called out explicitly.
 
 ### Added
 
+- A read-only web dashboard served by the API at `/ui/` (embedded in the
+  binary, no build step): per-queue backlog with auto-refresh, jobs with
+  filters, keyset paging and live SSE updates, workflows with the dependency
+  graph coloured by step state, dead letters, cron schedules, and registered
+  tasks. It authenticates with a tenant token kept in session storage. The
+  graph is drawn with Mermaid loaded from `cdn.jsdelivr.net` on demand, with
+  the Mermaid source shown when the CDN is unreachable.
 - `GET /api/v1/queues`: live per-queue backlog for the caller's tenant
   (claimable `pending`, future `scheduled`, `running`, and the age of the
   oldest claimable job). `JobStore::queue_stats` / `JobApi::queue_stats`.
