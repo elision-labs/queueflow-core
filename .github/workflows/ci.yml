@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       # `cargo publish` verifies with default features only, which excludes
       # the Postgres adapter; this proves the .crate really contains
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: Generate spec from code
         run: cargo run -q -p queueflow -- spec --output-dir spec
@@ -76,7 +76,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       # Regenerate the Python + Go SDKs (generated core + injected facade) from
       # the committed spec, templates, and configs, into throwaway dirs. This
       # guards the hand-written facade templates against codegen drift (e.g. a
@@ -165,7 +165,7 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: Integration tests
         run: cargo test -p queueflow-core --features postgres --test pg_integration
@@ -216,7 +216,7 @@ jobs:
       QUEUEFLOW_WORKER_TOKEN: ci-worker-token
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: Build the server
         run: cargo build -q -p queueflow
