@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "queueflow"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "queueflow-api"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "chrono",
@@ -1886,7 +1886,7 @@ dependencies = [
 
 [[package]]
 name = "queueflow-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "chrono",
@@ -1903,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "queueflow-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
