@@ -1,0 +1,6 @@
+# Values used by `helm lint` / `helm template` in CI. Placeholders only.
+database:
+  existingSecret: queueflow-db
+auth:
+  apiKeys: "ci-placeholder-token:acme"
+  workerToken: "ci-placeholder-worker-token"

@@ -1,0 +1,59 @@
+# QueueFlow + PostgreSQL for local use and small single-host deployments.
+#
+#   cp .env.example .env            # then set QUEUEFLOW_API_KEYS and QUEUEFLOW_WORKER_TOKEN
+#   docker compose up -d --wait
+#   curl -s localhost:8000/health
+#
+# Secrets are never written here: the two required credentials are read from
+# .env (or the shell) via ${VAR:?} interpolation, so compose refuses to start
+# until they are set. See .env.example, "Docker Compose".
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: queueflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-queueflow}
+      POSTGRES_DB: queueflow
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queueflow -d queueflow"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+    # Uncomment to reach Postgres from the host (psql, GUI clients).
+    # ports:
+    #   - "5432:5432"
+
+  queueflow:
+    image: ghcr.io/elision-labs/queueflow:${QUEUEFLOW_IMAGE_TAG:-0.2}
+    command: ["serve", "--mode", "all"]
+    environment:
+      DATABASE_URL: postgres://queueflow:${POSTGRES_PASSWORD:-queueflow}@postgres:5432/queueflow
+      # Required: the server refuses to start in api/all mode without both.
+      QUEUEFLOW_API_KEYS: ${QUEUEFLOW_API_KEYS:?set QUEUEFLOW_API_KEYS=token:tenant in .env (see .env.example)}
+      QUEUEFLOW_WORKER_TOKEN: ${QUEUEFLOW_WORKER_TOKEN:?set QUEUEFLOW_WORKER_TOKEN in .env (see .env.example)}
+      QUEUEFLOW_WORKERS: ${QUEUEFLOW_WORKERS:-10}
+      QUEUEFLOW_DEFAULT_QUEUE: ${QUEUEFLOW_DEFAULT_QUEUE:-default}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      # host:container. Override the host side if 8000/9090 are taken.
+      - "${QUEUEFLOW_HOST_API_PORT:-8000}:8000"       # REST API, /docs, /health, /ready
+      - "${QUEUEFLOW_HOST_METRICS_PORT:-9090}:9090"   # Prometheus /metrics (restrict to your scraper in production)
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # The image ships wget (see Dockerfile); /health is 200 only when the
+      # database is reachable.
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  pgdata: {}

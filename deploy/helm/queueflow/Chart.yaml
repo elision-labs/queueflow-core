@@ -1,0 +1,25 @@
+apiVersion: v2
+name: queueflow
+description: PostgreSQL-native job queue and workflow engine (single Rust binary). Bring your own PostgreSQL 13+.
+type: application
+# Chart version. Bump on any change to templates or values.
+version: 0.1.0
+# Default image tag (ghcr.io/elision-labs/queueflow:<appVersion>).
+appVersion: "0.2.0"
+kubeVersion: ">=1.25.0-0"
+home: https://queueflow.dev
+sources:
+  - https://github.com/elision-labs/queueflow-core
+keywords:
+  - queue
+  - jobs
+  - workflows
+  - postgresql
+  - background-jobs
+maintainers:
+  - name: Elision Labs
+    url: https://github.com/elision-labs
+annotations:
+  artifacthub.io/images: |
+    - name: queueflow
+      image: ghcr.io/elision-labs/queueflow:0.2.0

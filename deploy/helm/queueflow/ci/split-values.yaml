@@ -1,0 +1,26 @@
+# Exercises every optional resource in split mode.
+mode: split
+database:
+  existingSecret: queueflow-db
+auth:
+  existingSecret: queueflow-auth
+config:
+  corsOrigins: https://app.example.com
+  retentionHours: 168
+migration:
+  enabled: true
+autoscaling:
+  enabled: true
+  targetMemoryUtilizationPercentage: 80
+podDisruptionBudget:
+  enabled: true
+serviceMonitor:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack
+ingress:
+  enabled: true
+  className: nginx
+  tls:
+    - secretName: queueflow-tls
+      hosts: [queueflow.example.com]

@@ -1,0 +1,128 @@
+{{- include "queueflow.validate" . -}}
+{{- $root := . -}}
+{{- /*
+Build the list of Deployments to render:
+  mode=all   -> one ("all"), serving the API and running workers
+  mode=split -> "api" and "worker"
+*/ -}}
+{{- $specs := list -}}
+{{- if eq .Values.mode "split" -}}
+{{- $specs = append $specs (dict "component" "api" "mode" "api" "name" (printf "%s-api" (include "queueflow.fullname" .)) "replicas" .Values.api.replicaCount "resources" .Values.api.resources "podAnnotations" .Values.api.podAnnotations "podLabels" .Values.api.podLabels "nodeSelector" .Values.api.nodeSelector "tolerations" .Values.api.tolerations "affinity" .Values.api.affinity "workers" "" "serveApi" true) -}}
+{{- $specs = append $specs (dict "component" "worker" "mode" "worker" "name" (printf "%s-worker" (include "queueflow.fullname" .)) "replicas" .Values.worker.replicaCount "resources" .Values.worker.resources "podAnnotations" .Values.worker.podAnnotations "podLabels" .Values.worker.podLabels "nodeSelector" .Values.worker.nodeSelector "tolerations" .Values.worker.tolerations "affinity" .Values.worker.affinity "workers" .Values.worker.workers "serveApi" false) -}}
+{{- else -}}
+{{- $specs = append $specs (dict "component" "all" "mode" "all" "name" (include "queueflow.fullname" .) "replicas" .Values.replicaCount "resources" .Values.resources "podAnnotations" dict "podLabels" dict "nodeSelector" dict "tolerations" list "affinity" dict "workers" .Values.config.workers "serveApi" true) -}}
+{{- end -}}
+{{- range $spec := $specs }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $spec.name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "queueflow.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $spec.component }}
+spec:
+  {{- if not (and $spec.serveApi $root.Values.autoscaling.enabled) }}
+  replicas: {{ $spec.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "queueflow.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: {{ $spec.component }}
+  template:
+    metadata:
+      labels:
+        {{- include "queueflow.selectorLabels" $root | nindent 8 }}
+        app.kubernetes.io/component: {{ $spec.component }}
+        {{- with $root.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with $spec.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if and $spec.serveApi (not $root.Values.auth.existingSecret) }}
+        # Roll the pods when the rendered credentials change.
+        checksum/auth-secret: {{ include (print $root.Template.BasePath "/secret.yaml") $root | sha256sum }}
+        {{- end }}
+        {{- with $root.Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with $spec.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "queueflow.serviceAccountName" $root }}
+      automountServiceAccountToken: {{ $root.Values.serviceAccount.automountServiceAccountToken }}
+      {{- with $root.Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $root.Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml $root.Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: queueflow
+          image: {{ include "queueflow.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          args:
+            {{- include "queueflow.serveArgs" (dict "mode" $spec.mode "root" $root) | nindent 12 }}
+          env:
+            {{- include "queueflow.commonEnv" $root | trim | nindent 12 }}
+            {{- if $spec.workers }}
+            - name: QUEUEFLOW_WORKERS
+              value: {{ $spec.workers | quote }}
+            {{- end }}
+            {{- if $spec.serveApi }}
+            {{- include "queueflow.apiEnv" $root | trim | nindent 12 }}
+            {{- end }}
+          {{- with $root.Values.config.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            {{- if $spec.serveApi }}
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+            {{- end }}
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          {{- if $spec.serveApi }}
+          livenessProbe:
+            {{- toYaml $root.Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml $root.Values.readinessProbe | nindent 12 }}
+          {{- else }}
+          livenessProbe:
+            {{- toYaml $root.Values.workerLivenessProbe | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml $root.Values.securityContext | nindent 12 }}
+          {{- with $spec.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with (default $root.Values.nodeSelector $spec.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default $root.Values.tolerations $spec.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default $root.Values.affinity $spec.affinity) }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,86 @@
+name: Deploy assets
+
+# Validates the deployment surface (Helm chart, Docker Compose, Render
+# Blueprint, Homebrew formula). Nothing here builds or publishes anything.
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "deploy/**"
+      - "docker-compose.yml"
+      - "render.yaml"
+      - ".env.example"
+      - ".github/workflows/deploy-assets.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "deploy/**"
+      - "docker-compose.yml"
+      - "render.yaml"
+      - ".env.example"
+      - ".github/workflows/deploy-assets.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  helm:
+    name: Helm chart lint + template
+    runs-on: ubuntu-latest
+    env:
+      CHART: deploy/helm/queueflow
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint (mode=all)
+        run: helm lint "$CHART" -f "$CHART/ci/lint-values.yaml" --strict
+      - name: Lint (mode=split, every optional resource)
+        run: helm lint "$CHART" -f "$CHART/ci/split-values.yaml" --strict
+      - name: Template (mode=all)
+        run: helm template qf "$CHART" -f "$CHART/ci/lint-values.yaml" > /tmp/all.yaml && grep -c '^kind:' /tmp/all.yaml
+      - name: Template (mode=split)
+        run: helm template qf "$CHART" -f "$CHART/ci/split-values.yaml" > /tmp/split.yaml && grep -c '^kind:' /tmp/split.yaml
+      - name: Template with migration job sets --auto-migrate false
+        run: grep -A3 -- '- --auto-migrate' /tmp/split.yaml | grep -q '"false"'
+      - name: Template without required values must fail
+        run: |
+          if helm template qf "$CHART" >/dev/null 2>&1; then
+            echo "::error::rendering with no database/auth values should fail" >&2
+            exit 1
+          fi
+      - name: Rendered manifests are valid YAML
+        run: ruby -ryaml -e 'ARGV.each { |f| YAML.load_stream(File.read(f)) }' /tmp/all.yaml /tmp/split.yaml
+
+  compose:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    env:
+      QUEUEFLOW_API_KEYS: ci-placeholder:acme
+      QUEUEFLOW_WORKER_TOKEN: ci-placeholder-worker-token
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve and validate
+        run: docker compose -f docker-compose.yml config --quiet
+      - name: Required variables are enforced
+        run: |
+          if env -u QUEUEFLOW_API_KEYS -u QUEUEFLOW_WORKER_TOKEN docker compose -f docker-compose.yml config >/dev/null 2>&1; then
+            echo "::error::compose should refuse to resolve without the credentials" >&2
+            exit 1
+          fi
+
+  render:
+    name: render.yaml is valid YAML
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ruby -ryaml -e 'd = YAML.safe_load(File.read("render.yaml")); abort "missing services/databases" unless d["services"] && d["databases"]'
+
+  homebrew:
+    name: Homebrew formula syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ruby -c
+        run: ruby -c deploy/homebrew/queueflow.rb
+      - name: update script parses
+        run: bash -n deploy/homebrew/update-formula.sh

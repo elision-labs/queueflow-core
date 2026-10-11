@@ -1,0 +1,245 @@
+# Default values for the queueflow chart.
+#
+# Minimum to install (see README.md):
+#   database.existingSecret         a Secret holding DATABASE_URL
+#   auth.apiKeys + auth.workerToken (or auth.existingSecret)
+#
+# QueueFlow is one stateless binary. Every setting below maps to a `queueflow
+# serve` flag / env var documented in the repo README "Configuration" table.
+
+image:
+  repository: ghcr.io/elision-labs/queueflow
+  # Defaults to the chart's appVersion. Published tags: 0.2.0, 0.2, latest
+  # (linux/amd64 and linux/arm64).
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Topology.
+#   all   : one Deployment running `serve --mode all` (API + in-process
+#           workers + janitor + cron). Scale with replicaCount; many `all`
+#           replicas sharing one database is safe.
+#   split : an `api` Deployment (`--mode api`, behind the Service) and a
+#           `worker` Deployment (`--mode worker`, no HTTP API). Scale each
+#           independently; the api Deployment owns the HPA/PDB/Ingress.
+mode: all
+
+# Replicas for mode=all (ignored when autoscaling.enabled).
+replicaCount: 1
+
+# mode=split only.
+api:
+  replicaCount: 2
+  resources: {}
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+worker:
+  replicaCount: 1
+  # In-process worker concurrency per queue for the worker Deployment
+  # (--workers). mode=all uses config.workers.
+  workers: 10
+  resources: {}
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# PostgreSQL. The chart never creates a database; point it at an existing
+# Secret whose key holds a full connection string
+# (postgres://user:pass@host:5432/db). Any plain PostgreSQL 13+, no extensions.
+database:
+  existingSecret: ""
+  existingSecretKey: DATABASE_URL
+
+# Credentials. The server refuses to start in api/all mode without a tenant
+# credential source (apiKeys and/or jwtSecret) AND a workerToken, unless
+# dev mode is on. Either give the values here (the chart renders a Secret) or
+# name an existing Secret with the keys below.
+auth:
+  # Static tenant API keys: "token:tenant[,token2:tenant2]"  (QUEUEFLOW_API_KEYS)
+  apiKeys: ""
+  # HS256 secret for tenant JWTs; may be combined with apiKeys (QUEUEFLOW_JWT_SECRET)
+  jwtSecret: ""
+  # Credential for the worker-protocol endpoints (QUEUEFLOW_WORKER_TOKEN).
+  # Give it only to worker processes, never to tenants.
+  workerToken: ""
+  # Use this Secret instead of rendering one. Keys that are absent in the
+  # Secret are simply not injected (jwtSecret is optional).
+  existingSecret: ""
+  existingSecretKeys:
+    apiKeys: QUEUEFLOW_API_KEYS
+    jwtSecret: QUEUEFLOW_JWT_SECRET
+    workerToken: QUEUEFLOW_WORKER_TOKEN
+  # Development mode (--dev / QUEUEFLOW_DEV=1): no credentials, any non-empty
+  # token is tenant "tenant1". Never on a reachable cluster.
+  dev: false
+
+# Server tuning. Empty string = leave the server default.
+config:
+  # Workers per queue for mode=all (--workers, default 10).
+  workers: 10
+  defaultQueue: default
+  # Comma-separated browser origins (--cors-origins). Unset = permissive (warns).
+  corsOrigins: ""
+  # Connection pool size per pod (--max-db-connections, default 50). Budget
+  # replicas x pool against Postgres max_connections.
+  maxDbConnections: 50
+  # Delete terminal jobs/workflows/dead letters older than N hours
+  # (--retention-hours). Unset keeps history forever.
+  retentionHours: ""
+  # tracing EnvFilter (RUST_LOG).
+  logLevel: info
+  # Extra `serve` arguments appended verbatim.
+  extraArgs: []
+  # Extra environment (k8s EnvVar objects).
+  extraEnv: []
+  # Extra envFrom (ConfigMaps/Secrets).
+  extraEnvFrom: []
+
+# Schema migrations. By default the server applies them on startup
+# (idempotent). Enable this to run `queueflow migrate` as a Helm
+# pre-install/pre-upgrade hook Job instead; the server then starts with
+# `--auto-migrate false` so deploys and schema changes are decoupled.
+migration:
+  enabled: false
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 300
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+
+service:
+  type: ClusterIP
+  # REST API (container port 8000).
+  port: 8000
+  # Prometheus metrics (container port 9090). Not authenticated; keep it off
+  # any Ingress.
+  metricsPort: 9090
+  annotations: {}
+  # mode=split: a second ClusterIP Service exposing only the worker pods'
+  # metrics port, so the ServiceMonitor can scrape them.
+  workerMetrics:
+    enabled: true
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: queueflow.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: queueflow-tls
+  #    hosts: [queueflow.example.com]
+
+# Resources for the mode=all Deployment (api.resources / worker.resources
+# apply in split mode).
+resources: {}
+  # requests: { cpu: 100m, memory: 128Mi }
+  # limits:   { memory: 512Mi }
+
+# HPA on the API-serving Deployment (mode=all Deployment, or the api
+# Deployment in split mode).
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  # targetMemoryUtilizationPercentage: 80
+  behavior: {}
+
+# PodDisruptionBudget for the API-serving Deployment.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 1
+
+# Prometheus Operator ServiceMonitor (needs the monitoring.coreos.com CRDs).
+serviceMonitor:
+  enabled: false
+  # Namespace to create it in (default: release namespace).
+  namespace: ""
+  interval: 30s
+  scrapeTimeout: 10s
+  # Extra labels, e.g. the Prometheus instance's serviceMonitorSelector.
+  labels: {}
+  relabelings: []
+  metricRelabelings: []
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+  automountServiceAccountToken: false
+
+# The image runs as uid 10001 (see Dockerfile); nothing is written to disk.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# /health is 200 when the process can reach the database; /ready is 200 when
+# the engine is accepting work and the database answers. Neither needs a token.
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+# Worker pods (mode=split) have no API port; the metrics server also answers
+# GET /health with "ok", which is used for liveness.
+workerLivenessProbe:
+  httpGet:
+    path: /health
+    port: metrics
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# On SIGTERM the server stops claiming, drains in-flight in-process handlers
+# (bounded to 30s in the binary), then exits. Set this above your longest
+# handler.
+terminationGracePeriodSeconds: 60
+
+priorityClassName: ""
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []

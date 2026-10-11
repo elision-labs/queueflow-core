@@ -1,0 +1,50 @@
+QueueFlow {{ default .Chart.AppVersion .Values.image.tag }} ({{ .Values.mode }} mode) is being rolled out in namespace {{ .Release.Namespace }}.
+
+{{- if eq .Values.mode "split" }}
+Deployments: {{ include "queueflow.fullname" . }}-api ({{ .Values.api.replicaCount }} x `serve --mode api`)
+             {{ include "queueflow.fullname" . }}-worker ({{ .Values.worker.replicaCount }} x `serve --mode worker`, {{ .Values.worker.workers }} workers/queue)
+{{- else }}
+Deployment:  {{ include "queueflow.fullname" . }} ({{ .Values.replicaCount }} x `serve --mode all`, {{ .Values.config.workers }} workers/queue)
+{{- end }}
+Service:     {{ include "queueflow.fullname" . }}:{{ .Values.service.port }} (REST API), :{{ .Values.service.metricsPort }} (Prometheus /metrics)
+Database:    secret/{{ .Values.database.existingSecret }} key {{ .Values.database.existingSecretKey }}
+{{- if .Values.migration.enabled }}
+Migrations:  run by the pre-install/pre-upgrade Job {{ include "queueflow.fullname" . }}-migrate; the server starts with --auto-migrate false.
+{{- else }}
+Migrations:  applied by the server on startup (set migration.enabled=true to run them as a hook Job instead).
+{{- end }}
+
+Check it:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "queueflow.apiDeploymentName" . }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "queueflow.fullname" . }} 8000:{{ .Values.service.port }} &
+  curl -s localhost:8000/health      # {"status":"ok",...} once Postgres is reachable
+  curl -s localhost:8000/ready
+  open http://localhost:8000/docs    # Swagger UI
+
+Then enqueue a job with one of your tenant API keys:
+
+  curl -s -X POST localhost:8000/api/v1/jobs \
+    -H "Authorization: Bearer <token>" -H 'Content-Type: application/json' \
+    -d '{"task_name":"echo","payload":{"hello":"world"}}'
+
+{{- if .Values.auth.dev }}
+
+WARNING: auth.dev=true. Any non-empty bearer token is tenant "tenant1" and the
+worker endpoints are open. Never expose this release.
+{{- end }}
+{{- if not .Values.config.corsOrigins }}
+
+Note: config.corsOrigins is unset, so CORS is permissive (the server logs a
+warning). Set it if browsers will call the API directly.
+{{- end }}
+{{- if .Values.ingress.enabled }}
+
+Ingress hosts:
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- end }}
+
+Values reference: helm show values <chart>
+Operations guide: https://docs.queueflow.dev/deployment
