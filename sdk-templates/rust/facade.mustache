@@ -301,7 +301,13 @@ impl QueueFlow {
 #[derive(Clone, Debug, Default)]
 pub struct ListOptions {
     pub status: Option<String>,
+    /// Jobs and dead letters only.
     pub queue: Option<String>,
+    /// Jobs and dead letters only.
+    pub task_name: Option<String>,
+    /// Dead letters only: `Some(false)` lists entries not yet replayed,
+    /// `Some(true)` the replayed ones; both when `None`.
+    pub replayed: Option<bool>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     /// `"created_at ASC"` or `"created_at DESC"`.
@@ -324,6 +330,8 @@ macro_rules! list_call {
             $config,
             $o.status.as_deref(),
             $o.queue.as_deref(),
+            $o.task_name.as_deref(),
+            $o.replayed,
             $o.limit,
             $o.offset,
             $o.order_by.as_deref(),
@@ -443,6 +451,40 @@ impl CreateJobOptions {
     }
 }
 
+/// Which jobs [`QueueFlow::cancel_jobs`] applies to. Every field is optional
+/// (`None` is not sent); the default cancels any of the caller's non-terminal
+/// jobs up to the server's default limit of 100.
+#[derive(Clone, Debug, Default)]
+pub struct CancelJobsFilter {
+    /// Only jobs on this queue.
+    pub queue: Option<String>,
+    /// Only jobs with this task name.
+    pub task_name: Option<String>,
+    /// Only jobs in this state: `"pending"`, `"retrying"` or `"running"`. A
+    /// terminal status is a 400.
+    pub status: Option<String>,
+    /// RFC 3339 instant; only jobs created at or after it (inclusive).
+    pub created_after: Option<String>,
+    /// RFC 3339 instant; only jobs created strictly before it (exclusive).
+    pub created_before: Option<String>,
+    /// Cancel at most this many (default 100; the maximum is the server's
+    /// batch limit).
+    pub limit: Option<i64>,
+}
+
+impl CancelJobsFilter {
+    fn request(&self) -> models::CancelJobsRequest {
+        models::CancelJobsRequest {
+            created_after: self.created_after.clone().map(Some),
+            created_before: self.created_before.clone().map(Some),
+            limit: self.limit.map(Some),
+            queue: self.queue.clone().map(Some),
+            status: self.status.clone().map(Some),
+            task_name: self.task_name.clone().map(Some),
+        }
+    }
+}
+
 impl QueueFlow {
     /// Enqueues a job with the server's default config and returns the new
     /// job id. See [`QueueFlow::create_job_with_options`] for queue,
@@ -491,6 +533,18 @@ impl QueueFlow {
         jobs_api::cancel_job(&self.config, id)
             .await
             .map_err(api_err("cancel_job"))
+    }
+
+    /// Cancels the caller's non-terminal jobs matching `filter`, up to
+    /// `filter.limit` (default 100), and returns how many were cancelled.
+    /// Fewer than the limit means the matching set is exhausted; jobs that
+    /// finish concurrently are left as they ended. Call it again until it
+    /// returns 0 to cancel a set larger than the limit.
+    pub async fn cancel_jobs(&self, filter: &CancelJobsFilter) -> Result<u64, FacadeError> {
+        jobs_api::cancel_jobs(&self.config, filter.request())
+            .await
+            .map(|r| u64::try_from(r.cancelled).unwrap_or(0))
+            .map_err(api_err("cancel_jobs"))
     }
 
     /// Polls until the job reaches a terminal state (completed, failed or
@@ -685,8 +739,40 @@ impl QueueFlow {
 // Dead letters
 // ---------------------------------------------------------------------------
 
+/// Which dead letters [`QueueFlow::replay_dead_letters`] applies to. Every
+/// field is optional (`None` is not sent); the default replays any of the
+/// caller's unreplayed entries up to the server's default limit of 100.
+#[derive(Clone, Debug, Default)]
+pub struct ReplayDeadLettersFilter {
+    /// Only dead letters from this queue.
+    pub queue: Option<String>,
+    /// Only dead letters for this task name.
+    pub task_name: Option<String>,
+    /// RFC 3339 instant; only entries created at or after it (inclusive).
+    pub created_after: Option<String>,
+    /// RFC 3339 instant; only entries created strictly before it (exclusive).
+    pub created_before: Option<String>,
+    /// Consider at most this many entries (default 100; the maximum is the
+    /// server's batch limit).
+    pub limit: Option<i64>,
+}
+
+impl ReplayDeadLettersFilter {
+    fn request(&self) -> models::ReplayDeadLettersRequest {
+        models::ReplayDeadLettersRequest {
+            created_after: self.created_after.clone().map(Some),
+            created_before: self.created_before.clone().map(Some),
+            limit: self.limit.map(Some),
+            queue: self.queue.clone().map(Some),
+            task_name: self.task_name.clone().map(Some),
+        }
+    }
+}
+
 impl QueueFlow {
-    /// Lists terminally-failed jobs.
+    /// Lists terminally-failed jobs. `ListOptions::replayed` narrows the
+    /// list to entries not yet replayed (`Some(false)`) or already replayed
+    /// (`Some(true)`).
     pub async fn list_dead_letters(
         &self,
         opts: &ListOptions,
@@ -711,6 +797,22 @@ impl QueueFlow {
             .map(|r| r.job_id)
             .map_err(api_err("replay_dead_letter"))
     }
+
+    /// Replays the caller's unreplayed dead letters matching `filter`, up to
+    /// `filter.limit` (default 100). Each result carries the fresh `job_id`
+    /// on success or an `error` explaining why that entry could not be
+    /// replayed (for example its job was purged by retention). Entries
+    /// already replayed are never considered, so calling it again replays
+    /// only what the previous call did not reach.
+    pub async fn replay_dead_letters(
+        &self,
+        filter: &ReplayDeadLettersFilter,
+    ) -> Result<Vec<models::ReplayedDeadLetter>, FacadeError> {
+        dlq_api::replay_dead_letters(&self.config, filter.request())
+            .await
+            .map(|r| r.results)
+            .map_err(api_err("replay_dead_letters"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -725,13 +827,40 @@ impl QueueFlow {
             .map_err(api_err("stats"))
     }
 
-    /// Live backlog per queue (pending, scheduled, running and the oldest
-    /// pending age), one entry per queue with non-terminal jobs.
+    /// Live backlog per queue (pending, scheduled, running, the oldest
+    /// pending age and whether the queue is paused for this tenant), one
+    /// entry per queue with non-terminal jobs.
     pub async fn queues(&self) -> Result<Vec<models::QueueStats>, FacadeError> {
         system_api::list_queues(&self.config)
             .await
             .map(|r| r.queues)
             .map_err(api_err("queues"))
+    }
+
+    /// Stops workers claiming this tenant's jobs on `queue`; running jobs
+    /// finish, so the queue is drained once the returned `running` reaches
+    /// zero. Idempotent. Pending jobs accumulate until
+    /// [`QueueFlow::resume_queue`].
+    pub async fn pause_queue(&self, queue: &str) -> Result<models::QueueControlResponse, FacadeError> {
+        system_api::pause_queue(&self.config, queue)
+            .await
+            .map_err(api_err("pause_queue"))
+    }
+
+    /// Lets workers claim this tenant's jobs on `queue` again. Idempotent.
+    pub async fn resume_queue(&self, queue: &str) -> Result<models::QueueControlResponse, FacadeError> {
+        system_api::resume_queue(&self.config, queue)
+            .await
+            .map_err(api_err("resume_queue"))
+    }
+
+    /// The caller's identity as the server resolved it from the tenant
+    /// token: the `tenant` every request is scoped to and its `access`
+    /// (`"read_write"`, or `"read_only"` for a read-only key).
+    pub async fn whoami(&self) -> Result<models::WhoAmIResponse, FacadeError> {
+        system_api::who_am_i(&self.config)
+            .await
+            .map_err(api_err("whoami"))
     }
 
     /// Names of the task handlers registered on the server.
