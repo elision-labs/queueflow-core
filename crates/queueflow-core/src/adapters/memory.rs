@@ -67,11 +67,14 @@ impl InMemoryJobStore {
 }
 
 /// Lock order: when holding more than one of these mutexes, acquire them in
-/// field-declaration order (jobs -> leases -> workflows -> steps ->
+/// field-declaration order (queues -> jobs -> leases -> workflows -> steps ->
 /// dead_letters -> waiters). Every multi-lock method follows it; deviating
 /// can deadlock a janitor sweep racing a workflow advance.
 struct Inner {
     clock: Arc<dyn Clock>,
+    /// The queue registry: (tenant or "", queue) -> paused. Mirrors the
+    /// `queueflow.queues` table.
+    queues: Mutex<HashMap<(String, String), bool>>,
     jobs: Mutex<HashMap<String, Job>>,
     /// job_id -> lease. Entries exist only while a job is leased (`running`).
     leases: Mutex<HashMap<String, Lease>>,
@@ -94,6 +97,7 @@ impl InMemoryJobStore {
             lease_grace_secs: LEASE_GRACE_SECS,
             inner: Arc::new(Inner {
                 clock,
+                queues: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
                 leases: Mutex::new(HashMap::new()),
                 workflows: Mutex::new(HashMap::new()),
@@ -198,7 +202,18 @@ fn matches_filter(job: &Job, f: &ListFilter) -> bool {
             return false;
         }
     }
+    if let Some(t) = &f.task_name {
+        if &job.task_name != t {
+            return false;
+        }
+    }
     in_time_range(job.created_at, f)
+}
+
+/// The registry key for a tenant: `""` stands for "no tenant", as in the
+/// Postgres table's primary key.
+fn tenant_key(tenant_id: Option<&str>) -> String {
+    tenant_id.unwrap_or("").to_string()
 }
 
 #[async_trait]
@@ -302,11 +317,26 @@ impl JobStore for InMemoryJobStore {
         // epoch, so the caller's subsequent await_work cannot lose it.
         let epoch = self.waiter(queue).epoch.load(Ordering::SeqCst);
         let now = self.now();
+        // Tenants whose claims on this queue are paused (registry lock first,
+        // per the lock order; released before the job maps are taken).
+        let paused: Vec<String> = self
+            .inner
+            .queues
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((_, name), paused)| name == queue && **paused)
+            .map(|((tenant, _), _)| tenant.clone())
+            .collect();
         let mut jobs = self.inner.jobs.lock().unwrap();
         let mut leases = self.inner.leases.lock().unwrap();
 
         let claimable = |j: &Job| {
-            j.queue_name == queue && matches!(j.status, JobStatus::Pending | JobStatus::Retrying)
+            j.queue_name == queue
+                && matches!(j.status, JobStatus::Pending | JobStatus::Retrying)
+                && !paused
+                    .iter()
+                    .any(|t| t == j.tenant_id.as_deref().unwrap_or(""))
         };
 
         // Due jobs, ordered like the Postgres claim query: higher priority
@@ -655,6 +685,14 @@ impl JobStore for InMemoryJobStore {
                         .as_ref()
                         .map(|q| d.queue_name.as_deref() == Some(q.as_str()))
                         .unwrap_or(true)
+                    && filter
+                        .task_name
+                        .as_ref()
+                        .map(|t| d.task_name.as_deref() == Some(t.as_str()))
+                        .unwrap_or(true)
+                    && filter
+                        .replayed
+                        .is_none_or(|want| d.replayed_at.is_some() == want)
                     && in_time_range(d.created_at, filter)
             })
             .cloned()
@@ -814,6 +852,61 @@ impl JobStore for InMemoryJobStore {
             self.notify_work(&replacement.queue_name);
         }
         Ok(true)
+    }
+
+    async fn register_queue(
+        &self,
+        tenant_id: Option<&str>,
+        name: &str,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .queues
+            .lock()
+            .unwrap()
+            .entry((tenant_key(tenant_id), name.to_string()))
+            .or_insert(false);
+        Ok(())
+    }
+
+    async fn set_queue_paused(
+        &self,
+        tenant_id: Option<&str>,
+        name: &str,
+        paused: bool,
+        _now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .queues
+            .lock()
+            .unwrap()
+            .insert((tenant_key(tenant_id), name.to_string()), paused);
+        if !paused {
+            // Parked workers saw nothing claimable while paused; wake them.
+            self.notify_work(name);
+        }
+        Ok(())
+    }
+
+    async fn list_registered_queues(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<RegisteredQueue>, StorageError> {
+        let want = tenant_id.map(|t| tenant_key(Some(t)));
+        let mut out: Vec<RegisteredQueue> = self
+            .inner
+            .queues
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((tenant, _), _)| want.as_ref().is_none_or(|w| w == tenant))
+            .map(|((tenant, name), paused)| RegisteredQueue {
+                tenant_id: (!tenant.is_empty()).then(|| tenant.clone()),
+                name: name.clone(),
+                paused: *paused,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.tenant_id.cmp(&b.tenant_id)));
+        Ok(out)
     }
 
     async fn ping(&self) -> Result<(), StorageError> {

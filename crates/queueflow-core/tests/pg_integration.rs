@@ -611,3 +611,190 @@ async fn pg_count_stats_are_scoped_to_the_tenant() {
         .unwrap();
     assert_eq!(nobody, StatsSnapshot::default());
 }
+
+#[tokio::test]
+async fn pg_paused_queue_skips_one_tenants_claims_and_is_listed() {
+    let queue = "test_pause";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    // Registry rows survive purge_queue; start from a clean slate.
+    store
+        .set_queue_paused(Some("acme"), queue, false, chrono::Utc::now())
+        .await
+        .unwrap();
+    let engine = Engine::builder(store.clone(), Arc::new(SystemClock))
+        .default_queue(queue)
+        .register("echo", builtin::echo())
+        .build();
+    let opts = |tenant: &str| EnqueueOptions {
+        tenant_id: Some(tenant.into()),
+        ..Default::default()
+    };
+    let acme = engine
+        .enqueue("echo", Map::new(), opts("acme"))
+        .await
+        .unwrap();
+    let globex = engine
+        .enqueue("echo", Map::new(), opts("globex"))
+        .await
+        .unwrap();
+
+    engine.pause_queue(Some("acme"), queue).await.unwrap();
+    let claimed = store.claim_jobs(queue, 10, 30, false).await.unwrap();
+    let ids: Vec<&str> = claimed.jobs.iter().map(|l| l.job.id.as_str()).collect();
+    assert_eq!(ids, vec![globex.as_str()], "only the unpaused tenant's job");
+
+    let acme_view = engine.queue_stats(Some("acme")).await.unwrap();
+    let q = acme_view.iter().find(|q| q.queue == queue).unwrap();
+    assert!(q.paused);
+    assert_eq!(q.pending, 1);
+    let all = engine.queue_stats(None).await.unwrap();
+    assert!(!all.iter().find(|q| q.queue == queue).unwrap().paused);
+
+    engine.resume_queue(Some("acme"), queue).await.unwrap();
+    let claimed = store.claim_jobs(queue, 10, 30, false).await.unwrap();
+    assert_eq!(claimed.jobs.len(), 1);
+    assert_eq!(claimed.jobs[0].job.id, acme);
+
+    // Registered queues are listed even once drained.
+    for lease in claimed.jobs {
+        store
+            .finish_if_leased(
+                &lease.job.id,
+                &lease.lease_token,
+                JobStatus::Completed,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let rows = store.list_registered_queues(Some("acme")).await.unwrap();
+    assert!(
+        rows.iter().any(|r| r.name == queue && !r.paused),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn pg_bulk_cancel_is_one_bounded_statement() {
+    let queue = "test_bulk_cancel";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    let engine = Engine::builder(store.clone(), Arc::new(SystemClock))
+        .default_queue(queue)
+        .build();
+    let opts = |tenant: &str| EnqueueOptions {
+        tenant_id: Some(tenant.into()),
+        ..Default::default()
+    };
+    for _ in 0..4 {
+        engine.enqueue("a", Map::new(), opts("acme")).await.unwrap();
+    }
+    engine.enqueue("b", Map::new(), opts("acme")).await.unwrap();
+    engine
+        .enqueue("a", Map::new(), opts("globex"))
+        .await
+        .unwrap();
+    // One running job: a non-terminal status, so it is in scope too.
+    let running = store.claim_jobs(queue, 1, 30, false).await.unwrap();
+    assert_eq!(running.jobs.len(), 1);
+
+    let filter = |task: Option<&str>, limit: i64| ListFilter {
+        tenant_id: Some("acme".into()),
+        queue: Some(queue.into()),
+        task_name: task.map(Into::into),
+        limit,
+        ..Default::default()
+    };
+    assert_eq!(engine.cancel_jobs(&filter(Some("a"), 3)).await.unwrap(), 3);
+    assert_eq!(engine.cancel_jobs(&filter(Some("a"), 3)).await.unwrap(), 1);
+    assert_eq!(engine.cancel_jobs(&filter(None, 10)).await.unwrap(), 1);
+    assert_eq!(engine.cancel_jobs(&filter(None, 10)).await.unwrap(), 0);
+
+    let left = store
+        .list_jobs(&ListFilter {
+            queue: Some(queue.into()),
+            status: Some("pending".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .items;
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].tenant_id.as_deref(), Some("globex"));
+    // The worker holding the cancelled running job cannot complete it.
+    let lease = &running.jobs[0];
+    assert!(store
+        .finish_if_leased(
+            &lease.job.id,
+            &lease.lease_token,
+            JobStatus::Completed,
+            None,
+            None
+        )
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn pg_dead_letters_filter_by_replayed_and_task() {
+    let queue = "test_dlq_filters";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    let engine = Engine::builder(store.clone(), Arc::new(SystemClock))
+        .default_queue(queue)
+        .build();
+    let tenant = format!("t-{}", uuid::Uuid::new_v4());
+    let opts = EnqueueOptions {
+        tenant_id: Some(tenant.clone()),
+        ..Default::default()
+    };
+    engine
+        .enqueue("ghost_a", Map::new(), opts.clone())
+        .await
+        .unwrap();
+    engine.enqueue("ghost_b", Map::new(), opts).await.unwrap();
+    assert!(engine.process_once(queue).await.unwrap());
+    assert!(engine.process_once(queue).await.unwrap());
+
+    let base = ListFilter {
+        tenant_id: Some(tenant.clone()),
+        queue: Some(queue.into()),
+        ..Default::default()
+    };
+    let outcomes = engine
+        .replay_dead_letters(&ListFilter {
+            task_name: Some("ghost_a".into()),
+            ..base.clone()
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(outcomes[0].job_id.is_some());
+
+    let unreplayed = store
+        .list_dead_letters(&ListFilter {
+            replayed: Some(false),
+            ..base.clone()
+        })
+        .await
+        .unwrap()
+        .items;
+    assert_eq!(unreplayed.len(), 1);
+    assert_eq!(unreplayed[0].task_name.as_deref(), Some("ghost_b"));
+    let replayed = store
+        .list_dead_letters(&ListFilter {
+            replayed: Some(true),
+            ..base
+        })
+        .await
+        .unwrap()
+        .items;
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].task_name.as_deref(), Some("ghost_a"));
+}

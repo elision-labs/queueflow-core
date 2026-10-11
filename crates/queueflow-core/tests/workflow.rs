@@ -841,6 +841,30 @@ impl JobStore for OrderProbe {
     ) -> Result<Vec<QueueStats>, StorageError> {
         self.inner.queue_stats(tenant_id, now).await
     }
+    async fn register_queue(
+        &self,
+        tenant_id: Option<&str>,
+        name: &str,
+    ) -> Result<(), StorageError> {
+        self.inner.register_queue(tenant_id, name).await
+    }
+    async fn set_queue_paused(
+        &self,
+        tenant_id: Option<&str>,
+        name: &str,
+        paused: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .set_queue_paused(tenant_id, name, paused, now)
+            .await
+    }
+    async fn list_registered_queues(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<RegisteredQueue>, StorageError> {
+        self.inner.list_registered_queues(tenant_id).await
+    }
     async fn list_dead_letters(
         &self,
         filter: &ListFilter,

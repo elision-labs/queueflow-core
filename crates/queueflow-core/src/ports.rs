@@ -68,6 +68,11 @@ pub struct ListFilter {
     pub tenant_id: Option<String>,
     pub status: Option<String>,
     pub queue: Option<String>,
+    /// Only jobs for this task (jobs only; ignored by the other listings).
+    pub task_name: Option<String>,
+    /// Dead letters only: `Some(false)` lists entries not yet replayed,
+    /// `Some(true)` the replayed ones, `None` both.
+    pub replayed: Option<bool>,
     pub limit: i64,
     pub offset: i64,
     /// Order by `created_at` descending when true (the default), ascending when
@@ -95,6 +100,8 @@ impl Default for ListFilter {
             tenant_id: None,
             status: None,
             queue: None,
+            task_name: None,
+            replayed: None,
             limit: 50,
             offset: 0,
             order_desc: true,
@@ -248,6 +255,79 @@ pub trait JobStore: Send + Sync {
     /// check and the write are a single operation so a completing worker can
     /// never be raced into overwriting a terminal status.
     async fn cancel_job_if_active(&self, id: &str, reason: &str) -> Result<bool, StorageError>;
+
+    /// Cancel every non-terminal job matching the filter's tenant, queue,
+    /// task name, status (which must be a non-terminal status when given)
+    /// and creation window, at most `filter.limit` of them. Returns how many
+    /// were cancelled. Each cancellation is the same guarded transition as
+    /// [`JobStore::cancel_job_if_active`]: a job finishing concurrently is
+    /// left alone, never overwritten. The default implementation lists and
+    /// cancels one by one; Postgres does it in one statement.
+    async fn cancel_jobs_matching(
+        &self,
+        filter: &ListFilter,
+        reason: &str,
+    ) -> Result<u64, StorageError> {
+        // One status per listing, so already-cancelled rows never occupy
+        // the page and starve the limit.
+        let statuses: Vec<String> = match &filter.status {
+            Some(s) => vec![s.clone()],
+            None => ["pending", "retrying", "running"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        let limit = if filter.limit <= 0 { 50 } else { filter.limit };
+        let mut n: u64 = 0;
+        for status in statuses {
+            let remaining = limit - n as i64;
+            if remaining <= 0 {
+                break;
+            }
+            let mut page_filter = filter.clone();
+            page_filter.status = Some(status);
+            page_filter.offset = 0;
+            page_filter.after = None;
+            page_filter.include_total = false;
+            page_filter.limit = remaining;
+            let page = self.list_jobs(&page_filter).await?;
+            for job in page.items {
+                if self.cancel_job_if_active(&job.id, reason).await? {
+                    n += 1;
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    // ---- Queue registry -----------------------------------------------------
+
+    /// Record that `name` is a queue of this tenant (`None` = no tenant).
+    /// Idempotent. The engine calls it once per process per (tenant, queue)
+    /// it enqueues to, so `/queues` can list queues that are currently
+    /// empty. Purely advisory: a failure here must not fail the enqueue.
+    async fn register_queue(&self, tenant_id: Option<&str>, name: &str)
+        -> Result<(), StorageError>;
+
+    /// Pause or resume claims of this tenant's jobs on `name`, registering
+    /// the queue if needed. While paused, the queue's jobs stay pending and
+    /// are skipped by every claim; running jobs finish normally. Resuming
+    /// wakes parked workers so the backlog drains without waiting for a
+    /// poll tick.
+    async fn set_queue_paused(
+        &self,
+        tenant_id: Option<&str>,
+        name: &str,
+        paused: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError>;
+
+    /// Every registered queue of one tenant (or of all tenants, when
+    /// `tenant_id` is `None`), sorted by name.
+    async fn list_registered_queues(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<RegisteredQueue>, StorageError>;
 
     /// Record that a job is scheduled for retry: status becomes `retrying`,
     /// `scheduled_at` moves to `next_retry_at` (the durable delay lives in the
@@ -446,6 +526,15 @@ pub trait JobStore: Send + Sync {
         key: &str,
         value: &Json,
     ) -> Result<(), StorageError>;
+}
+
+/// One row of the queue registry: a (tenant, queue) pair the engine has
+/// enqueued to, and whether claims for it are paused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredQueue {
+    pub tenant_id: Option<String>,
+    pub name: String,
+    pub paused: bool,
 }
 
 /// The persisted state of one workflow step.

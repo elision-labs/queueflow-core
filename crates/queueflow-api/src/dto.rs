@@ -192,6 +192,147 @@ pub struct ReplayDeadLetterResponse {
     pub job_id: String,
 }
 
+/// Which jobs a bulk cancel applies to. Every field is optional; an empty
+/// body cancels the caller's oldest non-terminal jobs up to `limit`.
+#[derive(Clone, Debug, Default, Deserialize, ToSchema)]
+pub struct CancelJobsRequest {
+    /// Only jobs on this queue.
+    #[serde(default)]
+    pub queue: Option<String>,
+    /// Only jobs for this task.
+    #[serde(default)]
+    pub task_name: Option<String>,
+    /// Only jobs in this state: `pending`, `retrying` or `running` (all three
+    /// when omitted). Terminal states are rejected: history is never
+    /// rewritten.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Only jobs created at or after this instant (RFC 3339, inclusive).
+    #[serde(default)]
+    pub created_after: Option<DateTime<Utc>>,
+    /// Only jobs created strictly before this instant (RFC 3339, exclusive).
+    #[serde(default)]
+    pub created_before: Option<DateTime<Utc>>,
+    /// Cancel at most this many (oldest first). Default 100; the maximum is
+    /// the server's batch limit (`--max-batch`, 1000 by default).
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+impl CancelJobsRequest {
+    pub fn into_filter(self, tenant: String, max: i64) -> queueflow_core::ListFilter {
+        queueflow_core::ListFilter {
+            tenant_id: Some(tenant),
+            status: self.status,
+            queue: self.queue,
+            task_name: self.task_name,
+            replayed: None,
+            limit: self.limit.unwrap_or(100).clamp(1, max.max(1)),
+            offset: 0,
+            // Oldest first, so a capped cancel takes the longest-waiting work.
+            order_desc: false,
+            include_total: false,
+            after: None,
+            created_after: self.created_after,
+            created_before: self.created_before,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct CancelJobsResponse {
+    /// How many jobs this call cancelled. Less than `limit` means the
+    /// matching set is exhausted (jobs finishing concurrently are left as
+    /// they ended, never overwritten).
+    pub cancelled: u64,
+}
+
+/// Which dead letters a bulk replay applies to. Every field is optional; an
+/// empty body replays the caller's oldest unreplayed dead letters up to
+/// `limit`.
+#[derive(Clone, Debug, Default, Deserialize, ToSchema)]
+pub struct ReplayDeadLettersRequest {
+    /// Only dead letters from this queue.
+    #[serde(default)]
+    pub queue: Option<String>,
+    /// Only dead letters for this task.
+    #[serde(default)]
+    pub task_name: Option<String>,
+    /// Only entries created at or after this instant (RFC 3339, inclusive).
+    #[serde(default)]
+    pub created_after: Option<DateTime<Utc>>,
+    /// Only entries created strictly before this instant (RFC 3339,
+    /// exclusive).
+    #[serde(default)]
+    pub created_before: Option<DateTime<Utc>>,
+    /// Consider at most this many entries (oldest first). Default 100; the
+    /// maximum is the server's batch limit (`--max-batch`).
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+impl ReplayDeadLettersRequest {
+    pub fn into_filter(self, tenant: String, max: i64) -> queueflow_core::ListFilter {
+        queueflow_core::ListFilter {
+            tenant_id: Some(tenant),
+            status: None,
+            queue: self.queue,
+            task_name: self.task_name,
+            replayed: Some(false),
+            limit: self.limit.unwrap_or(100).clamp(1, max.max(1)),
+            offset: 0,
+            order_desc: false,
+            include_total: false,
+            after: None,
+            created_after: self.created_after,
+            created_before: self.created_before,
+        }
+    }
+}
+
+/// One dead letter's outcome in a bulk replay.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct ReplayedDeadLetter {
+    pub dead_letter_id: i64,
+    /// The fresh job, when the replay succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    /// Why it did not, for example the original job was purged by retention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct ReplayDeadLettersResponse {
+    /// Entries that were replayed (`job_id` set) or could not be (`error`
+    /// set), oldest first. Entries already replayed are not listed.
+    pub results: Vec<ReplayedDeadLetter>,
+    /// How many of `results` produced a job.
+    pub replayed: u64,
+}
+
+/// The caller's identity, as the server resolved it from the bearer token.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct WhoAmIResponse {
+    /// The tenant every request with this credential is scoped to.
+    pub tenant: String,
+    /// `read_write`, or `read_only` for a `:ro` key or a `scope: read` JWT.
+    pub access: String,
+}
+
+/// Pause or resume outcome: the queue's live counts with its new flag.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct QueueControlResponse {
+    pub queue: String,
+    /// Claims of the caller's jobs on this queue are paused.
+    pub paused: bool,
+    /// Jobs of the caller still leased by workers. A paused queue is drained
+    /// once this reaches zero.
+    pub running: u64,
+    /// Claimable jobs of the caller waiting on this queue.
+    pub pending: u64,
+}
+
 /// Runtime status of one workflow step (the live progress view).
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct WorkflowStepState {
@@ -224,8 +365,9 @@ pub struct TasksResponse {
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct QueuesResponse {
-    /// One entry per queue that currently has non-terminal jobs, sorted by
-    /// name.
+    /// One entry per queue the caller has enqueued to (since 0.5.0, whether or
+    /// not it currently has jobs) or that currently has non-terminal jobs,
+    /// sorted by name.
     pub queues: Vec<queueflow_core::QueueStats>,
 }
 
@@ -274,6 +416,11 @@ pub struct ListQuery {
     pub status: Option<String>,
     /// Filter by queue name (jobs only).
     pub queue: Option<String>,
+    /// Filter by task name (jobs and dead letters).
+    pub task_name: Option<String>,
+    /// Dead letters only: `false` lists entries not yet replayed, `true` the
+    /// replayed ones; both when omitted.
+    pub replayed: Option<bool>,
     /// Page size, 1..=100 (default 50).
     pub limit: Option<i64>,
     /// Number of records to skip (default 0).
@@ -309,6 +456,8 @@ impl ListQuery {
             tenant_id: tenant,
             status: self.status,
             queue: self.queue,
+            task_name: self.task_name,
+            replayed: self.replayed,
             limit,
             offset,
             order_desc,

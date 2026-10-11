@@ -12,7 +12,7 @@ use axum::{Extension, Json};
 use futures::stream::Stream;
 use queueflow_core::{BatchItem, CreateWorkflowRequest, EngineError, Job, Workflow};
 
-use crate::auth::Tenant;
+use crate::auth::{Access, Tenant};
 use crate::dto::*;
 use crate::error::ApiError;
 use crate::ApiState;
@@ -208,6 +208,30 @@ pub async fn cancel_job(
     ensure_owner(job.tenant_id.as_deref(), &t)?;
     s.engine.cancel_job(&id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/jobs/cancel", tag = "jobs", operation_id = "cancelJobs",
+    request_body = CancelJobsRequest,
+    responses(
+        (status = 200, description = "Matching non-terminal jobs of the caller's tenant were \
+                                      cancelled, oldest first, up to `limit`. Repeat until \
+                                      `cancelled` is below `limit` to drain a large set.",
+         body = CancelJobsResponse),
+        (status = 400, description = "Invalid filter (for example a terminal status)", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn cancel_jobs(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Json(body): Json<CancelJobsRequest>,
+) -> Result<Json<CancelJobsResponse>, ApiError> {
+    let filter = body.into_filter(t.0, s.max_batch as i64);
+    let cancelled = s.engine.cancel_jobs(filter).await?;
+    Ok(Json(CancelJobsResponse { cancelled }))
 }
 
 // ---- Workflows -------------------------------------------------------------
@@ -705,7 +729,7 @@ pub async fn resume_cron(
     get, path = "/api/v1/dlq", tag = "dlq", operation_id = "listDeadLetters",
     params(ListQuery),
     responses(
-        (status = 200, description = "Page of dead letters, newest first (the `status` filter does not apply)", body = ListDeadLettersResponse),
+        (status = 200, description = "Page of dead letters, newest first. `queue`, `task_name`, `replayed` and the time window apply; `status` does not.", body = ListDeadLettersResponse),
         (status = 401, description = "Unauthorized", body = ErrorBody),
     ),
     security(("bearerAuth" = []))
@@ -785,15 +809,137 @@ pub async fn replay_dead_letter(
         .into_response())
 }
 
+#[utoipa::path(
+    post, path = "/api/v1/dlq/replay", tag = "dlq", operation_id = "replayDeadLetters",
+    request_body = ReplayDeadLettersRequest,
+    responses(
+        (status = 200, description = "Every unreplayed dead letter matching the filter (oldest \
+                                      first, up to `limit`) was replayed as a fresh job, or is \
+                                      listed with the reason it could not be.",
+         body = ReplayDeadLettersResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn replay_dead_letters(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Json(body): Json<ReplayDeadLettersRequest>,
+) -> Result<Json<ReplayDeadLettersResponse>, ApiError> {
+    let filter = body.into_filter(t.0, s.max_batch as i64);
+    let outcomes = s.engine.replay_dead_letters(filter).await?;
+    let replayed = outcomes.iter().filter(|o| o.job_id.is_some()).count() as u64;
+    Ok(Json(ReplayDeadLettersResponse {
+        results: outcomes
+            .into_iter()
+            .map(|o| ReplayedDeadLetter {
+                dead_letter_id: o.dead_letter_id,
+                job_id: o.job_id,
+                error: o.error,
+            })
+            .collect(),
+        replayed,
+    }))
+}
+
 // ---- System ----------------------------------------------------------------
+
+#[utoipa::path(
+    get, path = "/api/v1/whoami", tag = "system", operation_id = "whoAmI",
+    responses(
+        (status = 200, description = "The tenant and access level of the bearer token",
+         body = WhoAmIResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn whoami(
+    Extension(t): Extension<Tenant>,
+    Extension(access): Extension<Access>,
+) -> Json<WhoAmIResponse> {
+    Json(WhoAmIResponse {
+        tenant: t.0,
+        access: match access {
+            Access::ReadWrite => "read_write".into(),
+            Access::ReadOnly => "read_only".into(),
+        },
+    })
+}
+
+/// Shared by pause and resume: flip the flag, then report the queue's live
+/// counts so a caller draining it can see `running` without a second call.
+async fn set_queue_paused(
+    s: &ApiState,
+    t: &Tenant,
+    queue: &str,
+    paused: bool,
+) -> Result<Json<QueueControlResponse>, ApiError> {
+    if paused {
+        s.engine.pause_queue(Some(&t.0), queue).await?;
+    } else {
+        s.engine.resume_queue(Some(&t.0), queue).await?;
+    }
+    let stats = s.engine.queue_stats(Some(&t.0)).await?;
+    let live = stats.into_iter().find(|q| q.queue == queue);
+    Ok(Json(QueueControlResponse {
+        queue: queue.to_string(),
+        paused,
+        running: live.as_ref().map_or(0, |q| q.running),
+        pending: live.as_ref().map_or(0, |q| q.pending),
+    }))
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/queues/{queue}/pause", tag = "system", operation_id = "pauseQueue",
+    params(("queue" = String, Path, description = "Queue name")),
+    responses(
+        (status = 200, description = "Claims of the caller's jobs on this queue are paused: \
+                                      pending jobs wait, running jobs finish. The queue is \
+                                      drained once `running` reaches zero. Idempotent.",
+         body = QueueControlResponse),
+        (status = 400, description = "Invalid queue name", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn pause_queue(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(queue): Path<String>,
+) -> Result<Json<QueueControlResponse>, ApiError> {
+    set_queue_paused(&s, &t, &queue, true).await
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/queues/{queue}/resume", tag = "system", operation_id = "resumeQueue",
+    params(("queue" = String, Path, description = "Queue name")),
+    responses(
+        (status = 200, description = "Claims resume immediately; parked workers are woken. Idempotent.",
+         body = QueueControlResponse),
+        (status = 400, description = "Invalid queue name", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn resume_queue(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(queue): Path<String>,
+) -> Result<Json<QueueControlResponse>, ApiError> {
+    set_queue_paused(&s, &t, &queue, false).await
+}
 
 #[utoipa::path(
     get, path = "/api/v1/queues", tag = "system", operation_id = "listQueues",
     responses((status = 200,
-        description = "Live backlog per queue for the caller's tenant: claimable (`pending`), \
-                       waiting for a future run time (`scheduled`), and `running` counts, plus \
-                       how long the oldest claimable job has waited. Queues with no non-terminal \
-                       jobs are omitted.",
+        description = "Backlog per queue for the caller's tenant: claimable (`pending`), \
+                       waiting for a future run time (`scheduled`), and `running` counts, how \
+                       long the oldest claimable job has waited, and whether the queue is \
+                       `paused`. Lists every queue the tenant has enqueued to (since 0.5.0) and \
+                       any with non-terminal jobs.",
         body = QueuesResponse)),
     security(("bearerAuth" = []))
 )]

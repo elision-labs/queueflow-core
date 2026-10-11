@@ -182,4 +182,10 @@ pub struct QueueStats {
     /// cannot keep up and stays near zero when they can.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_pending_age_secs: Option<u64>,
+    /// Claims for this tenant's jobs on the queue are paused (see
+    /// `POST /api/v1/queues/{queue}/pause`). Pending jobs accumulate; running
+    /// ones finish. In the all-tenants view this is true only when every
+    /// registered tenant of the queue is paused.
+    #[serde(default)]
+    pub paused: bool,
 }

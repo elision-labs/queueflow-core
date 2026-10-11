@@ -206,6 +206,18 @@ fn render(s: &StatsSnapshot, lat: &LatencySnapshot, queues: Option<&[QueueStats]
                 q.oldest_pending_age_secs.unwrap_or(0)
             ));
         }
+        gauge_header(
+            &mut out,
+            "queueflow_queue_paused",
+            "1 when claims on the queue are paused for every tenant that has registered it",
+        );
+        for q in queues {
+            out.push_str(&format!(
+                "queueflow_queue_paused{{queue=\"{}\"}} {}\n",
+                label(&q.queue),
+                u8::from(q.paused)
+            ));
+        }
     }
     out
 }
@@ -234,6 +246,7 @@ mod tests {
             scheduled: 1,
             running: 2,
             oldest_pending_age_secs: Some(42),
+            paused: true,
         }];
         let out = render(&stats, &lat, Some(&queues));
         assert!(out.contains("queueflow_jobs_completed_total 7\n"));
@@ -246,6 +259,7 @@ mod tests {
         assert!(
             out.contains("queueflow_queue_oldest_pending_age_seconds{queue=\"ord\\\"ers\"} 42\n")
         );
+        assert!(out.contains("queueflow_queue_paused{queue=\"ord\\\"ers\"} 1\n"));
     }
 
     #[test]

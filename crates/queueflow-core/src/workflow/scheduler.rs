@@ -14,6 +14,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::domain::*;
+use crate::engine::KnownQueues;
 use crate::error::EngineError;
 use crate::ports::{Clock, JobStore};
 use crate::stats::EngineStats;
@@ -25,6 +26,7 @@ pub struct WorkflowScheduler<JS> {
     clock: Arc<dyn Clock>,
     default_queue: String,
     stats: Arc<EngineStats>,
+    known_queues: Arc<KnownQueues>,
 }
 
 impl<JS> WorkflowScheduler<JS>
@@ -36,12 +38,14 @@ where
         clock: Arc<dyn Clock>,
         default_queue: String,
         stats: Arc<EngineStats>,
+        known_queues: Arc<KnownQueues>,
     ) -> Self {
         Self {
             store,
             clock,
             default_queue,
             stats,
+            known_queues,
         }
     }
 
@@ -375,6 +379,9 @@ where
             idempotency_key: None,
         };
 
+        self.known_queues
+            .ensure(&*self.store, wf.tenant_id.as_deref(), &job.queue_name)
+            .await;
         // CLAIM the step and create its job in one atomic store operation.
         // Two workers completing sibling steps concurrently both run `advance`
         // and can both see a join step as unscheduled; the claim guarantees

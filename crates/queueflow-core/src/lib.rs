@@ -63,11 +63,13 @@ pub use domain::{
 };
 pub use engine::janitor::JanitorSweepReport;
 pub use engine::{
-    BatchItem, Engine, EngineBuilder, EnqueueOptions, JanitorConfig, DEFAULT_WORKER_POLL_SECS,
+    validate_queue_name, BatchItem, Engine, EngineBuilder, EnqueueOptions, JanitorConfig,
+    ReplayOutcome, DEFAULT_WORKER_POLL_SECS, MAX_QUEUE_NAME_LEN,
 };
 pub use error::{EngineError, HandlerError};
 pub use ports::{
-    Claimed, Clock, FinishedJob, JobStore, ListFilter, Page, PageCursor, StepRecord, StorageError,
+    Claimed, Clock, FinishedJob, JobStore, ListFilter, Page, PageCursor, RegisteredQueue,
+    StepRecord, StorageError,
 };
 pub use stats::{
     EngineStats, Histogram, HistogramSnapshot, LatencySnapshot, QueueStats, StatsSnapshot,

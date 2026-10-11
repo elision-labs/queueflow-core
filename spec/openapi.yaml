@@ -33,6 +33,20 @@ paths:
         required: false
         schema:
           type: string
+      - name: task_name
+        in: query
+        description: Filter by task name (jobs and dead letters).
+        required: false
+        schema:
+          type: string
+      - name: replayed
+        in: query
+        description: |-
+          Dead letters only: `false` lists entries not yet replayed, `true` the
+          replayed ones; both when omitted.
+        required: false
+        schema:
+          type: boolean
       - name: limit
         in: query
         description: Page size, 1..=100 (default 50).
@@ -299,6 +313,20 @@ paths:
         required: false
         schema:
           type: string
+      - name: task_name
+        in: query
+        description: Filter by task name (jobs and dead letters).
+        required: false
+        schema:
+          type: string
+      - name: replayed
+        in: query
+        description: |-
+          Dead letters only: `false` lists entries not yet replayed, `true` the
+          replayed ones; both when omitted.
+        required: false
+        schema:
+          type: boolean
       - name: limit
         in: query
         description: Page size, 1..=100 (default 50).
@@ -354,13 +382,45 @@ paths:
           format: date-time
       responses:
         '200':
-          description: Page of dead letters, newest first (the `status` filter does not apply)
+          description: Page of dead letters, newest first. `queue`, `task_name`, `replayed` and the time window apply; `status` does not.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ListDeadLettersResponse'
         '401':
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+      security:
+      - bearerAuth: []
+  /api/v1/dlq/replay:
+    post:
+      tags:
+      - dlq
+      operationId: replayDeadLetters
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplayDeadLettersRequest'
+        required: true
+      responses:
+        '200':
+          description: Every unreplayed dead letter matching the filter (oldest first, up to `limit`) was replayed as a fresh job, or is listed with the reason it could not be.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplayDeadLettersResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden
           content:
             application/json:
               schema:
@@ -471,6 +531,20 @@ paths:
         required: false
         schema:
           type: string
+      - name: task_name
+        in: query
+        description: Filter by task name (jobs and dead letters).
+        required: false
+        schema:
+          type: string
+      - name: replayed
+        in: query
+        description: |-
+          Dead letters only: `false` lists entries not yet replayed, `true` the
+          replayed ones; both when omitted.
+        required: false
+        schema:
+          type: boolean
       - name: limit
         in: query
         description: Page size, 1..=100 (default 50).
@@ -605,6 +679,44 @@ paths:
                 $ref: '#/components/schemas/ErrorBody'
         '401':
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+      security:
+      - bearerAuth: []
+  /api/v1/jobs/cancel:
+    post:
+      tags:
+      - jobs
+      operationId: cancelJobs
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelJobsRequest'
+        required: true
+      responses:
+        '200':
+          description: Matching non-terminal jobs of the caller's tenant were cancelled, oldest first, up to `limit`. Repeat until `cancelled` is below `limit` to drain a large set.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelJobsResponse'
+        '400':
+          description: Invalid filter (for example a terminal status)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden
           content:
             application/json:
               schema:
@@ -874,7 +986,7 @@ paths:
       operationId: listQueues
       responses:
         '200':
-          description: 'Live backlog per queue for the caller''s tenant: claimable (`pending`), waiting for a future run time (`scheduled`), and `running` counts, plus how long the oldest claimable job has waited. Queues with no non-terminal jobs are omitted.'
+          description: 'Backlog per queue for the caller''s tenant: claimable (`pending`), waiting for a future run time (`scheduled`), and `running` counts, how long the oldest claimable job has waited, and whether the queue is `paused`. Lists every queue the tenant has enqueued to (since 0.5.0) and any with non-terminal jobs.'
           content:
             application/json:
               schema:
@@ -920,6 +1032,84 @@ paths:
                 $ref: '#/components/schemas/ErrorBody'
       security:
       - bearerAuth: []
+  /api/v1/queues/{queue}/pause:
+    post:
+      tags:
+      - system
+      operationId: pauseQueue
+      parameters:
+      - name: queue
+        in: path
+        description: Queue name
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 'Claims of the caller''s jobs on this queue are paused: pending jobs wait, running jobs finish. The queue is drained once `running` reaches zero. Idempotent.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueControlResponse'
+        '400':
+          description: Invalid queue name
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+      security:
+      - bearerAuth: []
+  /api/v1/queues/{queue}/resume:
+    post:
+      tags:
+      - system
+      operationId: resumeQueue
+      parameters:
+      - name: queue
+        in: path
+        description: Queue name
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Claims resume immediately; parked workers are woken. Idempotent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueControlResponse'
+        '400':
+          description: Invalid queue name
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+      security:
+      - bearerAuth: []
   /api/v1/stats:
     get:
       tags:
@@ -948,6 +1138,26 @@ paths:
                 $ref: '#/components/schemas/TasksResponse'
       security:
       - bearerAuth: []
+  /api/v1/whoami:
+    get:
+      tags:
+      - system
+      operationId: whoAmI
+      responses:
+        '200':
+          description: The tenant and access level of the bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WhoAmIResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+      security:
+      - bearerAuth: []
   /api/v1/workflows:
     get:
       tags:
@@ -966,6 +1176,20 @@ paths:
         required: false
         schema:
           type: string
+      - name: task_name
+        in: query
+        description: Filter by task name (jobs and dead letters).
+        required: false
+        schema:
+          type: string
+      - name: replayed
+        in: query
+        description: |-
+          Dead letters only: `false` lists entries not yet replayed, `true` the
+          replayed ones; both when omitted.
+        required: false
+        schema:
+          type: boolean
       - name: limit
         in: query
         description: Page size, 1..=100 (default 50).
@@ -1256,6 +1480,63 @@ components:
       - fixed
       - linear
       - exponential
+    CancelJobsRequest:
+      type: object
+      description: |-
+        Which jobs a bulk cancel applies to. Every field is optional; an empty
+        body cancels the caller's oldest non-terminal jobs up to `limit`.
+      properties:
+        created_after:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Only jobs created at or after this instant (RFC 3339, inclusive).
+        created_before:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Only jobs created strictly before this instant (RFC 3339, exclusive).
+        limit:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Cancel at most this many (oldest first). Default 100; the maximum is
+            the server's batch limit (`--max-batch`, 1000 by default).
+        queue:
+          type:
+          - string
+          - 'null'
+          description: Only jobs on this queue.
+        status:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Only jobs in this state: `pending`, `retrying` or `running` (all three
+            when omitted). Terminal states are rejected: history is never
+            rewritten.
+        task_name:
+          type:
+          - string
+          - 'null'
+          description: Only jobs for this task.
+    CancelJobsResponse:
+      type: object
+      required:
+      - cancelled
+      properties:
+        cancelled:
+          type: integer
+          format: int64
+          description: |-
+            How many jobs this call cancelled. Less than `limit` means the
+            matching set is exhausted (jobs finishing concurrently are left as
+            they ended, never overwritten).
+          minimum: 0
     CompleteJobRequest:
       type: object
       description: Body for `POST /api/v1/jobs/{id}/complete`.
@@ -1991,6 +2272,32 @@ components:
       description: Reserved for future expansion; only `Continue` is meaningful today.
       enum:
       - continue
+    QueueControlResponse:
+      type: object
+      description: 'Pause or resume outcome: the queue''s live counts with its new flag.'
+      required:
+      - queue
+      - paused
+      - running
+      - pending
+      properties:
+        paused:
+          type: boolean
+          description: Claims of the caller's jobs on this queue are paused.
+        pending:
+          type: integer
+          format: int64
+          description: Claimable jobs of the caller waiting on this queue.
+          minimum: 0
+        queue:
+          type: string
+        running:
+          type: integer
+          format: int64
+          description: |-
+            Jobs of the caller still leased by workers. A paused queue is drained
+            once this reaches zero.
+          minimum: 0
     QueueStats:
       type: object
       description: |-
@@ -2014,6 +2321,13 @@ components:
             is claimable. The queue's primary health signal: it grows when workers
             cannot keep up and stays near zero when they can.
           minimum: 0
+        paused:
+          type: boolean
+          description: |-
+            Claims for this tenant's jobs on the queue are paused (see
+            `POST /api/v1/queues/{queue}/pause`). Pending jobs accumulate; running
+            ones finish. In the all-tenants view this is true only when every
+            registered tenant of the queue is paused.
         pending:
           type: integer
           format: int64
@@ -2041,8 +2355,9 @@ components:
           items:
             $ref: '#/components/schemas/QueueStats'
           description: |-
-            One entry per queue that currently has non-terminal jobs, sorted by
-            name.
+            One entry per queue the caller has enqueued to (since 0.5.0, whether or
+            not it currently has jobs) or that currently has non-terminal jobs,
+            sorted by name.
     ReadyStatus:
       type: object
       required:
@@ -2058,6 +2373,82 @@ components:
         job_id:
           type: string
           description: The fresh job created from the dead-lettered one.
+    ReplayDeadLettersRequest:
+      type: object
+      description: |-
+        Which dead letters a bulk replay applies to. Every field is optional; an
+        empty body replays the caller's oldest unreplayed dead letters up to
+        `limit`.
+      properties:
+        created_after:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Only entries created at or after this instant (RFC 3339, inclusive).
+        created_before:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: |-
+            Only entries created strictly before this instant (RFC 3339,
+            exclusive).
+        limit:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Consider at most this many entries (oldest first). Default 100; the
+            maximum is the server's batch limit (`--max-batch`).
+        queue:
+          type:
+          - string
+          - 'null'
+          description: Only dead letters from this queue.
+        task_name:
+          type:
+          - string
+          - 'null'
+          description: Only dead letters for this task.
+    ReplayDeadLettersResponse:
+      type: object
+      required:
+      - results
+      - replayed
+      properties:
+        replayed:
+          type: integer
+          format: int64
+          description: How many of `results` produced a job.
+          minimum: 0
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReplayedDeadLetter'
+          description: |-
+            Entries that were replayed (`job_id` set) or could not be (`error`
+            set), oldest first. Entries already replayed are not listed.
+    ReplayedDeadLetter:
+      type: object
+      description: One dead letter's outcome in a bulk replay.
+      required:
+      - dead_letter_id
+      properties:
+        dead_letter_id:
+          type: integer
+          format: int64
+        error:
+          type:
+          - string
+          - 'null'
+          description: Why it did not, for example the original job was purged by retention.
+        job_id:
+          type:
+          - string
+          - 'null'
+          description: The fresh job, when the replay succeeded.
     StatsSnapshot:
       type: object
       description: Plain snapshot of [`EngineStats`].
@@ -2122,6 +2513,19 @@ components:
           type: array
           items:
             type: string
+    WhoAmIResponse:
+      type: object
+      description: The caller's identity, as the server resolved it from the bearer token.
+      required:
+      - tenant
+      - access
+      properties:
+        access:
+          type: string
+          description: '`read_write`, or `read_only` for a `:ro` key or a `scope: read` JWT.'
+        tenant:
+          type: string
+          description: The tenant every request with this credential is scoped to.
     Workflow:
       type: object
       description: A workflow instance and its steps.

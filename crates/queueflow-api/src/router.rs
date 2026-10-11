@@ -44,6 +44,7 @@ pub fn build_router(state: ApiState) -> Router {
     let tenant = Router::new()
         .route("/jobs", post(handlers::create_job).get(handlers::list_jobs))
         .route("/jobs/batch", post(handlers::create_batch_jobs))
+        .route("/jobs/cancel", post(handlers::cancel_jobs))
         .route("/jobs/{id}", get(handlers::get_job))
         .route("/jobs/{id}/cancel", post(handlers::cancel_job))
         .route("/jobs/{id}/events", get(handlers::stream_job_events))
@@ -72,11 +73,15 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/cron/{id}/pause", post(handlers::pause_cron))
         .route("/cron/{id}/resume", post(handlers::resume_cron))
         .route("/dlq", get(handlers::list_dead_letters))
+        .route("/dlq/replay", post(handlers::replay_dead_letters))
         .route("/dlq/{id}", get(handlers::get_dead_letter))
         .route("/dlq/{id}/replay", post(handlers::replay_dead_letter))
         .route("/tasks", get(handlers::list_tasks))
         .route("/stats", get(handlers::get_stats))
         .route("/queues", get(handlers::list_queues))
+        .route("/queues/{queue}/pause", post(handlers::pause_queue))
+        .route("/queues/{queue}/resume", post(handlers::resume_queue))
+        .route("/whoami", get(handlers::whoami))
         .route_layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
     // Worker protocol: lease / heartbeat / complete / fail. Workers execute

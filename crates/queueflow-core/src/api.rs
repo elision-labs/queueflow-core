@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use std::time::Duration;
 
 use crate::domain::*;
-use crate::engine::{BatchItem, Engine, EnqueueOptions};
+use crate::engine::{BatchItem, Engine, EnqueueOptions, ReplayOutcome};
 use crate::error::EngineError;
 use crate::ports::{JobStore, ListFilter, Page, StepRecord};
 use crate::stats::{LatencySnapshot, QueueStats, StatsSnapshot};
@@ -43,6 +43,9 @@ pub trait JobApi: Send + Sync {
     async fn await_job_change(&self, id: &str, max_wait: Duration) -> Result<(), EngineError>;
     async fn list_jobs(&self, filter: ListFilter) -> Result<Page<Job>, EngineError>;
     async fn cancel_job(&self, id: &str) -> Result<(), EngineError>;
+    /// Cancel every non-terminal job matching the filter (at most
+    /// `filter.limit`); returns how many were cancelled.
+    async fn cancel_jobs(&self, filter: ListFilter) -> Result<u64, EngineError>;
 
     async fn create_workflow(
         &self,
@@ -61,6 +64,12 @@ pub trait JobApi: Send + Sync {
     async fn list_dead_letters(&self, filter: ListFilter) -> Result<Page<DeadLetter>, EngineError>;
     async fn get_dead_letter(&self, id: i64) -> Result<DeadLetter, EngineError>;
     async fn replay_dead_letter(&self, id: i64) -> Result<String, EngineError>;
+    /// Replay every unreplayed dead letter matching the filter (at most
+    /// `filter.limit`), reporting the outcome of each.
+    async fn replay_dead_letters(
+        &self,
+        filter: ListFilter,
+    ) -> Result<Vec<ReplayOutcome>, EngineError>;
 
     // Cron schedules: recurring enqueues.
     async fn create_cron(
@@ -115,6 +124,10 @@ pub trait JobApi: Send + Sync {
     /// Per-queue backlog (see [`crate::JobStore::queue_stats`]); serves
     /// `/api/v1/queues` and the operator metrics.
     async fn queue_stats(&self, tenant_id: Option<&str>) -> Result<Vec<QueueStats>, EngineError>;
+    /// Pause claims of this tenant's jobs on a queue (idempotent).
+    async fn pause_queue(&self, tenant_id: Option<&str>, queue: &str) -> Result<(), EngineError>;
+    /// Resume claims paused by `pause_queue` (idempotent).
+    async fn resume_queue(&self, tenant_id: Option<&str>, queue: &str) -> Result<(), EngineError>;
 }
 
 #[async_trait]
@@ -170,6 +183,10 @@ where
 
     async fn cancel_job(&self, id: &str) -> Result<(), EngineError> {
         Engine::cancel_job(self, id).await
+    }
+
+    async fn cancel_jobs(&self, filter: ListFilter) -> Result<u64, EngineError> {
+        Engine::cancel_jobs(self, &filter).await
     }
 
     async fn create_workflow(
@@ -236,6 +253,13 @@ where
         Engine::replay_dead_letter(self, id).await
     }
 
+    async fn replay_dead_letters(
+        &self,
+        filter: ListFilter,
+    ) -> Result<Vec<ReplayOutcome>, EngineError> {
+        Engine::replay_dead_letters(self, &filter).await
+    }
+
     async fn lease_jobs(
         &self,
         queue: &str,
@@ -300,5 +324,13 @@ where
 
     async fn queue_stats(&self, tenant_id: Option<&str>) -> Result<Vec<QueueStats>, EngineError> {
         Engine::queue_stats(self, tenant_id).await
+    }
+
+    async fn pause_queue(&self, tenant_id: Option<&str>, queue: &str) -> Result<(), EngineError> {
+        Engine::pause_queue(self, tenant_id, queue).await
+    }
+
+    async fn resume_queue(&self, tenant_id: Option<&str>, queue: &str) -> Result<(), EngineError> {
+        Engine::resume_queue(self, tenant_id, queue).await
     }
 }

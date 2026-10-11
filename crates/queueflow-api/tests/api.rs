@@ -1147,6 +1147,7 @@ async fn read_only_keys_can_read_everything_but_write_nothing() {
         "/api/v1/dlq",
         "/api/v1/cron",
         "/api/v1/tasks",
+        "/api/v1/whoami",
     ] {
         let resp = app
             .clone()
@@ -1180,6 +1181,10 @@ async fn read_only_keys_can_read_everything_but_write_nothing() {
         ),
         ("DELETE", "/api/v1/cron/nope", None),
         ("POST", "/api/v1/dlq/1/replay", None),
+        ("POST", "/api/v1/dlq/replay", Some(json!({}))),
+        ("POST", "/api/v1/jobs/cancel", Some(json!({}))),
+        ("POST", "/api/v1/queues/default/pause", None),
+        ("POST", "/api/v1/queues/default/resume", None),
     ] {
         let resp = app
             .clone()
@@ -1222,4 +1227,328 @@ async fn read_only_keys_can_read_everything_but_write_nothing() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+// ---- Queue control, bulk operations, whoami ------------------------------------
+
+async fn body_json(resp: axum::response::Response) -> Value {
+    serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap_or(Value::Null)
+}
+
+#[tokio::test]
+async fn queue_pause_and_resume_round_trip() {
+    let app = app();
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v1/jobs",
+                Some("dev"),
+                Some(json!({"task_name": "echo", "config": {"queue": "orders"}})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/queues/orders/pause",
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["queue"], "orders");
+    assert_eq!(body["paused"], true);
+    assert_eq!(body["pending"], 2, "{body}");
+    assert_eq!(body["running"], 0);
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/queues", Some("dev"), None))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let orders = body["queues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["queue"] == "orders")
+        .expect("orders listed");
+    assert_eq!(orders["paused"], true, "{body}");
+
+    // Pausing twice is fine; resuming clears the flag.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/queues/orders/pause",
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/queues/orders/resume",
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["paused"], false);
+
+    // A queue name with whitespace is rejected.
+    let resp = app
+        .oneshot(req(
+            "POST",
+            "/api/v1/queues/bad%20name/pause",
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn bulk_cancel_is_tenant_scoped_and_validated() {
+    let clock = Arc::new(SystemClock);
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    let engine = Engine::builder(store, clock)
+        .register("echo", builtin::echo())
+        .build();
+    engine.mark_running();
+    let other = engine
+        .enqueue(
+            "echo",
+            Map::new(),
+            EnqueueOptions {
+                tenant_id: Some("other-tenant".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let app = build_router(ApiState::new(engine.clone()).with_auth(AuthConfig::development()));
+    for task in ["a", "a", "b"] {
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v1/jobs",
+                Some("dev"),
+                Some(json!({"task_name": task})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Terminal status: 400 before anything is touched.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/jobs/cancel",
+            Some("dev"),
+            Some(json!({"status": "completed"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/jobs/cancel",
+            Some("dev"),
+            Some(json!({"task_name": "a"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["cancelled"], 2);
+
+    // Everything left for this tenant, bounded by limit.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/jobs/cancel",
+            Some("dev"),
+            Some(json!({"limit": 10})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["cancelled"], 1);
+
+    // The other tenant's job was never in scope.
+    assert_eq!(
+        engine.get_job(&other).await.unwrap().status,
+        JobStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn bulk_dlq_replay_and_replayed_filter() {
+    let clock = Arc::new(SystemClock);
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    // No handlers at all: every job dead-letters on first delivery.
+    let engine = Engine::builder(store, clock).build();
+    engine.mark_running();
+    let app = build_router(ApiState::new(engine.clone()).with_auth(AuthConfig::development()));
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v1/jobs",
+                Some("dev"),
+                Some(json!({"task_name": "ghost"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(engine.process_once("default").await.unwrap());
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/dlq?replayed=false", Some("dev"), None))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(resp).await["dead_letters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/dlq/replay",
+            Some("dev"),
+            Some(json!({})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["replayed"], 2, "{body}");
+    assert_eq!(body["results"].as_array().unwrap().len(), 2);
+    assert!(body["results"][0]["job_id"].is_string());
+
+    // Nothing left to replay; the replayed filter now shows both.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/dlq/replay",
+            Some("dev"),
+            Some(json!({})),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["replayed"], 0);
+    assert!(body["results"].as_array().unwrap().is_empty());
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/dlq?replayed=true", Some("dev"), None))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(resp).await["dead_letters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let resp = app
+        .oneshot(req("GET", "/api/v1/dlq?replayed=false", Some("dev"), None))
+        .await
+        .unwrap();
+    assert!(body_json(resp).await["dead_letters"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn whoami_reports_tenant_and_access() {
+    use queueflow_api::auth::ApiKey;
+    let clock = Arc::new(SystemClock);
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    let engine = Engine::builder(store, clock).build();
+    let app = build_router(ApiState::new(engine).with_auth(AuthConfig {
+        api_keys: vec![
+            ApiKey::read_only("viewer", "acme"),
+            ApiKey::new("writer", "acme"),
+        ],
+        ..Default::default()
+    }));
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/whoami", Some("viewer"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["tenant"], "acme");
+    assert_eq!(body["access"], "read_only");
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/whoami", Some("writer"), None))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["access"], "read_write");
+    let resp = app
+        .oneshot(req("GET", "/api/v1/whoami", None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn jobs_list_filters_by_task_name() {
+    let app = app();
+    for task in ["a", "b"] {
+        app.clone()
+            .oneshot(req(
+                "POST",
+                "/api/v1/jobs",
+                Some("dev"),
+                Some(json!({"task_name": task})),
+            ))
+            .await
+            .unwrap();
+    }
+    let resp = app
+        .oneshot(req("GET", "/api/v1/jobs?task_name=b", Some("dev"), None))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let jobs = body["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 1, "{body}");
+    assert_eq!(jobs[0]["task_name"], "b");
 }

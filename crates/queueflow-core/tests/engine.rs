@@ -976,3 +976,297 @@ async fn cron_schedules_fire_on_time_dedupe_and_skip_missed_runs() {
     h.engine.delete_cron(&cron_id).await.unwrap();
     assert!(h.engine.get_cron(&cron_id).await.is_err());
 }
+
+// ---- Queue registry and pause ---------------------------------------------------
+
+fn tenant_opts(tenant: &str, queue: &str) -> EnqueueOptions {
+    EnqueueOptions {
+        tenant_id: Some(tenant.into()),
+        queue: Some(queue.into()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn paused_queue_is_skipped_until_resumed() {
+    let h = harness(|b| b.register("echo", builtin::echo()));
+    for _ in 0..2 {
+        h.engine
+            .enqueue("echo", Map::new(), tenant_opts("acme", "orders"))
+            .await
+            .unwrap();
+    }
+    h.engine.pause_queue(Some("acme"), "orders").await.unwrap();
+
+    // Nothing is claimable while paused; the backlog is still reported.
+    assert!(!h.engine.process_once("orders").await.unwrap());
+    let stats = h.engine.queue_stats(Some("acme")).await.unwrap();
+    let orders = stats.iter().find(|q| q.queue == "orders").unwrap();
+    assert!(orders.paused);
+    assert_eq!(orders.pending, 2);
+
+    h.engine.resume_queue(Some("acme"), "orders").await.unwrap();
+    assert!(h.engine.process_once("orders").await.unwrap());
+    assert!(h.engine.process_once("orders").await.unwrap());
+    let stats = h.engine.queue_stats(Some("acme")).await.unwrap();
+    let orders = stats.iter().find(|q| q.queue == "orders").unwrap();
+    assert!(!orders.paused);
+    assert_eq!(orders.pending, 0);
+}
+
+#[tokio::test]
+async fn pause_is_scoped_to_one_tenant() {
+    let h = harness(|b| b.register("echo", builtin::echo()));
+    let acme = h
+        .engine
+        .enqueue("echo", Map::new(), tenant_opts("acme", "orders"))
+        .await
+        .unwrap();
+    let globex = h
+        .engine
+        .enqueue("echo", Map::new(), tenant_opts("globex", "orders"))
+        .await
+        .unwrap();
+    let nobody = h
+        .engine
+        .enqueue(
+            "echo",
+            Map::new(),
+            EnqueueOptions {
+                queue: Some("orders".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    h.engine.pause_queue(Some("acme"), "orders").await.unwrap();
+
+    // The other tenant's job and the untenanted job still run; acme's waits.
+    assert!(h.engine.process_once("orders").await.unwrap());
+    assert!(h.engine.process_once("orders").await.unwrap());
+    assert!(!h.engine.process_once("orders").await.unwrap());
+    assert_eq!(
+        h.engine.get_job(&globex).await.unwrap().status,
+        JobStatus::Completed
+    );
+    assert_eq!(
+        h.engine.get_job(&nobody).await.unwrap().status,
+        JobStatus::Completed
+    );
+    assert_eq!(
+        h.engine.get_job(&acme).await.unwrap().status,
+        JobStatus::Pending
+    );
+
+    // The all-tenants view only reports paused when every tenant is.
+    let all = h.engine.queue_stats(None).await.unwrap();
+    assert!(!all.iter().find(|q| q.queue == "orders").unwrap().paused);
+    let acme_view = h.engine.queue_stats(Some("acme")).await.unwrap();
+    assert!(
+        acme_view
+            .iter()
+            .find(|q| q.queue == "orders")
+            .unwrap()
+            .paused
+    );
+    let globex_view = h.engine.queue_stats(Some("globex")).await.unwrap();
+    assert!(
+        !globex_view
+            .iter()
+            .find(|q| q.queue == "orders")
+            .unwrap()
+            .paused
+    );
+}
+
+#[tokio::test]
+async fn registry_lists_queues_that_are_currently_empty() {
+    let h = harness(|b| b.register("echo", builtin::echo()));
+    h.engine
+        .enqueue("echo", Map::new(), tenant_opts("acme", "emails"))
+        .await
+        .unwrap();
+    h.engine
+        .enqueue_batch(
+            vec![BatchItem {
+                task_name: "echo".into(),
+                payload: Map::new(),
+                config: None,
+                queue: Some("reports".into()),
+                run_at: None,
+            }],
+            Some("acme".into()),
+        )
+        .await
+        .unwrap();
+    assert!(h.engine.process_once("emails").await.unwrap());
+    assert!(h.engine.process_once("reports").await.unwrap());
+
+    // Both queues are drained, yet both are listed, with zero counts.
+    let stats = h.engine.queue_stats(Some("acme")).await.unwrap();
+    let names: Vec<&str> = stats.iter().map(|q| q.queue.as_str()).collect();
+    assert_eq!(names, vec!["emails", "reports"]);
+    assert!(stats
+        .iter()
+        .all(|q| q.pending + q.running + q.scheduled == 0));
+    assert!(stats.iter().all(|q| !q.paused));
+    // Another tenant sees nothing: registration is per tenant.
+    assert!(h
+        .engine
+        .queue_stats(Some("globex"))
+        .await
+        .unwrap()
+        .is_empty());
+    // Registration is cached: a second enqueue does not need the store, and
+    // the registry still holds exactly one row per pair.
+    h.engine
+        .enqueue("echo", Map::new(), tenant_opts("acme", "emails"))
+        .await
+        .unwrap();
+    let rows = h.store.list_registered_queues(Some("acme")).await.unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+}
+
+#[tokio::test]
+async fn invalid_queue_names_are_rejected_by_pause() {
+    let h = harness(|b| b);
+    for bad in [
+        "",
+        "has space",
+        "tab\tbed",
+        &"x".repeat(MAX_QUEUE_NAME_LEN + 1),
+    ] {
+        let err = h.engine.pause_queue(Some("acme"), bad).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::Validation(_)),
+            "{bad:?}: {err:?}"
+        );
+    }
+    assert!(h
+        .engine
+        .pause_queue(Some("acme"), "ok-queue.v2")
+        .await
+        .is_ok());
+}
+
+// ---- Bulk operations --------------------------------------------------------
+
+#[tokio::test]
+async fn bulk_cancel_honours_filter_and_limit() {
+    let h = harness(|b| b.register("echo", builtin::echo()));
+    for _ in 0..5 {
+        h.engine
+            .enqueue("a", Map::new(), tenant_opts("acme", "orders"))
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        h.engine
+            .enqueue("b", Map::new(), tenant_opts("acme", "orders"))
+            .await
+            .unwrap();
+    }
+    h.engine
+        .enqueue("a", Map::new(), tenant_opts("globex", "orders"))
+        .await
+        .unwrap();
+
+    let filter = |task: &str, limit: i64| ListFilter {
+        tenant_id: Some("acme".into()),
+        task_name: Some(task.into()),
+        limit,
+        ..Default::default()
+    };
+    assert_eq!(h.engine.cancel_jobs(&filter("a", 3)).await.unwrap(), 3);
+    assert_eq!(h.engine.cancel_jobs(&filter("a", 3)).await.unwrap(), 2);
+    assert_eq!(h.engine.cancel_jobs(&filter("a", 3)).await.unwrap(), 0);
+    // Task b and the other tenant are untouched.
+    let remaining = h
+        .engine
+        .list_jobs(&ListFilter {
+            status: Some("pending".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .items;
+    assert_eq!(remaining.len(), 3, "{remaining:?}");
+    assert!(remaining
+        .iter()
+        .all(|j| j.task_name == "b" || j.tenant_id.as_deref() == Some("globex")));
+
+    // Terminal and unknown statuses are rejected: history is never rewritten.
+    for bad in ["completed", "failed", "cancelled", "bogus"] {
+        let err = h
+            .engine
+            .cancel_jobs(&ListFilter {
+                status: Some(bad.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Validation(_)), "{bad}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn bulk_replay_replays_each_dead_letter_once() {
+    // No handler for "ghost": every delivery dead-letters.
+    let h = harness(|b| b);
+    for _ in 0..3 {
+        h.engine
+            .enqueue("ghost", Map::new(), tenant_opts("acme", "default"))
+            .await
+            .unwrap();
+    }
+    for _ in 0..3 {
+        assert!(h.engine.process_once("default").await.unwrap());
+    }
+    let filter = ListFilter {
+        tenant_id: Some("acme".into()),
+        limit: 2,
+        ..Default::default()
+    };
+    let first = h.engine.replay_dead_letters(&filter).await.unwrap();
+    assert_eq!(first.len(), 2);
+    assert!(first
+        .iter()
+        .all(|o| o.job_id.is_some() && o.error.is_none()));
+    let second = h.engine.replay_dead_letters(&filter).await.unwrap();
+    assert_eq!(second.len(), 1, "{second:?}");
+    let third = h.engine.replay_dead_letters(&filter).await.unwrap();
+    assert!(third.is_empty(), "{third:?}");
+    // Three fresh pending jobs now exist alongside the three failed ones.
+    let pending = h
+        .engine
+        .list_jobs(&ListFilter {
+            status: Some("pending".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(pending.items.len(), 3);
+}
+
+#[tokio::test]
+async fn jobs_can_be_listed_by_task_name() {
+    let h = harness(|b| b);
+    h.engine
+        .enqueue("a", Map::new(), Default::default())
+        .await
+        .unwrap();
+    h.engine
+        .enqueue("b", Map::new(), Default::default())
+        .await
+        .unwrap();
+    let page = h
+        .engine
+        .list_jobs(&ListFilter {
+            task_name: Some("b".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].task_name, "b");
+}

@@ -4,9 +4,9 @@
 pub mod janitor;
 pub mod retry;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
@@ -23,6 +23,36 @@ use crate::task::{handler_fn, TaskHandler};
 use crate::workflow::scheduler::WorkflowScheduler;
 
 pub use janitor::JanitorConfig;
+
+/// Longest accepted queue name. Names are free-form (they are plain column
+/// values), bounded only so a stray payload cannot register unbounded junk.
+pub const MAX_QUEUE_NAME_LEN: usize = 128;
+
+/// A queue name must be non-empty, at most [`MAX_QUEUE_NAME_LEN`] bytes, and
+/// free of whitespace and control characters.
+pub fn validate_queue_name(name: &str) -> Result<(), EngineError> {
+    if name.is_empty() || name.len() > MAX_QUEUE_NAME_LEN {
+        return Err(EngineError::Validation(format!(
+            "queue name must be 1..={MAX_QUEUE_NAME_LEN} bytes"
+        )));
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(EngineError::Validation(
+            "queue name must not contain whitespace or control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// What happened to one dead letter in [`Engine::replay_dead_letters`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayOutcome {
+    pub dead_letter_id: i64,
+    /// The fresh job, when the replay succeeded.
+    pub job_id: Option<String>,
+    /// Why it did not (for example the original job row was purged).
+    pub error: Option<String>,
+}
 
 /// Options for [`Engine::enqueue`].
 #[derive(Clone, Debug, Default)]
@@ -50,6 +80,37 @@ pub struct BatchItem {
     /// Don't run before this instant (durable scheduling, like
     /// [`EnqueueOptions::run_at`]).
     pub run_at: Option<DateTime<Utc>>,
+}
+
+/// Process-local memory of which (tenant, queue) pairs this engine has
+/// already registered in the store's queue registry, so registration costs
+/// one write per pair per process rather than one per enqueue.
+#[derive(Default)]
+pub(crate) struct KnownQueues {
+    seen: Mutex<HashSet<(String, String)>>,
+}
+
+impl KnownQueues {
+    /// Register `(tenant, queue)` unless this process already did. The
+    /// registry is advisory, so a store failure is logged and the pair stays
+    /// unregistered (the next enqueue retries); it never fails the enqueue.
+    pub(crate) async fn ensure<JS: JobStore + ?Sized>(
+        &self,
+        store: &JS,
+        tenant_id: Option<&str>,
+        queue: &str,
+    ) {
+        let key = (tenant_id.unwrap_or("").to_string(), queue.to_string());
+        if self.seen.lock().unwrap().contains(&key) {
+            return;
+        }
+        match store.register_queue(tenant_id, queue).await {
+            Ok(()) => {
+                self.seen.lock().unwrap().insert(key);
+            }
+            Err(e) => tracing::warn!(queue, error = %e, "queue registration failed; will retry"),
+        }
+    }
 }
 
 /// Best-effort text from a caught panic payload (for logs and job errors).
@@ -83,6 +144,7 @@ pub struct Engine<JS> {
     poll_secs: u64,
     janitor: JanitorConfig,
     stats: Arc<EngineStats>,
+    known_queues: Arc<KnownQueues>,
     shutdown: CancellationToken,
     running: AtomicBool,
 }
@@ -154,11 +216,13 @@ where
 
     pub fn build(self) -> Arc<Engine<JS>> {
         let stats = Arc::new(EngineStats::default());
+        let known_queues = Arc::new(KnownQueues::default());
         let scheduler = WorkflowScheduler::new(
             self.store.clone(),
             self.clock.clone(),
             self.default_queue.clone(),
             stats.clone(),
+            known_queues.clone(),
         );
         Arc::new(Engine {
             store: self.store,
@@ -171,6 +235,7 @@ where
             poll_secs: self.poll_secs,
             janitor: self.janitor,
             stats,
+            known_queues,
             shutdown: CancellationToken::new(),
             running: AtomicBool::new(false),
         })
@@ -198,13 +263,95 @@ where
         self.stats.clone()
     }
 
-    /// Per-queue backlog as of now (`None` = all tenants). See
-    /// [`JobStore::queue_stats`].
+    /// Per-queue backlog as of now (`None` = all tenants), merged with the
+    /// queue registry: a registered queue with no live jobs is listed with
+    /// zero counts, and each entry carries its `paused` flag. See
+    /// [`JobStore::queue_stats`] and [`JobStore::list_registered_queues`].
     pub async fn queue_stats(
         &self,
         tenant_id: Option<&str>,
     ) -> Result<Vec<crate::stats::QueueStats>, EngineError> {
-        Ok(self.store.queue_stats(tenant_id, self.clock.now()).await?)
+        let mut stats = self.store.queue_stats(tenant_id, self.clock.now()).await?;
+        let registered = self.store.list_registered_queues(tenant_id).await?;
+        // paused per queue name: for one tenant that is its own row; across
+        // tenants, only when every registered tenant of the queue is paused.
+        let mut paused: HashMap<&str, (usize, usize)> = HashMap::new();
+        for r in &registered {
+            let e = paused.entry(r.name.as_str()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += usize::from(r.paused);
+        }
+        for s in &mut stats {
+            if let Some((rows, paused_rows)) = paused.get(s.queue.as_str()) {
+                s.paused = paused_rows == rows;
+            }
+        }
+        for r in &registered {
+            if !stats.iter().any(|s| s.queue == r.name) {
+                let (rows, paused_rows) = paused[r.name.as_str()];
+                stats.push(crate::stats::QueueStats {
+                    queue: r.name.clone(),
+                    paused: paused_rows == rows,
+                    ..Default::default()
+                });
+            }
+        }
+        stats.sort_by(|a, b| a.queue.cmp(&b.queue));
+        Ok(stats)
+    }
+
+    /// Pause claims of `tenant_id`'s jobs on `queue`. Pending jobs stay
+    /// pending and stop being claimed; running jobs finish normally. To drain
+    /// a queue, pause it and wait for its `running` count to reach zero.
+    /// Idempotent.
+    pub async fn pause_queue(
+        &self,
+        tenant_id: Option<&str>,
+        queue: &str,
+    ) -> Result<(), EngineError> {
+        validate_queue_name(queue)?;
+        self.store
+            .set_queue_paused(tenant_id, queue, true, self.clock.now())
+            .await?;
+        Ok(())
+    }
+
+    /// Resume claims paused by [`Engine::pause_queue`] and wake parked
+    /// workers. Idempotent.
+    pub async fn resume_queue(
+        &self,
+        tenant_id: Option<&str>,
+        queue: &str,
+    ) -> Result<(), EngineError> {
+        validate_queue_name(queue)?;
+        self.store
+            .set_queue_paused(tenant_id, queue, false, self.clock.now())
+            .await?;
+        Ok(())
+    }
+
+    /// Cancel every non-terminal job matching `filter` (tenant, queue, task
+    /// name, a non-terminal status, creation window), at most `filter.limit`
+    /// of them. Returns how many were cancelled. See
+    /// [`JobStore::cancel_jobs_matching`].
+    pub async fn cancel_jobs(&self, filter: &ListFilter) -> Result<u64, EngineError> {
+        if let Some(s) = &filter.status {
+            let terminal = matches!(s.as_str(), "completed" | "failed" | "cancelled");
+            let known = matches!(
+                s.as_str(),
+                "pending" | "retrying" | "running" | "completed" | "failed" | "cancelled"
+            );
+            if terminal || !known {
+                return Err(EngineError::Validation(format!(
+                    "status must be one of pending, retrying, running (got '{s}')"
+                )));
+            }
+        }
+        let n = self
+            .store
+            .cancel_jobs_matching(filter, "cancelled by user")
+            .await?;
+        Ok(n)
     }
 
     /// Durable, tenant-scoped counts read from the store (`None` = all
@@ -243,6 +390,9 @@ where
             cfg.validate().map_err(EngineError::Validation)?;
         }
         let queue = opts.queue.unwrap_or_else(|| self.default_queue.clone());
+        self.known_queues
+            .ensure(&*self.store, opts.tenant_id.as_deref(), &queue)
+            .await;
         let now = self.clock.now();
         let job = Job {
             id: Uuid::new_v4().to_string(),
@@ -324,6 +474,14 @@ where
             })
             .collect();
 
+        let mut queues: Vec<&str> = jobs.iter().map(|j| j.queue_name.as_str()).collect();
+        queues.sort_unstable();
+        queues.dedup();
+        for q in queues {
+            self.known_queues
+                .ensure(&*self.store, tenant_id.as_deref(), q)
+                .await;
+        }
         let ids = self.store.batch_create_jobs(&jobs).await?;
         EngineStats::add(&self.stats.jobs_created, jobs.len() as u64);
         Ok(ids)
@@ -617,6 +775,9 @@ where
             idempotency_key: None,
         };
 
+        self.known_queues
+            .ensure(&*self.store, job.tenant_id.as_deref(), &job.queue_name)
+            .await;
         if !self.store.replay_dead_letter(id, &job).await? {
             return Err(EngineError::Conflict(format!(
                 "dead letter {id} was already replayed"
@@ -624,6 +785,41 @@ where
         }
         EngineStats::incr(&self.stats.jobs_created);
         Ok(job.id)
+    }
+
+    /// Replay several dead letters: every unreplayed entry matching `filter`
+    /// (tenant, queue, task name, creation window; at most `filter.limit`),
+    /// each as [`Engine::replay_dead_letter`] would. Entries already replayed
+    /// or whose original job was purged are reported, not fatal. Returns the
+    /// outcome per dead letter, in listing order.
+    pub async fn replay_dead_letters(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<Vec<ReplayOutcome>, EngineError> {
+        let mut page_filter = filter.clone();
+        page_filter.offset = 0;
+        page_filter.after = None;
+        page_filter.include_total = false;
+        // Unreplayed entries only, so replayed ones never fill the page.
+        page_filter.replayed = Some(false);
+        let page = self.store.list_dead_letters(&page_filter).await?;
+        let mut out = Vec::with_capacity(page.items.len());
+        for dl in page.items {
+            let outcome = match self.replay_dead_letter(dl.id).await {
+                Ok(job_id) => ReplayOutcome {
+                    dead_letter_id: dl.id,
+                    job_id: Some(job_id),
+                    error: None,
+                },
+                Err(e) => ReplayOutcome {
+                    dead_letter_id: dl.id,
+                    job_id: None,
+                    error: Some(e.to_string()),
+                },
+            };
+            out.push(outcome);
+        }
+        Ok(out)
     }
 
     pub async fn ping(&self) -> Result<(), EngineError> {

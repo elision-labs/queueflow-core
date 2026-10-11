@@ -119,14 +119,21 @@ fn job_columns_prefixed(alias: &str) -> String {
 /// makes concurrent claimers disjoint without blocking; the CTE-then-UPDATE
 /// shape is the standard Postgres claim pattern. `$4` (cover_timeout)
 /// stretches the lease to the job's configured timeout plus `grace`, so local
-/// workers need no separate extension round trip.
+/// workers need no separate extension round trip. The NOT EXISTS skips jobs
+/// whose (tenant, queue) is paused in the registry: a primary-key probe on a
+/// tiny table per candidate row.
 fn claim_sql(grace: u64) -> String {
     format!(
         "WITH c AS (\
-             SELECT id FROM queueflow.jobs \
-             WHERE queue_name = $1 AND status IN ('pending','retrying') \
-               AND scheduled_at <= now() \
-             ORDER BY priority DESC, scheduled_at, created_at \
+             SELECT j0.id FROM queueflow.jobs j0 \
+             WHERE j0.queue_name = $1 AND j0.status IN ('pending','retrying') \
+               AND j0.scheduled_at <= now() \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM queueflow.queues q \
+                   WHERE q.name = $1 AND q.paused \
+                     AND q.tenant_id = COALESCE(j0.tenant_id, '')\
+               ) \
+             ORDER BY j0.priority DESC, j0.scheduled_at, j0.created_at \
              FOR UPDATE SKIP LOCKED \
              LIMIT $2\
          ) \
@@ -543,6 +550,110 @@ impl JobStore for PostgresJobStore {
         Ok(affected > 0)
     }
 
+    async fn cancel_jobs_matching(
+        &self,
+        filter: &ListFilter,
+        reason: &str,
+    ) -> Result<u64, StorageError> {
+        // One statement: the same guarded transition as the single cancel,
+        // over the filtered set. SKIP LOCKED leaves rows a worker is claiming
+        // at this instant alone rather than queueing behind the claim; they
+        // are running by the time the caller looks, and cancellable then.
+        let mut qb: QueryBuilder<Postgres> =
+            QueryBuilder::new("UPDATE queueflow.jobs SET status = 'cancelled', error_message = ");
+        qb.push_bind(reason.to_string());
+        qb.push(
+            ", completed_at = now(), locked_until = NULL, lease_token = NULL \
+             WHERE id IN (SELECT id FROM queueflow.jobs \
+             WHERE status IN ('pending','retrying','running')",
+        );
+        push_job_filters(&mut qb, filter);
+        let limit = if filter.limit <= 0 { 50 } else { filter.limit };
+        qb.push(" LIMIT ").push_bind(limit);
+        qb.push(" FOR UPDATE SKIP LOCKED)");
+        let affected = qb
+            .build()
+            .execute(&self.pool)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        Ok(affected)
+    }
+
+    async fn register_queue(
+        &self,
+        tenant_id: Option<&str>,
+        name: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO queueflow.queues (tenant_id, name) VALUES (COALESCE($1, ''), $2) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(tenant_id)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    async fn set_queue_paused(
+        &self,
+        tenant_id: Option<&str>,
+        name: &str,
+        paused: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO queueflow.queues (tenant_id, name, paused, paused_at) \
+             VALUES (COALESCE($1, ''), $2, $3, CASE WHEN $3 THEN $4 END) \
+             ON CONFLICT (tenant_id, name) DO UPDATE \
+             SET paused = EXCLUDED.paused, paused_at = EXCLUDED.paused_at",
+        )
+        .bind(tenant_id)
+        .bind(name)
+        .bind(paused)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        if !paused {
+            // Workers parked on this queue saw nothing claimable while it was
+            // paused; the same channel the insert trigger uses wakes them.
+            sqlx::query("SELECT pg_notify('queueflow_work', $1)")
+                .bind(name)
+                .execute(&self.pool)
+                .await
+                .map_err(db)?;
+        }
+        Ok(())
+    }
+
+    async fn list_registered_queues(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<RegisteredQueue>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT tenant_id, name, paused FROM queueflow.queues \
+             WHERE ($1::text IS NULL OR tenant_id = $1) \
+             ORDER BY name, tenant_id",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|r| {
+                let tenant: String = r.try_get("tenant_id").map_err(db)?;
+                Ok(RegisteredQueue {
+                    tenant_id: (!tenant.is_empty()).then_some(tenant),
+                    name: r.try_get("name").map_err(db)?,
+                    paused: r.try_get("paused").map_err(db)?,
+                })
+            })
+            .collect()
+    }
+
     async fn mark_retrying(
         &self,
         id: &str,
@@ -631,6 +742,7 @@ impl JobStore for PostgresJobStore {
                     scheduled: n("scheduled")?,
                     running: n("running")?,
                     oldest_pending_age_secs: oldest.map(|o| (now - o).num_seconds().max(0) as u64),
+                    paused: false,
                 })
             })
             .collect()
@@ -1497,6 +1609,18 @@ fn push_dlq_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
     if let Some(q) = &filter.queue {
         qb.push(" AND queue_name = ").push_bind(q.clone());
     }
+    if let Some(t) = &filter.task_name {
+        qb.push(" AND task_name = ").push_bind(t.clone());
+    }
+    match filter.replayed {
+        Some(true) => {
+            qb.push(" AND replayed_at IS NOT NULL");
+        }
+        Some(false) => {
+            qb.push(" AND replayed_at IS NULL");
+        }
+        None => {}
+    }
 }
 
 fn push_job_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
@@ -1509,6 +1633,9 @@ fn push_job_filters(qb: &mut QueryBuilder<Postgres>, filter: &ListFilter) {
     }
     if let Some(q) = &filter.queue {
         qb.push(" AND queue_name = ").push_bind(q.clone());
+    }
+    if let Some(t) = &filter.task_name {
+        qb.push(" AND task_name = ").push_bind(t.clone());
     }
 }
 
