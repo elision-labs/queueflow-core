@@ -10,6 +10,8 @@ versions may contain breaking changes, which are called out explicitly.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-11
+
 ### Added
 
 - **Queue registry and per-tenant pause.** The engine records every
