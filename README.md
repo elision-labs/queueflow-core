@@ -127,7 +127,8 @@ cargo run -p queueflow -- serve --dev --mode all --workers 10 --api-port 8000
 ```
 
 The server applies migrations on startup, exposes the REST API on `:8000`, Prometheus metrics on `:9090`,
-and interactive docs at <http://localhost:8000/docs>.
+interactive docs at <http://localhost:8000/docs>, and the [dashboard](#dashboard) at
+<http://localhost:8000/ui/>.
 
 `--dev` runs without credentials for local development (any non-empty bearer token is tenant
 `tenant1`). Without it the server **refuses to start** until you configure tenant credentials
@@ -239,6 +240,31 @@ curl -s http://localhost:9090/metrics
 | `POST /api/v1/dlq/{id}/replay` | Replay a dead letter as a fresh job (once per entry) |
 | `GET /api/v1/tasks` · `/stats` | Registered handlers · engine counters (process-local) |
 | `GET /health` · `/ready` · `/docs` · `/openapi.json` | Probes · Swagger UI · spec |
+| `GET /ui/` | Read-only web dashboard (see [Dashboard](#dashboard)) |
+
+### Dashboard
+
+The server ships a read-only dashboard at `http://<host>:8000/ui/` (the same port as the API).
+It shows, for one tenant:
+
+- **Overview**: live per-queue backlog (pending, scheduled, running, age of the oldest claimable
+  job) refreshed every 5 seconds, plus the durable totals from `/api/v1/stats`.
+- **Jobs**: filter by status, queue, and creation time; page with the API's keyset cursor; a job
+  page with timeline, config, payload, result, and error, following a running job live over the
+  `/events` SSE stream (falling back to polling).
+- **Workflows**: list by status; a workflow page with the dependency graph, each step coloured by
+  its live state from `/steps`, the step table, and the shared context.
+- **Dead letters**, **Cron** schedules, and the registered **Tasks**.
+
+The dashboard asks for a **tenant token** (an API key or JWT, or any non-empty value under
+`--dev`), keeps it in the tab's session storage, and sends it on every `/api/v1` request. The
+worker token (`--worker-token`) authenticates only the worker protocol and will not open the
+dashboard. The static files under `/ui/` are embedded in the binary and need no credentials; they
+contain no data. The dashboard performs no actions (no cancel, replay, pause, or create).
+
+One external dependency: the workflow graph is drawn with [Mermaid](https://mermaid.js.org),
+loaded from `cdn.jsdelivr.net` only when a workflow page is opened. On an air-gapped network the
+page still works and shows the Mermaid source text in place of the drawing.
 
 ### Remote workers (any language)
 
@@ -396,7 +422,8 @@ Contributions welcome — these are the planned next steps, roughly in priority 
 - [x] **Publish** — crates.io, GHCR image, and GitHub release binaries ship from the tag pipeline
       (see [`PUBLISHING.md`](./PUBLISHING.md)).
 - [ ] **Helm chart** and one-click deploy templates.
-- [ ] **Web dashboard** — queues, jobs, workflow DAGs, DLQ, and cron in a browser.
+- [x] **Web dashboard**: read-only queues, jobs, workflow DAGs, DLQ, cron, and tasks at `/ui/`.
+      Next: actions (cancel, replay, pause/resume) behind a confirmation.
 
 ## Contributing
 

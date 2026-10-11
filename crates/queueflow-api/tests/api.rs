@@ -380,6 +380,61 @@ async fn openapi_json_is_served() {
 }
 
 #[tokio::test]
+async fn ui_redirects_to_trailing_slash() {
+    let resp = app().oneshot(req("GET", "/ui", None, None)).await.unwrap();
+    assert!(resp.status().is_redirection(), "got {}", resp.status());
+    assert_eq!(resp.headers()["location"].to_str().unwrap(), "/ui/");
+}
+
+#[tokio::test]
+async fn ui_index_is_public_html() {
+    // No Authorization header: the static shell carries no data.
+    let resp = app().oneshot(req("GET", "/ui/", None, None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(ct.starts_with("text/html"), "content-type: {ct}");
+    assert_eq!(
+        resp.headers()["cache-control"].to_str().unwrap(),
+        "no-cache"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("QueueFlow"), "got: {text}");
+}
+
+#[tokio::test]
+async fn ui_modules_are_served_as_javascript() {
+    for path in ["/ui/app.js", "/ui/api.js", "/ui/fmt.js"] {
+        let resp = app().oneshot(req("GET", path, None, None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let ct = resp.headers()["content-type"].to_str().unwrap().to_string();
+        assert!(
+            ct.starts_with("text/javascript"),
+            "{path} content-type: {ct}"
+        );
+    }
+    let resp = app()
+        .oneshot(req("GET", "/ui/app.css", None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(ct.starts_with("text/css"), "content-type: {ct}");
+}
+
+#[tokio::test]
+async fn ui_routes_are_not_in_the_openapi_document() {
+    let resp = app()
+        .oneshot(req("GET", "/openapi.json", None, None))
+        .await
+        .unwrap();
+    let spec = json_body(resp).await;
+    let paths = spec["paths"].as_object().unwrap();
+    let ui: Vec<&String> = paths.keys().filter(|p| p.starts_with("/ui")).collect();
+    assert!(ui.is_empty(), "unexpected UI paths in the spec: {ui:?}");
+}
+
+#[tokio::test]
 async fn worker_endpoints_require_the_worker_token_when_configured() {
     let app = app_with_worker_token("wt-secret");
 

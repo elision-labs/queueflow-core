@@ -10,6 +10,16 @@ versions may contain breaking changes, which are called out explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- A read-only web dashboard served by the API at `/ui/` (embedded in the
+  binary, no build step): per-queue backlog with auto-refresh, jobs with
+  filters, keyset paging and live SSE updates, workflows with the dependency
+  graph coloured by step state, dead letters, cron schedules, and registered
+  tasks. It authenticates with a tenant token kept in session storage. The
+  graph is drawn with Mermaid loaded from `cdn.jsdelivr.net` on demand, with
+  the Mermaid source shown when the CDN is unreachable.
+
 ## [0.2.0] - 2026-10-09
 
 ### Breaking
