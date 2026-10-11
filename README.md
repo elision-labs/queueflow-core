@@ -141,6 +141,7 @@ cargo run -p queueflow -- serve --mode all \
 
 ### With Docker
 
+For Compose, Kubernetes (Helm), Fly.io, Render, Railway, and Homebrew, see [`deploy/`](./deploy/README.md).
 ```bash
 docker run -p 8000:8000 -p 9090:9090 \
   -e DATABASE_URL=postgres://… \
@@ -404,7 +405,8 @@ Contributions welcome — these are the planned next steps, roughly in priority 
 - [ ] **Per-tenant rate limiting & quotas.**
 - [x] **Publish** — crates.io, GHCR image, and GitHub release binaries ship from the tag pipeline
       (see [`PUBLISHING.md`](./PUBLISHING.md)).
-- [ ] **Helm chart** and one-click deploy templates.
+- [x] **Deploy surface** — `docker-compose.yml`, a Helm chart, Fly.io / Render / Railway configs, a
+      Homebrew formula, and a Grafana dashboard under [`deploy/`](./deploy/README.md).
 - [ ] **Web dashboard** — queues, jobs, workflow DAGs, DLQ, and cron in a browser.
 
 ## Contributing

@@ -80,6 +80,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Grafana dashboard JSON parses
+        run: jq -e '.panels | length > 0' deploy/grafana/queueflow-overview.json
       - name: ruby -c
         run: ruby -c deploy/homebrew/queueflow.rb
       - name: update script parses

@@ -43,3 +43,9 @@ checklist) lives in the docs: <https://docs.queueflow.dev/deployment>.
 runs on changes to these files: `helm lint` + `helm template` for both chart
 topologies, `docker compose config` with placeholder credentials, YAML
 validation of `render.yaml`, and `ruby -c` on the Homebrew formula.
+
+## Grafana
+
+[`grafana/`](./grafana/) holds an importable overview dashboard for the
+Prometheus metrics (per-queue backlog gauges, outcome rates, handler and
+queue-wait latency percentiles) and suggested alert expressions.
