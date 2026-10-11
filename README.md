@@ -338,6 +338,7 @@ queueflow stats
 | `--api-port` | `QUEUEFLOW_API_PORT` | `8000` | REST API port |
 | `--workers` | `QUEUEFLOW_WORKERS` | `10` | Workers per queue |
 | `--queues` | `QUEUEFLOW_QUEUES` | default queue | Comma-separated queues the in-process workers drain; each gets `--workers` workers |
+| `--claim-batch` | `QUEUEFLOW_CLAIM_BATCH` | `0` (= `--workers`) | Most jobs one claim query takes for the in-process pool; lower it to spread a backlog across servers |
 | `--metrics-port` | `QUEUEFLOW_METRICS_PORT` | `9090` | Prometheus port |
 | `--default-queue` | `QUEUEFLOW_DEFAULT_QUEUE` | `default` | Default queue name |
 | `--worker-token` | `QUEUEFLOW_WORKER_TOKEN` | unset | Credential required by the worker-protocol endpoints (lease/heartbeat/complete/fail). Required in `api`/`all` mode unless `--dev` |

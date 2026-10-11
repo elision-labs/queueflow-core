@@ -36,6 +36,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let engine = Engine::builder(store, Arc::new(SystemClock))
         .default_queue(args.default_queue.clone())
         .worker_count(args.workers)
+        .claim_batch(args.claim_batch)
         .lease_secs(args.lease_secs)
         .worker_poll_secs(args.worker_poll_secs)
         .janitor(JanitorConfig {

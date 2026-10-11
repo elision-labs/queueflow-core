@@ -1270,3 +1270,102 @@ async fn jobs_can_be_listed_by_task_name() {
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].task_name, "b");
 }
+
+// ---- Worker pool ----------------------------------------------------------------
+
+#[tokio::test]
+async fn worker_pool_drains_a_backlog_concurrently_and_stops_cleanly() {
+    let peak = Arc::new(AtomicU32::new(0));
+    let active = Arc::new(AtomicU32::new(0));
+    let (p, a) = (peak.clone(), active.clone());
+    let h = harness(move |b| {
+        b.worker_count(4).register_fn("slow", move |_p| {
+            let (p, a) = (p.clone(), a.clone());
+            async move {
+                let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+                p.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                a.fetch_sub(1, Ordering::SeqCst);
+                Ok(Map::new())
+            }
+        })
+    });
+    let mut ids = Vec::new();
+    for _ in 0..12 {
+        ids.push(
+            h.engine
+                .enqueue("slow", Map::new(), Default::default())
+                .await
+                .unwrap(),
+        );
+    }
+    let mut pool = h.engine.run_workers("default");
+    let all_done = async {
+        loop {
+            let mut done = 0;
+            for id in &ids {
+                if h.engine.get_job(id).await.unwrap().status == JobStatus::Completed {
+                    done += 1;
+                }
+            }
+            if done == ids.len() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), all_done)
+        .await
+        .expect("backlog drained");
+    assert!(
+        peak.load(Ordering::SeqCst) > 1 && peak.load(Ordering::SeqCst) <= 4,
+        "peak concurrency {} should be bounded by the pool size",
+        peak.load(Ordering::SeqCst)
+    );
+
+    h.engine.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while pool.join_next().await.is_some() {}
+    })
+    .await
+    .expect("pool stops after shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_in_flight_jobs() {
+    let finished = Arc::new(AtomicU32::new(0));
+    let f = finished.clone();
+    let h = harness(move |b| {
+        b.worker_count(2).register_fn("slow", move |_p| {
+            let f = f.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                f.fetch_add(1, Ordering::SeqCst);
+                Ok(Map::new())
+            }
+        })
+    });
+    let id = h
+        .engine
+        .enqueue("slow", Map::new(), Default::default())
+        .await
+        .unwrap();
+    let mut pool = h.engine.run_workers("default");
+    // Let the dispatcher claim it, then stop while the handler is running.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        h.engine.get_job(&id).await.unwrap().status,
+        JobStatus::Running
+    );
+    h.engine.shutdown();
+    while pool.join_next().await.is_some() {}
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        1,
+        "the in-flight job ran to completion"
+    );
+    assert_eq!(
+        h.engine.get_job(&id).await.unwrap().status,
+        JobStatus::Completed
+    );
+}

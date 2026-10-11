@@ -290,6 +290,13 @@ pub struct ServeArgs {
     #[arg(long, env = "QUEUEFLOW_QUEUES", value_delimiter = ',')]
     pub queues: Vec<String>,
 
+    /// Most jobs one claim query takes for the in-process workers: the
+    /// pool's dispatcher claims for every idle worker at once, up to this
+    /// many. 0 means up to --workers. Lower it to spread a backlog more
+    /// evenly across several servers at the cost of more claim queries.
+    #[arg(long, env = "QUEUEFLOW_CLAIM_BATCH", default_value_t = 0)]
+    pub claim_batch: usize,
+
     /// Prometheus metrics port.
     #[arg(long, env = "QUEUEFLOW_METRICS_PORT", default_value_t = 9090)]
     pub metrics_port: u16,

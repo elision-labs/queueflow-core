@@ -140,6 +140,7 @@ pub struct Engine<JS> {
     scheduler: WorkflowScheduler<JS>,
     default_queue: String,
     worker_count: usize,
+    claim_batch: usize,
     lease_secs: u32,
     poll_secs: u64,
     janitor: JanitorConfig,
@@ -156,6 +157,7 @@ pub struct EngineBuilder<JS> {
     handlers: HashMap<String, Arc<dyn TaskHandler>>,
     default_queue: String,
     worker_count: usize,
+    claim_batch: usize,
     lease_secs: u32,
     poll_secs: u64,
     janitor: JanitorConfig,
@@ -174,6 +176,16 @@ where
     /// Number of concurrent worker tasks per queue.
     pub fn worker_count(mut self, n: usize) -> Self {
         self.worker_count = n.max(1);
+        self
+    }
+
+    /// Most jobs one claim query may take for the in-process pool: the
+    /// dispatcher claims for every idle worker at once, up to this many.
+    /// `0` (the default) means up to `worker_count`. Lower it to spread a
+    /// backlog more evenly across several servers; the trade-off is more
+    /// claim queries.
+    pub fn claim_batch(mut self, n: usize) -> Self {
+        self.claim_batch = n;
         self
     }
 
@@ -231,6 +243,7 @@ where
             scheduler,
             default_queue: self.default_queue,
             worker_count: self.worker_count,
+            claim_batch: self.claim_batch,
             lease_secs: self.lease_secs,
             poll_secs: self.poll_secs,
             janitor: self.janitor,
@@ -253,6 +266,7 @@ where
             handlers: HashMap::new(),
             default_queue: "default".to_string(),
             worker_count: 8,
+            claim_batch: 0,
             lease_secs: 30,
             poll_secs: DEFAULT_WORKER_POLL_SECS,
             janitor: JanitorConfig::default(),
@@ -850,61 +864,113 @@ where
 
     // ---- Worker loop ------------------------------------------------------
 
-    /// Spawn `worker_count` concurrent workers draining `queue`. The returned
-    /// [`JoinSet`] resolves when all workers stop (on shutdown). Call
-    /// [`Engine::shutdown`] (or cancel via the token) to stop them.
+    /// Spawn the worker pool for `queue`: up to `worker_count` jobs run
+    /// concurrently, fed by one dispatcher that claims for every free worker
+    /// in a single query (up to [`EngineBuilder::claim_batch`]). The
+    /// returned [`JoinSet`] resolves once the pool has stopped, which happens
+    /// after [`Engine::shutdown`] (or the token) and once every in-flight
+    /// job has finished.
     ///
-    /// Workers are supervised: a panic that escapes the per-job containment
-    /// (an adapter bug, say) restarts the worker instead of silently
-    /// shrinking the pool. The pool only winds down at shutdown.
+    /// The dispatcher is supervised: a panic that escapes the per-job
+    /// containment (an adapter bug, say) restarts it instead of silently
+    /// stopping the pool. The pool only winds down at shutdown.
     pub fn run_workers(self: &Arc<Self>, queue: impl Into<String>) -> JoinSet<()> {
         let queue = queue.into();
         self.mark_running();
         let mut set = JoinSet::new();
-        for worker_id in 0..self.worker_count {
-            let engine = Arc::clone(self);
-            let q = queue.clone();
-            set.spawn(async move {
-                loop {
-                    let run = std::panic::AssertUnwindSafe(
-                        engine.clone().worker_loop(worker_id, q.clone()),
-                    )
+        let engine = Arc::clone(self);
+        set.spawn(async move {
+            loop {
+                let run = std::panic::AssertUnwindSafe(engine.clone().dispatch_loop(queue.clone()))
                     .catch_unwind()
                     .await;
-                    match run {
-                        Ok(()) => break, // clean exit (shutdown)
-                        Err(panic) => {
-                            tracing::error!(
-                                worker_id,
-                                panic = %panic_message(&*panic),
-                                "worker panicked; restarting"
-                            );
-                            if engine.shutdown.is_cancelled() {
-                                break;
-                            }
+                match run {
+                    Ok(()) => break, // clean exit (shutdown)
+                    Err(panic) => {
+                        tracing::error!(
+                            queue = %queue,
+                            panic = %panic_message(&*panic),
+                            "worker dispatcher panicked; restarting"
+                        );
+                        if engine.shutdown.is_cancelled() {
+                            break;
                         }
                     }
                 }
-            });
-        }
+            }
+        });
         set
     }
 
-    async fn worker_loop(self: Arc<Self>, worker_id: usize, queue: String) {
-        tracing::info!(worker_id, queue = %queue, "worker started");
+    /// Jobs one claim may take: the configured batch, or every worker when
+    /// unset.
+    fn claim_batch(&self) -> usize {
+        if self.claim_batch == 0 {
+            self.worker_count
+        } else {
+            self.claim_batch.min(self.worker_count).max(1)
+        }
+    }
+
+    /// One dispatcher per queue. Free workers are semaphore permits: the
+    /// dispatcher waits for at least one, grabs every other free permit up
+    /// to the claim batch without waiting, claims that many jobs in one
+    /// query, and hands each job to its own task holding one permit. With
+    /// `n` idle workers that is one claim query instead of `n` racing ones,
+    /// and a backlog is drained in batches rather than a row at a time.
+    async fn dispatch_loop(self: Arc<Self>, queue: String) {
+        let permits = Arc::new(tokio::sync::Semaphore::new(self.worker_count));
+        let mut inflight: JoinSet<()> = JoinSet::new();
+        tracing::info!(queue = %queue, workers = self.worker_count, "worker pool started");
         loop {
-            if self.shutdown.is_cancelled() {
-                break;
+            // Reap finished job tasks so the set never grows.
+            while inflight.try_join_next().is_some() {}
+
+            let first = tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => break,
+                permit = permits.clone().acquire_owned() => match permit {
+                    Ok(p) => p,
+                    Err(_) => break, // closed: never happens, be safe
+                },
+            };
+            let mut held = vec![first];
+            while held.len() < self.claim_batch() {
+                match permits.clone().try_acquire_owned() {
+                    Ok(p) => held.push(p),
+                    Err(_) => break,
+                }
             }
+
             match self
                 .store
-                .claim_jobs(&queue, 1, self.lease_secs, true)
+                .claim_jobs(&queue, held.len(), self.lease_secs, true)
                 .await
             {
-                Ok(mut claimed) => {
-                    if let Some(lease) = claimed.jobs.pop() {
-                        self.process_job(lease).await;
-                    } else {
+                Ok(claimed) => {
+                    let got = claimed.jobs.len();
+                    for lease in claimed.jobs {
+                        let permit = held.pop().expect("one permit per claimed job");
+                        let engine = Arc::clone(&self);
+                        inflight.spawn(async move {
+                            let _permit = permit; // released when the job is done
+                                                  // process_job contains handler panics; one that
+                                                  // escapes it (an adapter bug) must not take the
+                                                  // pool down with it.
+                            if let Err(panic) =
+                                std::panic::AssertUnwindSafe(engine.process_job(lease))
+                                    .catch_unwind()
+                                    .await
+                            {
+                                tracing::error!(
+                                    panic = %panic_message(&*panic),
+                                    "job task panicked outside handler containment"
+                                );
+                            }
+                        });
+                    }
+                    drop(held); // unclaimed slots go back to the pool
+                    if got == 0 {
                         // Idle: park until NOTIFY wakes us, the next delayed
                         // job comes due, or the safety-net window passes. The
                         // claim's epoch makes a wakeup that raced the empty
@@ -918,7 +984,8 @@ where
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(worker_id, error = %e, "claim error");
+                    drop(held);
+                    tracing::warn!(queue = %queue, error = %e, "claim error");
                     tokio::select! {
                         _ = self.shutdown.cancelled() => break,
                         _ = tokio::time::sleep(StdDuration::from_secs(1)) => {}
@@ -926,7 +993,9 @@ where
                 }
             }
         }
-        tracing::info!(worker_id, queue = %queue, "worker stopped");
+        // Graceful stop: in-flight jobs finish before the pool reports done.
+        while inflight.join_next().await.is_some() {}
+        tracing::info!(queue = %queue, "worker pool stopped");
     }
 
     /// How long an idle worker should park: until the next delayed job is due,
