@@ -10,7 +10,7 @@
 class Queueflow < Formula
   desc "PostgreSQL-native job queue and workflow engine (server + CLI)"
   homepage "https://queueflow.dev"
-  version "0.2.0"
+  version "0.3.0"
   license "MIT"
 
   livecheck do
@@ -21,28 +21,28 @@ class Queueflow < Formula
   on_macos do
     on_arm do
       url "https://github.com/elision-labs/queueflow-core/releases/download/v#{version}/queueflow-aarch64-apple-darwin.tar.gz"
-      sha256 "6e5002cc79c6f53c49e1504525ce1a9a86d73c4446164eb4c497c97cfb0e3e3f"
+      sha256 "6ae1a71233d30f50f6962a2875b6a956ae62ed52e014fc0a6ff1059363c77360"
     end
     # BEGIN x86_64-apple-darwin
     # Enabled by update-formula.sh once release.yml publishes this asset.
-    # on_intel do
-    #   url "https://github.com/elision-labs/queueflow-core/releases/download/v#{version}/queueflow-x86_64-apple-darwin.tar.gz"
-    #   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-    # end
+    on_intel do
+      url "https://github.com/elision-labs/queueflow-core/releases/download/v#{version}/queueflow-x86_64-apple-darwin.tar.gz"
+      sha256 "97590e238397b9ad2415d54017d18ba3e5f926178e2be0a15e0c91792811f1ae"
+    end
     # END x86_64-apple-darwin
   end
 
   on_linux do
     on_intel do
       url "https://github.com/elision-labs/queueflow-core/releases/download/v#{version}/queueflow-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "6cb93405b41b3b09bee1edb8ff38bc8a3d514abdad4c7721973cd31f7be7e55c"
+      sha256 "f57c662643e2bfcc405e692a4d6ff0397b808fcf9699b1d01d9c18b17d949e3c"
     end
     # BEGIN aarch64-unknown-linux-gnu
     # Enabled by update-formula.sh once release.yml publishes this asset.
-    # on_arm do
-    #   url "https://github.com/elision-labs/queueflow-core/releases/download/v#{version}/queueflow-aarch64-unknown-linux-gnu.tar.gz"
-    #   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-    # end
+    on_arm do
+      url "https://github.com/elision-labs/queueflow-core/releases/download/v#{version}/queueflow-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "999a507f17146a53aaeb07806256d7ee8b0fe044fccfc85da6540457ae0e27a9"
+    end
     # END aarch64-unknown-linux-gnu
   end
 

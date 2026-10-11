@@ -81,7 +81,7 @@ done
 rm -f "$new.bak"
 
 # 3. Every active (uncommented) url must have been refreshed for this tag.
-for target in "${missing[@]}"; do
+for target in ${missing[@]+"${missing[@]}"}; do
   if grep -qE "^\s+url .*queueflow-$target\.tar\.gz" "$new"; then
     echo "error: $tag has no asset for active target $target" >&2
     exit 1
