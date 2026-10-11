@@ -148,7 +148,7 @@ docker run -p 8000:8000 -p 9090:9090 \
   -e DATABASE_URL=postgres://… \
   -e QUEUEFLOW_API_KEYS=my-token:acme \
   -e QUEUEFLOW_WORKER_TOKEN=my-worker-token \
-  ghcr.io/elision-labs/queueflow:0.2 serve
+  ghcr.io/elision-labs/queueflow:0.3 serve
 
 make docker                       # builds ghcr.io/elision-labs/queueflow:dev locally
 ```

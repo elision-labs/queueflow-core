@@ -10,6 +10,8 @@ versions may contain breaking changes, which are called out explicitly.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-10
+
 ### Added
 
 - A read-only web dashboard served by the API at `/ui/` (embedded in the
@@ -98,6 +100,7 @@ keys) with a separate worker credential, idempotent enqueue, an HTTP worker
 protocol for handlers in any language, Prometheus metrics, health and
 readiness probes, graceful shutdown, and a code-generated OpenAPI 3.1 spec.
 
-[Unreleased]: https://github.com/elision-labs/queueflow-core/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/elision-labs/queueflow-core/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/elision-labs/queueflow-core/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/elision-labs/queueflow-core/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/elision-labs/queueflow-core/releases/tag/v0.1.0
