@@ -1,4 +1,6 @@
-// QueueFlow dashboard: hash-routed, read-only views over /api/v1.
+// QueueFlow dashboard: hash-routed views over /api/v1. Reads with any
+// tenant token; cancel, replay, and pause actions appear for read-write
+// tokens and sit behind a confirmation.
 
 import * as api from "./api.js";
 import {
@@ -122,6 +124,24 @@ function showGate(message) {
   setTimeout(() => gateInput.focus(), 0);
 }
 
+const accessLabel = document.getElementById("access-label");
+
+function setAccessLabel() {
+  if (!api.session.tenant) {
+    accessLabel.textContent = "";
+    return;
+  }
+  accessLabel.textContent = api.canWrite() ? `${api.session.tenant}, read-write` : `${api.session.tenant}, read only`;
+}
+
+/** Resolve the token's tenant and access level; throws on 401. */
+async function loadSession() {
+  const me = await api.get("/whoami");
+  api.session.tenant = me.tenant || "";
+  api.session.access = me.access || "read_only";
+  setAccessLabel();
+}
+
 gateForm.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const token = gateInput.value.trim();
@@ -129,7 +149,7 @@ gateForm.addEventListener("submit", async (ev) => {
   gateMsg.textContent = "";
   api.auth.set(token);
   try {
-    await api.get("/tasks");
+    await loadSession();
   } catch (e) {
     api.auth.clear();
     gate.hidden = false;
@@ -148,13 +168,80 @@ gateForm.addEventListener("submit", async (ev) => {
 window.addEventListener(api.UNAUTHORIZED_EVENT, () => {
   const had = api.auth.get();
   api.auth.clear();
+  api.session.tenant = "";
+  api.session.access = "";
+  setAccessLabel();
   showGate(had ? "The server rejected the token. Enter a tenant token to continue." : "");
 });
 
 document.getElementById("change-token").addEventListener("click", () => {
   api.auth.clear();
+  api.session.tenant = "";
+  api.session.access = "";
+  setAccessLabel();
   showGate("");
 });
+
+// ---- Actions ------------------------------------------------------------------
+
+const confirmDialog = document.getElementById("confirm");
+
+/** Ask before a write. Resolves true when the user confirms. */
+function confirmAction(title, body, verb) {
+  document.getElementById("confirm-title").textContent = title;
+  document.getElementById("confirm-body").textContent = body;
+  const ok = document.getElementById("confirm-ok");
+  ok.textContent = verb || "Confirm";
+  return new Promise((resolve) => {
+    const done = () => {
+      confirmDialog.removeEventListener("close", done);
+      resolve(confirmDialog.returnValue === "ok");
+    };
+    confirmDialog.addEventListener("close", done);
+    confirmDialog.returnValue = "";
+    confirmDialog.showModal();
+  });
+}
+
+let flashTimer = null;
+function flash(message, kind) {
+  const el = document.getElementById("flash");
+  el.textContent = message;
+  if (kind) el.dataset.kind = kind;
+  else delete el.dataset.kind;
+  el.hidden = false;
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => {
+    el.hidden = true;
+  }, 4000);
+}
+
+/**
+ * Run a confirmed write: `button` is disabled while it runs, `onDone` gets
+ * the response. Errors surface as a flash; a 403 means the token turned out
+ * to be read-only after all.
+ */
+async function act(button, { title, body, verb, path, payload, success, onDone }) {
+  if (!(await confirmAction(title, body, verb))) return;
+  button.disabled = true;
+  try {
+    const resp = await api.post(path, payload);
+    flash(typeof success === "function" ? success(resp) : success);
+    if (onDone) await onDone(resp);
+  } catch (e) {
+    if (e instanceof api.ApiError && e.status === 401) return;
+    flash(e && e.message ? e.message : String(e), "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function actionButton(label, dataset, extraClass) {
+  const attrs = Object.entries(dataset)
+    .map(([k, v]) => html` data-${k}="${v}"`)
+    .join("");
+  return html`<button type="button" class="btn small ${extraClass || ""}"${raw(attrs)}>${label}</button>`;
+}
 
 // ---- Shared pieces --------------------------------------------------------------
 
@@ -232,7 +319,7 @@ async function overview(ctx) {
     html`<span id="ov-updated">Loading</span><button type="button" class="btn" id="ov-pause" aria-pressed="false">Pause refresh</button>`,
   )}
   <h2>Queues</h2>
-  <p class="note">Live backlog for this tenant. Queues with no pending, scheduled, or running jobs are not listed. Refreshes every 5 seconds.</p>
+  <p class="note">Live backlog for this tenant: every queue it has enqueued to, plus any with live jobs. Refreshes every 5 seconds.${api.canWrite() ? " Pausing a queue stops new claims of this tenant's jobs on it; running jobs finish, so a paused queue is drained once Running reaches zero." : ""}</p>
   <section id="ov-queues">${loadingState("queues")}</section>
   <h2>Totals</h2>
   <p class="note">Durable counts read from the store. Retention deletes history, so they can go down.</p>
@@ -259,10 +346,11 @@ async function overview(ctx) {
     if (!el) return;
     if (!queues.length) {
       el.innerHTML = String(
-        emptyState("No live jobs on any queue", "Queues appear here as soon as a job is pending, scheduled, or running."),
+        emptyState("No queues yet", "Queues appear here as soon as this tenant enqueues a job."),
       );
       return;
     }
+    const write = api.canWrite();
     const maxAge = Math.max(1, ...queues.map((q) => q.oldest_pending_age_secs || 0));
     const rows = queues.map((q) => {
       const age = q.oldest_pending_age_secs;
@@ -275,20 +363,44 @@ async function overview(ctx) {
         ageCell = html`<span class="${cls}" title="Oldest claimable job has waited ${duration(age)}"><span class="bar"><i style="width:${pct}%"></i></span>${duration(age)}</span>`;
       }
       const n = (v) => (v ? html`${num(v)}` : html`<span class="zero">0</span>`);
+      const state = q.paused ? html`<span class="status" data-status="cancelled">Paused</span>` : html`<span class="status" data-status="running" style="--st-color: var(--st-completed); --st-soft: var(--st-completed-soft)">Active</span>`;
+      const action = write
+        ? q.paused
+          ? actionButton("Resume", { action: "resume-queue", queue: q.queue })
+          : actionButton("Pause", { action: "pause-queue", queue: q.queue })
+        : "";
       return html`<tr>
         <td><a href="${hashFor("/jobs", { queue: q.queue })}">${q.queue}</a></td>
+        <td>${state}</td>
         <td class="num">${n(q.pending)}</td>
         <td class="num">${n(q.scheduled)}</td>
         <td class="num">${n(q.running)}</td>
         <td>${ageCell}</td>
+        ${write ? html`<td class="actions">${action}</td>` : ""}
       </tr>`;
     });
-    el.innerHTML = String(
-      table(
-        ["Queue", { label: "Pending", num: true }, { label: "Scheduled", num: true }, { label: "Running", num: true }, "Oldest pending"],
-        rows,
-      ),
-    );
+    const headers = ["Queue", "State", { label: "Pending", num: true }, { label: "Scheduled", num: true }, { label: "Running", num: true }, "Oldest pending"];
+    if (write) headers.push("");
+    el.innerHTML = String(table(headers, rows));
+  }
+
+  main.addEventListener("click", onQueueAction);
+  ctx.cleanups.push(() => main.removeEventListener("click", onQueueAction));
+  function onQueueAction(ev) {
+    const btn = ev.target.closest("[data-action='pause-queue'], [data-action='resume-queue']");
+    if (!btn || !ctx.alive()) return;
+    const queue = btn.dataset.queue;
+    const pausing = btn.dataset.action === "pause-queue";
+    act(btn, {
+      title: pausing ? `Pause ${queue}?` : `Resume ${queue}?`,
+      body: pausing
+        ? "Workers stop claiming this tenant's jobs on the queue. Pending jobs wait; running jobs finish."
+        : "Workers resume claiming this tenant's jobs on the queue right away.",
+      verb: pausing ? "Pause queue" : "Resume queue",
+      path: `/queues/${enc(queue)}/${pausing ? "pause" : "resume"}`,
+      success: (r) => (pausing ? `${queue} paused; ${num(r.running)} still running` : `${queue} resumed`),
+      onDone: () => tick(true),
+    });
   }
 
   function renderTotals(s) {
@@ -355,18 +467,25 @@ function statusSelect(name, options, value) {
   )}</select>`;
 }
 
+const CANCELLABLE = new Set(["pending", "retrying", "running"]);
+
 async function jobsList(ctx) {
-  const keys = ["status", "queue", "created_after", "created_before", "cursor"];
+  const keys = ["status", "queue", "task_name", "created_after", "created_before", "cursor"];
   const f = filtersFrom(ctx.query, keys);
   const { cursor, ...filters } = f;
+  // Bulk cancel is offered only for a filter that names a non-terminal
+  // status, so the set it applies to is visible on screen.
+  const bulk = api.canWrite() && CANCELLABLE.has(filters.status);
   ctx.set(html`${viewHead("Jobs", html`<span>Newest first</span>`)}
   <form class="filters" id="job-filters">
     <label>Status ${statusSelect("status", JOB_STATUSES, filters.status || "")}</label>
     <label>Queue <input type="text" name="queue" value="${filters.queue || ""}" placeholder="any queue"></label>
+    <label>Task <input type="text" name="task_name" value="${filters.task_name || ""}" placeholder="any task"></label>
     <label>Created after <input type="datetime-local" name="created_after" value="${isoToLocal(filters.created_after)}"></label>
     <label>Created before <input type="datetime-local" name="created_before" value="${isoToLocal(filters.created_before)}"></label>
     <button type="submit" class="btn">Apply filters</button>
     ${Object.keys(filters).length ? html`<a href="#/jobs" class="btn">Clear</a>` : ""}
+    ${bulk ? html`<button type="button" class="btn danger" id="bulk-cancel">Cancel matching jobs</button>` : ""}
   </form>
   <section id="job-list">${loadingState("jobs")}</section>`);
 
@@ -376,10 +495,37 @@ async function jobsList(ctx) {
     location.hash = hashFor("/jobs", {
       status: fd.get("status"),
       queue: String(fd.get("queue") || "").trim(),
+      task_name: String(fd.get("task_name") || "").trim(),
       created_after: localToIso(fd.get("created_after")),
       created_before: localToIso(fd.get("created_before")),
     });
   });
+
+  if (bulk) {
+    document.getElementById("bulk-cancel").addEventListener("click", (ev) => {
+      const parts = [`status ${statusLabel(filters.status).toLowerCase()}`];
+      if (filters.queue) parts.push(`queue ${filters.queue}`);
+      if (filters.task_name) parts.push(`task ${filters.task_name}`);
+      if (filters.created_after) parts.push(`created after ${exact(filters.created_after)}`);
+      if (filters.created_before) parts.push(`created before ${exact(filters.created_before)}`);
+      act(ev.currentTarget, {
+        title: "Cancel every matching job?",
+        body: `Up to 1000 jobs matching ${parts.join(", ")} are cancelled, oldest first. Running jobs keep executing but their results are refused. This cannot be undone.`,
+        verb: "Cancel jobs",
+        path: "/jobs/cancel",
+        payload: {
+          status: filters.status,
+          queue: filters.queue || undefined,
+          task_name: filters.task_name || undefined,
+          created_after: filters.created_after || undefined,
+          created_before: filters.created_before || undefined,
+          limit: 1000,
+        },
+        success: (r) => `${num(r.cancelled)} job${r.cancelled === 1 ? "" : "s"} cancelled${r.cancelled >= 1000 ? "; more may remain, run it again" : ""}`,
+        onDone: () => route(),
+      });
+    });
+  }
 
   const resp = await api.get("/jobs", { ...filters, cursor, limit: PAGE_SIZE });
   if (!ctx.alive()) return;
@@ -436,10 +582,11 @@ async function jobDetail(ctx, id) {
       done: ["Finished", false],
     }[mode];
     document.title = `${job.task_name} | QueueFlow`;
+    const cancel = api.canWrite() && !JOB_TERMINAL.has(job.status) ? actionButton("Cancel job", { action: "cancel-job" }, "danger") : "";
     ctx.set(html`${crumbs("jobs", "Jobs")}
     <div class="view-head">
       <div class="title-row"><h1>${job.task_name}</h1>${status(job.status)}<span class="mono">${job.id}</span></div>
-      <div class="meta"><span class="live" data-on="${liveLabel[1]}">${liveLabel[0]}</span></div>
+      <div class="meta actions">${cancel}<span class="live" data-on="${liveLabel[1]}">${liveLabel[0]}</span></div>
     </div>
     <div class="detail">
       <div class="stack">
@@ -474,6 +621,25 @@ async function jobDetail(ctx, id) {
   }
 
   render();
+  const onCancel = (ev) => {
+    const btn = ev.target.closest("[data-action='cancel-job']");
+    if (!btn || !ctx.alive()) return;
+    act(btn, {
+      title: `Cancel ${job.task_name}?`,
+      body:
+        job.status === "running"
+          ? "The handler keeps running, but its result is refused and the job ends cancelled. This cannot be undone."
+          : "The job will never be claimed. This cannot be undone.",
+      verb: "Cancel job",
+      path: `/jobs/${enc(id)}/cancel`,
+      success: "Job cancelled",
+      onDone: async () => {
+        onJob(await api.get(`/jobs/${enc(id)}`));
+      },
+    });
+  };
+  main.addEventListener("click", onCancel);
+  ctx.cleanups.push(() => main.removeEventListener("click", onCancel));
   if (mode === "done") return;
 
   // Live updates: SSE over fetch, then polling if the stream is unavailable.
@@ -693,10 +859,11 @@ async function workflowDetail(ctx, id) {
 
   function render() {
     document.title = `${wf.name} | QueueFlow`;
+    const cancel = api.canWrite() && live ? actionButton("Cancel workflow", { action: "cancel-workflow" }, "danger") : "";
     ctx.set(html`${crumbs("workflows", "Workflows")}
     <div class="view-head">
       <div class="title-row"><h1>${wf.name}</h1>${status(wf.status)}<span class="mono">${wf.id}</span></div>
-      <div class="meta"><span class="live" data-on="${live}">${live ? "Following every 3s" : "Finished"}</span></div>
+      <div class="meta actions">${cancel}<span class="live" data-on="${live}">${live ? "Following every 3s" : "Finished"}</span></div>
     </div>
     <div class="detail">
       <div class="stack">
@@ -737,6 +904,26 @@ async function workflowDetail(ctx, id) {
   }
 
   render();
+  const onCancel = (ev) => {
+    const btn = ev.target.closest("[data-action='cancel-workflow']");
+    if (!btn || !ctx.alive()) return;
+    act(btn, {
+      title: `Cancel ${wf.name}?`,
+      body: "Every step that has not finished is cancelled, including their jobs. Completed steps keep their results. This cannot be undone.",
+      verb: "Cancel workflow",
+      path: `/workflows/${enc(id)}/cancel`,
+      success: "Workflow cancelled",
+      onDone: async () => {
+        const [w, s] = await Promise.all([api.get(`/workflows/${enc(id)}`), api.get(`/workflows/${enc(id)}/steps`)]);
+        wf = w;
+        steps = s.steps || [];
+        live = !WORKFLOW_TERMINAL.has(wf.status);
+        render();
+      },
+    });
+  };
+  main.addEventListener("click", onCancel);
+  ctx.cleanups.push(() => main.removeEventListener("click", onCancel));
   if (!live) return;
 
   const timer = setInterval(async () => {
@@ -763,7 +950,7 @@ async function workflowDetail(ctx, id) {
 async function dlqList(ctx) {
   const cursor = ctx.query.get("cursor") || "";
   ctx.set(html`${viewHead("Dead letters", html`<span>Newest first</span>`)}
-  <p class="note">Jobs that failed for good: retries exhausted, a permanent failure, or no handler for the task. Replay them with POST /api/v1/dlq/{id}/replay.</p>
+  <p class="note">Jobs that failed for good: retries exhausted, a permanent failure, or no handler for the task.${api.canWrite() ? " Replaying one creates a fresh job with the same task, payload, queue, and config; each entry replays at most once." : " Replay them with POST /api/v1/dlq/{id}/replay."}</p>
   <section id="dlq-list">${loadingState("dead letters")}</section>`);
   const resp = await api.get("/dlq", { cursor, limit: PAGE_SIZE });
   if (!ctx.alive()) return;
@@ -772,6 +959,7 @@ async function dlqList(ctx) {
     el.innerHTML = String(emptyState("No dead letters", "Nothing has failed terminally for this tenant."));
     return;
   }
+  const write = api.canWrite();
   const rows = resp.dead_letters.map(
     (d) => html`<tr>
       <td><a href="#/dlq/${d.id}">${dlqReason(d.reason)}</a></td>
@@ -781,12 +969,30 @@ async function dlqList(ctx) {
       <td>${time(d.created_at)}</td>
       <td>${d.replayed_at ? html`${time(d.replayed_at)}${d.replay_job_id ? html` <a class="id" href="#/jobs/${enc(d.replay_job_id)}">${shortId(d.replay_job_id)}</a>` : ""}` : html`<span class="zero">no</span>`}</td>
       <td><a class="id" href="#/jobs/${enc(d.job_id)}" title="${d.job_id}">${shortId(d.job_id)}</a></td>
+      ${write ? html`<td class="actions">${d.replayed_at ? "" : actionButton("Replay", { action: "replay-dlq", id: d.id, task: d.task_name || "" })}</td>` : ""}
     </tr>`,
   );
-  el.innerHTML = String(
-    html`${table(["Reason", "Task", "Queue", "Error", "Dead-lettered", "Replayed", "Original job"], rows)}
-    ${pager(resp, "/dlq", {}, cursor)}`,
-  );
+  const headers = ["Reason", "Task", "Queue", "Error", "Dead-lettered", "Replayed", "Original job"];
+  if (write) headers.push("");
+  el.innerHTML = String(html`${table(headers, rows)}${pager(resp, "/dlq", {}, cursor)}`);
+  const onReplay = (ev) => {
+    const btn = ev.target.closest("[data-action='replay-dlq']");
+    if (!btn || !ctx.alive()) return;
+    replayAction(btn, btn.dataset.id, btn.dataset.task, () => route());
+  };
+  main.addEventListener("click", onReplay);
+  ctx.cleanups.push(() => main.removeEventListener("click", onReplay));
+}
+
+function replayAction(btn, id, task, onDone) {
+  act(btn, {
+    title: `Replay ${task || "this job"}?`,
+    body: "A fresh job is created with the same task, payload, queue, and config, and runs as soon as a worker is free. The dead letter is marked replayed and cannot be replayed again.",
+    verb: "Replay",
+    path: `/dlq/${enc(id)}/replay`,
+    success: (r) => `Replayed as job ${shortId(r.job_id)}`,
+    onDone,
+  });
 }
 
 async function dlqDetail(ctx, id) {
@@ -794,9 +1000,11 @@ async function dlqDetail(ctx, id) {
   const d = await api.get(`/dlq/${enc(id)}`);
   if (!ctx.alive()) return;
   document.title = `Dead letter ${d.id} | QueueFlow`;
+  const replay = api.canWrite() && !d.replayed_at ? actionButton("Replay", { action: "replay-dlq" }) : "";
   ctx.set(html`${crumbs("dlq", "Dead letters")}
   <div class="view-head">
     <div class="title-row"><h1>${dlqReason(d.reason)}</h1>${status("failed")}<span class="mono">dead letter ${d.id}</span></div>
+    ${replay ? html`<div class="meta actions">${replay}</div>` : ""}
   </div>
   <div class="detail">
     <div class="stack">
@@ -816,6 +1024,13 @@ async function dlqDetail(ctx, id) {
       <p class="note">The original job keeps its payload, result, and attempt history. Open it for the full record.</p>
     </div>
   </div>`);
+  const onReplay = (ev) => {
+    const btn = ev.target.closest("[data-action='replay-dlq']");
+    if (!btn || !ctx.alive()) return;
+    replayAction(btn, d.id, d.task_name || "", () => route());
+  };
+  main.addEventListener("click", onReplay);
+  ctx.cleanups.push(() => main.removeEventListener("click", onReplay));
 }
 
 // ---- Cron -----------------------------------------------------------------------------
@@ -831,6 +1046,7 @@ async function cronList(ctx) {
     el.innerHTML = String(emptyState("No cron schedules", "Create one with POST /api/v1/cron and it will show up here."));
     return;
   }
+  const write = api.canWrite();
   const rows = resp.crons.map(
     (c) => html`<tr>
       <td>${c.enabled ? html`<span class="status" data-status="running" style="--st-color: var(--st-completed); --st-soft: var(--st-completed-soft)">Enabled</span>` : html`<span class="status" data-status="cancelled">Paused</span>`}</td>
@@ -841,12 +1057,29 @@ async function cronList(ctx) {
       <td>${c.enabled ? time(c.next_run_at) : html`<span class="zero">paused</span>`}</td>
       <td>${c.last_enqueued_at ? time(c.last_enqueued_at) : html`<span class="zero">never</span>`}</td>
       <td class="mono" title="${c.id}">${shortId(c.id)}</td>
+      ${write ? html`<td class="actions">${actionButton(c.enabled ? "Pause" : "Resume", { action: c.enabled ? "pause-cron" : "resume-cron", id: c.id, name: c.name })}</td>` : ""}
     </tr>`,
   );
-  el.innerHTML = String(
-    html`${table(["State", "Name", "Schedule", "Task", "Queue", "Next run", "Last enqueued", "Id"], rows)}
-    ${pager(resp, "/cron", {}, cursor)}`,
-  );
+  const headers = ["State", "Name", "Schedule", "Task", "Queue", "Next run", "Last enqueued", "Id"];
+  if (write) headers.push("");
+  el.innerHTML = String(html`${table(headers, rows)}${pager(resp, "/cron", {}, cursor)}`);
+  const onCron = (ev) => {
+    const btn = ev.target.closest("[data-action='pause-cron'], [data-action='resume-cron']");
+    if (!btn || !ctx.alive()) return;
+    const pausing = btn.dataset.action === "pause-cron";
+    act(btn, {
+      title: pausing ? `Pause ${btn.dataset.name}?` : `Resume ${btn.dataset.name}?`,
+      body: pausing
+        ? "No further firings until it is resumed. Jobs it already enqueued are unaffected."
+        : "It fires at its next future occurrence; runs missed while paused are not caught up.",
+      verb: pausing ? "Pause schedule" : "Resume schedule",
+      path: `/cron/${enc(btn.dataset.id)}/${pausing ? "pause" : "resume"}`,
+      success: pausing ? "Schedule paused" : "Schedule resumed",
+      onDone: () => route(),
+    });
+  };
+  main.addEventListener("click", onCron);
+  ctx.cleanups.push(() => main.removeEventListener("click", onCron));
 }
 
 // ---- Tasks ----------------------------------------------------------------------------
@@ -868,4 +1101,16 @@ async function tasksList(ctx) {
 
 // ---- Boot -------------------------------------------------------------------------------
 
-route();
+(async () => {
+  if (api.auth.get()) {
+    try {
+      await loadSession();
+    } catch (e) {
+      if (!(e instanceof api.ApiError && e.status === 401)) {
+        // Offline or old server: the views still work, read-only.
+        api.session.access = api.session.access || "read_only";
+      }
+    }
+  }
+  route();
+})();

@@ -29,7 +29,7 @@
       <a href="#/tasks" data-nav="tasks">Tasks</a>
     </nav>
     <div class="top-right">
-      <span class="hide-sm">Read only</span>
+      <span class="hide-sm" id="access-label"></span>
       <button type="button" class="link" id="change-token">Change token</button>
     </div>
   </header>
@@ -37,6 +37,19 @@
   <main id="main" tabindex="-1" aria-live="polite">
     <div class="state">Loading</div>
   </main>
+
+  <div id="flash" role="status" aria-live="polite" hidden></div>
+
+  <dialog id="confirm" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-body"></p>
+      <div class="row">
+        <button type="submit" class="btn primary" id="confirm-ok" value="ok">Confirm</button>
+        <button type="submit" class="btn" value="cancel">Keep as is</button>
+      </div>
+    </form>
+  </dialog>
 
   <div id="gate" hidden>
     <div class="panel gate-card">
@@ -52,7 +65,7 @@
           <span class="msg" id="gate-msg" role="alert"></span>
         </div>
       </form>
-      <p class="fine">The token is kept in this tab's session storage and sent only to this server's <code>/api/v1</code> routes. A read-only key (<code>token:tenant:ro</code>) is enough for this dashboard. The worker token authenticates the worker protocol only and will not work here.</p>
+      <p class="fine">The token is kept in this tab's session storage and sent only to this server's <code>/api/v1</code> routes. A read-only key (<code>token:tenant:ro</code>) is enough to look around; a read-write key adds the cancel, replay, and pause actions. The worker token authenticates the worker protocol only and will not work here.</p>
     </div>
   </div>
 

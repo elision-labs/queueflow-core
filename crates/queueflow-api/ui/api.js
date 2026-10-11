@@ -62,33 +62,64 @@ export function buildQuery(params) {
   return s ? `?${s}` : "";
 }
 
+/**
+ * Who the current token is: `{ tenant, access }` with access `read_write`
+ * or `read_only`. Filled in by the sign-in flow; views consult `canWrite()`
+ * to decide whether to offer actions at all (the server enforces it
+ * regardless).
+ */
+export const session = { tenant: "", access: "" };
+
+export function canWrite() {
+  return session.access === "read_write";
+}
+
 /** GET a JSON resource under /api/v1. Throws ApiError on non-2xx. */
 export async function get(path, params, { signal } = {}) {
+  return request("GET", path + buildQuery(params), undefined, signal);
+}
+
+/**
+ * POST a JSON body (or nothing) under /api/v1. Throws ApiError on non-2xx;
+ * a 204 resolves to null.
+ */
+export async function post(path, body, { signal } = {}) {
+  return request("POST", path, body, signal);
+}
+
+async function request(method, pathAndQuery, body, signal) {
   let resp;
   try {
-    resp = await fetch(BASE + path + buildQuery(params), { headers: headers(), signal });
+    const init = { method, headers: headers(), signal };
+    if (body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(body);
+    }
+    resp = await fetch(BASE + pathAndQuery, init);
   } catch (e) {
     if (e && e.name === "AbortError") throw e;
     throw new ApiError(0, "The server could not be reached.", null);
   }
   if (resp.status === 401) {
-    window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT, { detail: { path } }));
+    window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT, { detail: { path: pathAndQuery } }));
     throw new ApiError(401, "The token was rejected.", null);
   }
-  let body = null;
+  let parsed = null;
   const text = await resp.text();
   if (text) {
     try {
-      body = JSON.parse(text);
+      parsed = JSON.parse(text);
     } catch {
-      body = null;
+      parsed = null;
     }
   }
   if (!resp.ok) {
-    const msg = (body && body.error) || `${resp.status} ${resp.statusText}`;
-    throw new ApiError(resp.status, msg, body);
+    const msg =
+      (parsed && parsed.error) ||
+      (resp.status === 403 ? "This token is read-only or belongs to another tenant." : `${resp.status} ${resp.statusText}`);
+    throw new ApiError(resp.status, msg, parsed);
   }
-  return body;
+  return parsed;
 }
 
 /**
