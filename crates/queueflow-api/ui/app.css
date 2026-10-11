@@ -157,7 +157,13 @@ time { font-variant-numeric: tabular-nums; }
   overflow-x: auto;
   flex: 1;
   height: 100%;
+  min-width: 0;
+  /* Scrollable on narrow screens, but never show a scrollbar: on macOS with
+     "always show scroll bars" the bar rendered inside the 48px bar. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
+.top nav::-webkit-scrollbar { display: none; }
 .top nav a {
   color: var(--muted);
   padding: 0 10px;
