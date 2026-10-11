@@ -20,7 +20,7 @@ gitRepoId: queueflow-sdk-python
 additionalProperties:
   packageName: queueflow
   projectName: queueflow
-  packageVersion: 0.2.2
+  packageVersion: 0.3.0
   packageUrl: https://github.com/elision-labs/queueflow-sdk-python
   library: urllib3
   hideGenerationTimestamp: true

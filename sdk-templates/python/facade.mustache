@@ -12,7 +12,8 @@ import inspect
 import logging
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .api_client import ApiClient
 from .configuration import Configuration
@@ -34,6 +35,7 @@ from .models.create_workflow_request import CreateWorkflowRequest
 from .models.create_cron_request import CreateCronRequest
 from .models.workflow_step import WorkflowStep
 from .models.job import Job
+from .models.queue_stats import QueueStats
 from .models.workflow import Workflow
 
 _TERMINAL_JOB = {"completed", "failed", "cancelled"}
@@ -77,6 +79,70 @@ class WorkerContext:
 _logger = logging.getLogger("queueflow.worker")
 
 
+class WorkerRunResult:
+    """What :meth:`QueueFlow.run_worker` returns once the worker has stopped.
+
+    ``unfinished`` lists the jobs whose handlers were still running when
+    ``drain_timeout`` elapsed. Nothing was reported for them: their leases
+    expire and the server redelivers. Empty when every in-flight handler
+    finished in time.
+    """
+
+    def __init__(self, unfinished: List[Job]) -> None:
+        self.unfinished = unfinished
+
+    def __repr__(self) -> str:
+        return "WorkerRunResult(unfinished=" + repr([j.id for j in self.unfinished]) + ")"
+
+
+class _InFlight:
+    """Bookkeeping for one leased job while its handler runs."""
+
+    def __init__(self, lease: Any) -> None:
+        self.lease = lease
+        self.ctx = WorkerContext()
+        self.hb_done = threading.Event()
+
+    def abandon(self) -> None:
+        """Stop heartbeating and flip ``ctx.cancelled``; nothing is reported afterwards."""
+        self.hb_done.set()
+        self.ctx._lost.set()
+
+
+class _TimeoutApiClient(ApiClient):
+    """The generated ApiClient with a default per-request timeout.
+
+    The generated Configuration has no timeout setting; every generated api
+    method takes ``_request_timeout`` and passes None through to urllib3,
+    which then waits forever. This applies ``default_timeout`` (seconds, or a
+    ``(connect, read)`` pair) whenever a call does not set its own.
+    """
+
+    def __init__(self, configuration: Configuration, default_timeout: Union[None, float, Tuple[float, float]]) -> None:
+        super().__init__(configuration)
+        self.default_timeout = default_timeout
+
+    def call_api(
+        self,
+        method,
+        url,
+        header_params=None,
+        body=None,
+        post_params=None,
+        _request_timeout=None,
+    ):
+        if _request_timeout is None:
+            _request_timeout = self.default_timeout
+        return super().call_api(
+            method,
+            url,
+            header_params=header_params,
+            body=body,
+            post_params=post_params,
+            _request_timeout=_request_timeout,
+        )
+
+
 class QueueFlow:
     """Ergonomic client wrapping the generated api clients.
 
@@ -88,18 +154,30 @@ class QueueFlow:
     fail) authenticate with the server's *worker token*, not a tenant token.
     Pass it as ``worker_token=``; without it, ``qf.worker`` reuses the tenant
     token, which only works in the server's development mode.
+
+    ``timeout`` is the default per-request timeout in seconds (30 by default;
+    a ``(connect, read)`` pair is also accepted, ``None`` disables it). Any
+    generated api method can override it per call with ``_request_timeout=``;
+    the worker runtime's long-poll lease calls set their own.
     """
 
-    def __init__(self, base_url: str, token: str, worker_token: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        worker_token: Optional[str] = None,
+        timeout: Union[None, float, Tuple[float, float]] = 30.0,
+    ) -> None:
+        self.timeout = timeout
         config = Configuration(host=base_url.rstrip("/"))
         config.access_token = token
-        self._client = ApiClient(config)
+        self._client = _TimeoutApiClient(config, timeout)
         self.jobs = JobsApi(self._client)
         self.workflows = WorkflowsApi(self._client)
         if worker_token is not None:
             worker_config = Configuration(host=base_url.rstrip("/"))
             worker_config.access_token = worker_token
-            self._worker_client: Optional[ApiClient] = ApiClient(worker_config)
+            self._worker_client: Optional[ApiClient] = _TimeoutApiClient(worker_config, timeout)
             self.worker = WorkerApi(self._worker_client)
         else:
             self._worker_client = None
@@ -196,6 +274,16 @@ class QueueFlow:
         replayed = self.dlq.replay_dead_letter(dead_letter_id)
         return self.jobs.get_job(replayed.job_id)
 
+    # --- system -------------------------------------------------------------
+
+    def queues(self) -> List[QueueStats]:
+        """Live backlog per queue (``GET /api/v1/queues``): claimable ``pending``,
+        future-dated ``scheduled`` and ``running`` counts, plus how long the
+        oldest claimable job has waited. Queues with no non-terminal jobs are
+        omitted.
+        """
+        return self.system.list_queues().queues
+
     # --- worker runtime -------------------------------------------------------
 
     def run_worker(
@@ -206,7 +294,10 @@ class QueueFlow:
         wait_secs: int = 20,
         stop: Optional["threading.Event"] = None,
         on_error: Optional[Callable[[Exception], None]] = None,
-    ) -> None:
+        concurrency: int = 1,
+        poll_wait_secs: int = 5,
+        drain_timeout: float = 30.0,
+    ) -> WorkerRunResult:
         """Run a worker loop: lease jobs from ``queue``, dispatch to
         ``handlers`` by task name, heartbeat while a handler runs, and report
         the outcome. The engine owns retries, backoff, the dead-letter queue,
@@ -214,50 +305,131 @@ class QueueFlow:
 
         Semantics (matching the Node SDK's ``qf.worker.run``):
 
-        * Delivery is **at-least-once** — make handlers idempotent.
+        * Up to ``concurrency`` handlers run at once (default 1) on a
+          ``ThreadPoolExecutor``. Each lease asks for as many jobs as there
+          are free slots, and no lease is issued while every slot is busy.
+        * Delivery is **at-least-once**: make handlers idempotent.
         * A handler returns the job's result dict (or None for ``{}``).
           Raising fails the job through the engine's retry policy; raise
           :class:`NonRetryableError` (or any exception with
           ``retryable = False``) to dead-letter immediately.
-        * Each in-flight job is heartbeated at half the lease interval. A
-          heartbeat showing the job is no longer running (cancelled mid-run,
-          or the lease was reclaimed) abandons reporting — the server owns
-          the outcome — and flips ``ctx.cancelled`` so a two-argument handler
-          ``(job, ctx)`` can stop early.
+        * Each in-flight job is heartbeated at half the lease interval by its
+          own thread. A heartbeat showing the job is no longer running
+          (cancelled mid-run, or the lease was reclaimed) abandons reporting,
+          since the server owns the outcome, and flips ``ctx.cancelled`` so a
+          two-argument handler ``(job, ctx)`` can stop early.
         * A failed *report* is never re-reported as a job failure: the lease
           expires and the engine redelivers.
         * Lease errors with HTTP 401/403 raise (a wrong or missing
           ``worker_token`` cannot heal by retrying); other lease errors go to
           ``on_error`` (or a throttled log) with a 1s backoff.
 
-        Blocks until ``stop`` (a ``threading.Event``) is set.
+        Stopping: set ``stop`` (a ``threading.Event``). The generated urllib3
+        client cannot cancel an in-flight long poll, so while ``stop`` is
+        provided each lease waits at most ``poll_wait_secs`` (default 5,
+        never more than ``wait_secs``), which bounds stop latency to about
+        that long. Without ``stop`` the full ``wait_secs`` long poll is used.
+        After the loop exits, in-flight handlers get up to ``drain_timeout``
+        seconds (default 30) to finish and report. Handlers still running
+        afterwards are abandoned: their ``ctx.cancelled`` flips, nothing is
+        reported for them (the lease expires and the server redelivers), and
+        they are listed in the returned :class:`WorkerRunResult`. Python
+        cannot kill a thread, so an abandoned handler keeps its pool thread
+        until it returns; long handlers should check ``ctx.cancelled``.
+
+        Each lease call carries its own request timeout of the effective
+        wait plus 35 seconds, independent of the client-wide ``timeout``.
         """
-        _logger.info("worker leasing %r (tasks: %s)", queue, ", ".join(sorted(handlers)))
+        if concurrency < 1:
+            raise ValueError("concurrency must be >= 1")
+        effective_wait = min(wait_secs, poll_wait_secs) if stop is not None else wait_secs
+        _logger.info(
+            "worker leasing %r with concurrency %d (tasks: %s)",
+            queue,
+            concurrency,
+            ", ".join(sorted(handlers)),
+        )
+        pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="queueflow-worker")
+        in_flight: Dict[Future, _InFlight] = {}
+        lock = threading.Lock()
+        slot_freed = threading.Event()
         failures = 0
-        while stop is None or not stop.is_set():
-            try:
-                leased = self.worker.lease_jobs(
-                    queue,
-                    LeaseJobsRequest(max_jobs=1, lease_secs=lease_secs, wait_secs=wait_secs),
-                ).jobs
-                failures = 0
-            except ApiException as err:
-                if err.status in (401, 403):
-                    raise
-                failures += 1
-                self._lease_failed(err, failures, on_error)
-                if self._sleep_interruptibly(1.0, stop):
-                    break
-                continue
-            except Exception as err:  # noqa: BLE001 - transport-level failure
-                failures += 1
-                self._lease_failed(err, failures, on_error)
-                if self._sleep_interruptibly(1.0, stop):
-                    break
-                continue
-            for lease in leased:
-                self._run_one(lease, handlers, lease_secs)
-        _logger.info("worker stopped")
+        fatal: Optional[BaseException] = None
+
+        def release(fut: Future) -> None:
+            with lock:
+                in_flight.pop(fut, None)
+            slot_freed.set()
+
+        try:
+            while stop is None or not stop.is_set():
+                with lock:
+                    free = concurrency - len(in_flight)
+                if free <= 0:
+                    # Every slot is busy: no lease until a handler settles. The
+                    # bounded wait keeps ``stop`` responsive.
+                    slot_freed.wait(0.5)
+                    slot_freed.clear()
+                    continue
+                try:
+                    leased = self.worker.lease_jobs(
+                        queue,
+                        # The server caps max_jobs at 100 per call.
+                        LeaseJobsRequest(
+                            max_jobs=min(free, 100), lease_secs=lease_secs, wait_secs=effective_wait
+                        ),
+                        _request_timeout=float(effective_wait + 35),
+                    ).jobs
+                    failures = 0
+                except ApiException as err:
+                    if err.status in (401, 403):
+                        fatal = err
+                        break
+                    failures += 1
+                    self._lease_failed(err, failures, on_error)
+                    if self._sleep_interruptibly(1.0, stop):
+                        break
+                    continue
+                except Exception as err:  # noqa: BLE001 - transport-level failure
+                    failures += 1
+                    self._lease_failed(err, failures, on_error)
+                    if self._sleep_interruptibly(1.0, stop):
+                        break
+                    continue
+                for lease in leased:
+                    entry = _InFlight(lease)
+                    with lock:
+                        fut = pool.submit(self._run_one, entry, handlers, lease_secs)
+                        in_flight[fut] = entry
+                    fut.add_done_callback(release)
+        finally:
+            unfinished = self._drain(in_flight, lock, drain_timeout)
+            pool.shutdown(wait=False)
+        if fatal is not None:
+            raise fatal
+        _logger.info("worker stopped (%d unfinished)", len(unfinished))
+        return WorkerRunResult(unfinished)
+
+    @staticmethod
+    def _drain(in_flight: Dict[Future, _InFlight], lock: "threading.Lock", drain_timeout: float) -> List[Job]:
+        """Wait up to ``drain_timeout`` for in-flight handlers; abandon the rest."""
+        with lock:
+            futures = list(in_flight)
+        if not futures:
+            return []
+        _logger.info("draining %d in-flight job(s) for up to %.1fs", len(futures), drain_timeout)
+        _, not_done = wait(futures, timeout=max(0.0, drain_timeout))
+        with lock:
+            left = [in_flight[f] for f in not_done if f in in_flight]
+        for entry in left:
+            entry.abandon()
+        if left:
+            _logger.warning(
+                "gave up on %d job(s) still running after %.1fs; their leases will expire and the engine redelivers",
+                len(left),
+                drain_timeout,
+            )
+        return [entry.lease.job for entry in left]
 
     def _lease_failed(self, err, failures, on_error) -> None:
         if on_error is not None:
@@ -273,7 +445,8 @@ class QueueFlow:
             return False
         return stop.wait(seconds)
 
-    def _run_one(self, lease, handlers, lease_secs: int) -> None:
+    def _run_one(self, entry: _InFlight, handlers, lease_secs: int) -> None:
+        lease = entry.lease
         job = lease.job
         handler = handlers.get(job.task_name)
         if handler is None:
@@ -287,8 +460,8 @@ class QueueFlow:
             )
             return
 
-        ctx = WorkerContext()
-        hb_done = threading.Event()
+        ctx = entry.ctx
+        hb_done = entry.hb_done
         hb = threading.Thread(
             target=self._heartbeat_loop,
             args=(job.id, lease.lease_token, lease_secs, ctx, hb_done),
@@ -309,7 +482,7 @@ class QueueFlow:
             hb.join(timeout=5)
 
         if ctx.cancelled:
-            return  # the server owns the outcome
+            return  # the server owns the outcome (lease lost, or abandoned by the drain)
 
         if outcome_error is None:
             self._report(job.id, CompleteJobRequest(lease_token=lease.lease_token, result=result))
