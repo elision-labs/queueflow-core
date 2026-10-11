@@ -9,7 +9,7 @@
 
 image:
   repository: ghcr.io/elision-labs/queueflow
-  # Defaults to the chart's appVersion. Published tags: 0.2.0, 0.2, latest
+  # Defaults to the chart's appVersion. Published tags: 0.5.0, 0.5, latest
   # (linux/amd64 and linux/arm64).
   tag: ""
   pullPolicy: IfNotPresent

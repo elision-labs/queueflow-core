@@ -4,7 +4,7 @@
 
 - a Render Postgres instance `queueflow-db` (PostgreSQL 16), and
 - a web service `queueflow` running the prebuilt image
-  `ghcr.io/elision-labs/queueflow:0.2` in `--mode all`, with `/health` as the
+  `ghcr.io/elision-labs/queueflow:0.5` in `--mode all`, with `/health` as the
   health check.
 
 Field names were checked against the Blueprint spec
@@ -38,7 +38,7 @@ in the Dashboard.
 
 | Key | Value | Why |
 | --- | --- | --- |
-| `runtime: image`, `image.url` | `ghcr.io/elision-labs/queueflow:0.2` | Prebuilt, public image; no build. Pin to `0.2.0` for an exact version. |
+| `runtime: image`, `image.url` | `ghcr.io/elision-labs/queueflow:0.5` | Prebuilt, public image; no build. Pin to `0.5.0` for an exact version. |
 | `healthCheckPath` | `/health` | 200 only when the process can reach Postgres. No token needed. |
 | `PORT`, `QUEUEFLOW_API_PORT` | `8000` | Render routes traffic to the port in `PORT`; QueueFlow listens on `QUEUEFLOW_API_PORT`. Both pinned so they agree. |
 | `QUEUEFLOW_MODE` | `all` | API + in-process workers + janitor + cron in one process. |

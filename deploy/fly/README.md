@@ -1,6 +1,6 @@
 # QueueFlow on Fly.io
 
-Deploys the prebuilt image `ghcr.io/elision-labs/queueflow:0.2` as one Fly app
+Deploys the prebuilt image `ghcr.io/elision-labs/queueflow:0.5` as one Fly app
 in `--mode all` (API + in-process workers + janitor + cron) with Fly Managed
 Postgres. No Dockerfile or build step.
 
