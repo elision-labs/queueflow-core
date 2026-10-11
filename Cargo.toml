@@ -50,7 +50,7 @@ axum = "0.8"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
-utoipa = { version = "5", features = ["axum_extras", "chrono", "yaml"] }
+utoipa = { version = "6", features = ["axum_extras", "chrono", "yaml"] }
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.10"
 reqwest = { version = "0.13", features = ["json", "query"] }
