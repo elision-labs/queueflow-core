@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use queueflow_api::auth::AuthConfig;
 use queueflow_api::{build_router, ApiState};
-use queueflow_client::{Client, CreateJobOptions, ListQuery};
+use queueflow_client::{
+    CancelJobsFilter, Client, CreateJobOptions, ListQuery, ReplayDeadLettersFilter,
+};
 use queueflow_core::{Engine, InMemoryJobStore, JobStatus, Map, SystemClock};
 
 /// Start an API server on an ephemeral port; returns a connected client.
@@ -269,4 +271,101 @@ async fn dead_letters_are_listable_and_replayable() {
     assert_eq!(leases[0].job.id, new_id);
     let err = client.replay_dead_letter(dl.id).await.unwrap_err();
     assert_eq!(err.status(), Some(409));
+}
+
+#[tokio::test]
+async fn queues_are_listed_paused_and_resumed() {
+    let client = start_server().await;
+    client
+        .create_job(
+            "t",
+            Map::new(),
+            CreateJobOptions {
+                queue: Some("images".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let paused = client.pause_queue("images").await.unwrap();
+    assert!(paused.paused);
+    assert_eq!(paused.pending, 1);
+    assert_eq!(paused.running, 0);
+    // Paused: a worker leases nothing.
+    assert!(client
+        .lease_jobs("images", 1, 30, 0)
+        .await
+        .unwrap()
+        .is_empty());
+    let queues = client.list_queues().await.unwrap();
+    let images = queues.iter().find(|q| q.queue == "images").unwrap();
+    assert!(images.paused);
+
+    let resumed = client.resume_queue("images").await.unwrap();
+    assert!(!resumed.paused);
+    assert_eq!(
+        client.lease_jobs("images", 1, 30, 0).await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn bulk_cancel_and_bulk_replay() {
+    let client = start_server().await;
+    for task in ["a", "a", "b"] {
+        client
+            .create_job(task, Map::new(), CreateJobOptions::default())
+            .await
+            .unwrap();
+    }
+    let n = client
+        .cancel_jobs(&CancelJobsFilter {
+            task_name: Some("a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
+    let left = client
+        .list_jobs(&ListQuery {
+            status: Some("pending".into()),
+            task_name: Some("b".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(left.jobs.len(), 1);
+
+    // Dead-letter the remaining job through the worker protocol, then
+    // replay everything in one call.
+    let leases = client.lease_jobs("default", 1, 30, 0).await.unwrap();
+    client.fail_job(&leases[0], "no good", false).await.unwrap();
+    let results = client
+        .replay_dead_letters(&ReplayDeadLettersFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].job_id.is_some());
+    assert!(client
+        .replay_dead_letters(&ReplayDeadLettersFilter::default())
+        .await
+        .unwrap()
+        .is_empty());
+    let replayed = client
+        .list_dead_letters(&ListQuery {
+            replayed: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(replayed.dead_letters.len(), 1);
+}
+
+#[tokio::test]
+async fn whoami_reports_the_dev_tenant() {
+    let client = start_server().await;
+    let me = client.whoami().await.unwrap();
+    assert_eq!(me.tenant, "tenant1");
+    assert_eq!(me.access, "read_write");
 }

@@ -27,8 +27,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Workflow(cmd) => client_cmds::workflow(cmd).await,
         Command::Dlq(cmd) => client_cmds::dlq(cmd).await,
         Command::Cron(cmd) => client_cmds::cron(cmd).await,
+        Command::Queue(cmd) => client_cmds::queue(cmd).await,
         Command::Tasks(args) => client_cmds::tasks(args).await,
         Command::Stats(args) => client_cmds::stats(args).await,
+        Command::Whoami(args) => client_cmds::whoami(args).await,
     }
 }
 

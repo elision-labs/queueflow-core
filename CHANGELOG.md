@@ -10,8 +10,57 @@ versions may contain breaking changes, which are called out explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **Queue registry and per-tenant pause.** The engine records every
+  (tenant, queue) it enqueues to in `queueflow.queues`, so
+  `GET /api/v1/queues` now lists a queue that is currently empty, each
+  entry carrying a `paused` flag. `POST /api/v1/queues/{queue}/pause` stops
+  claims of the caller's jobs on that queue (pending jobs wait, running
+  jobs finish; the response reports `running`, so a queue is drained once
+  it reaches zero) and `.../resume` restarts them and wakes parked workers.
+  Pausing is per tenant: other tenants' jobs on the same queue are
+  unaffected. Metrics gain `queueflow_queue_paused{queue}`.
+- **Bulk operations.** `POST /api/v1/jobs/cancel` cancels every
+  non-terminal job matching a filter (queue, task, non-terminal status,
+  creation window; oldest first, up to `limit`, capped by `--max-batch`)
+  in one statement on Postgres. `POST /api/v1/dlq/replay` replays every
+  unreplayed dead letter matching a filter and reports the outcome per
+  entry.
+- **`GET /api/v1/whoami`** returns the tenant and access level
+  (`read_write` or `read_only`) of the bearer token.
+- **Filters.** `GET /api/v1/jobs?task_name=` and, on `GET /api/v1/dlq`,
+  `task_name=` and `replayed=true|false`.
+- **Dashboard actions.** With a read-write token the dashboard offers
+  cancel (job, workflow, and every job matching the list's filter), replay
+  (dead letters), and pause/resume (queues and cron schedules), each
+  behind a confirmation. Read-only tokens see the same pages without the
+  buttons; the header shows the tenant and access level. The jobs list
+  gains a task filter.
+- **Batch claiming.** The in-process worker pool is now one dispatcher per
+  queue that claims for every idle worker in a single query, instead of
+  one claim query per worker. `--claim-batch` (`QUEUEFLOW_CLAIM_BATCH`)
+  caps how many jobs one claim takes; `0`, the default, means up to
+  `--workers`. Library users: `EngineBuilder::claim_batch`.
+- Library users: `JobStore` gains `cancel_jobs_matching`,
+  `register_queue`, `set_queue_paused` and `list_registered_queues`;
+  `ListFilter` gains `task_name` and `replayed`; `QueueStats` gains
+  `paused`; `Engine` gains `pause_queue`, `resume_queue`, `cancel_jobs`
+  and `replay_dead_letters`; `JobApi` mirrors them.
+
 ### Changed
 
+- **Migration 0006** adds the queue registry, `CHECK` constraints on every
+  status column (and `on_failure`), per-tenant listing indexes
+  (`idx_jobs_tenant_created`, `idx_workflows_tenant_created`, replacing
+  the bare tenant indexes), expression indexes for the retention purge
+  (`idx_jobs_purge`, `idx_workflows_purge`), and drops the redundant
+  `idx_jobs_status` and `idx_jobs_queue`. The index builds are plain
+  (transactional) and briefly block writes on large tables; run
+  `queueflow migrate` from one place before rolling the fleet, or build
+  the new indexes by hand with `CONCURRENTLY` first (the migration's
+  `IF NOT EXISTS` statements then no-op). The file explains why
+  `CONCURRENTLY` cannot be used from auto-migrate.
 - utoipa 6 generates the OpenAPI document. The only change to the
   published spec is the member order inside nullable `oneOf` schemas,
   which generators treat identically.

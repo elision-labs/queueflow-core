@@ -36,10 +36,37 @@ pub enum Command {
     /// Manage recurring enqueues (cron schedules, UTC) on a running server.
     #[command(subcommand)]
     Cron(CronCommand),
+    /// List queues and pause or resume claims on them.
+    #[command(subcommand)]
+    Queue(QueueCommand),
     /// List the task handlers registered in the server.
     Tasks(ClientArgs),
     /// Show the server's engine counters.
     Stats(ClientArgs),
+    /// Show the tenant and access level of the token.
+    Whoami(ClientArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum QueueCommand {
+    /// List the tenant's queues with their backlog and paused flag.
+    List {
+        #[command(flatten)]
+        client: ClientArgs,
+    },
+    /// Stop claims of the tenant's jobs on a queue; running jobs finish.
+    /// Prints the queue's live counts (drained once `running` is 0).
+    Pause {
+        #[command(flatten)]
+        client: ClientArgs,
+        name: String,
+    },
+    /// Resume claims on a paused queue.
+    Resume {
+        #[command(flatten)]
+        client: ClientArgs,
+        name: String,
+    },
 }
 
 /// How to reach a running QueueFlow server.
@@ -101,6 +128,9 @@ pub enum JobCommand {
         status: Option<String>,
         #[arg(long)]
         queue: Option<String>,
+        /// Only jobs for this task.
+        #[arg(long)]
+        task: Option<String>,
         #[arg(long)]
         limit: Option<i64>,
         #[arg(long)]
@@ -108,6 +138,24 @@ pub enum JobCommand {
         /// Also compute the exact total (extra count query server-side).
         #[arg(long)]
         include_total: bool,
+    },
+    /// Cancel every non-terminal job matching the filters, oldest first,
+    /// up to --limit; prints how many were cancelled.
+    CancelMany {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long)]
+        task: Option<String>,
+        /// pending, retrying or running (all three when omitted).
+        #[arg(long)]
+        status: Option<String>,
+        /// RFC 3339; only jobs created before this instant.
+        #[arg(long)]
+        created_before: Option<chrono::DateTime<chrono::Utc>>,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
     },
     /// Cancel a job (409 if it already finished).
     Cancel {
@@ -195,6 +243,18 @@ pub enum DlqCommand {
         #[command(flatten)]
         client: ClientArgs,
         id: i64,
+    },
+    /// Replay every unreplayed dead letter matching the filters, oldest
+    /// first, up to --limit; prints one outcome per entry.
+    ReplayMany {
+        #[command(flatten)]
+        client: ClientArgs,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
     },
 }
 

@@ -230,10 +230,12 @@ curl -s http://localhost:9090/metrics
 | --- | --- |
 | `POST /api/v1/jobs` | Enqueue a job (send `Idempotency-Key` to make retries safe) |
 | `POST /api/v1/jobs/batch` | Enqueue up to 1000 jobs in one round trip |
-| `GET /api/v1/jobs` | List jobs (filter by status/queue, paginate; `include_total=true` for exact counts) |
+| `GET /api/v1/jobs` | List jobs (filter by status/queue/task, paginate; `include_total=true` for exact counts) |
 | `GET /api/v1/jobs/{id}` | Fetch a job |
 | `GET /api/v1/jobs/{id}/events` | Server-Sent Events stream of status changes until terminal |
 | `POST /api/v1/jobs/{id}/cancel` | Cancel a job (409 if already finished) |
+| `POST /api/v1/jobs/cancel` | Cancel every non-terminal job matching a filter (queue, task, status, time window; bounded) |
+| `GET /api/v1/queues` · `POST .../{queue}/pause` · `/resume` | Per-queue backlog and `paused` flag · pause / resume claims of your jobs on a queue |
 | `POST /api/v1/queues/{queue}/lease` | Worker protocol: lease jobs (long-poll supported) |
 | `POST /api/v1/jobs/{id}/heartbeat` · `/complete` · `/fail` | Worker protocol: extend lease · report outcome |
 | `POST /api/v1/workflows` | Create a workflow |
@@ -242,18 +244,20 @@ curl -s http://localhost:9090/metrics
 | `DELETE /api/v1/cron/{id}` · `POST .../pause` · `POST .../resume` | Delete / pause / resume a schedule |
 | `GET /api/v1/dlq` · `/{id}` | List / inspect dead-lettered jobs |
 | `POST /api/v1/dlq/{id}/replay` | Replay a dead letter as a fresh job (once per entry) |
-| `GET /api/v1/tasks` · `/stats` | Registered handlers · engine counters (process-local) |
+| `POST /api/v1/dlq/replay` | Replay every unreplayed dead letter matching a filter |
+| `GET /api/v1/tasks` · `/stats` · `/whoami` | Registered handlers · tenant counts · the token's tenant and access level |
 | `GET /health` · `/ready` · `/docs` · `/openapi.json` | Probes · Swagger UI · spec |
-| `GET /ui/` | Read-only web dashboard (see [Dashboard](#dashboard)) |
+| `GET /ui/` | Web dashboard (see [Dashboard](#dashboard)) |
 
 ### Dashboard
 
-The server ships a read-only dashboard at `http://<host>:8000/ui/` (the same port as the API).
-It shows, for one tenant:
+The server ships a dashboard at `http://<host>:8000/ui/` (the same port as the API). It shows,
+for one tenant:
 
-- **Overview**: live per-queue backlog (pending, scheduled, running, age of the oldest claimable
-  job) refreshed every 5 seconds, plus the durable totals from `/api/v1/stats`.
-- **Jobs**: filter by status, queue, and creation time; page with the API's keyset cursor; a job
+- **Overview**: every queue the tenant has used, with its live backlog (pending, scheduled,
+  running, age of the oldest claimable job) and paused state, refreshed every 5 seconds, plus the
+  durable totals from `/api/v1/stats`.
+- **Jobs**: filter by status, queue, task, and creation time; page with the API's keyset cursor; a job
   page with timeline, config, payload, result, and error, following a running job live over the
   `/events` SSE stream (falling back to polling).
 - **Workflows**: list by status; a workflow page with the dependency graph, each step coloured by
@@ -264,7 +268,10 @@ The dashboard asks for a **tenant token** (an API key or JWT, or any non-empty v
 `--dev`), keeps it in the tab's session storage, and sends it on every `/api/v1` request. The
 worker token (`--worker-token`) authenticates only the worker protocol and will not open the
 dashboard. The static files under `/ui/` are embedded in the binary and need no credentials; they
-contain no data. The dashboard performs no actions (no cancel, replay, pause, or create).
+contain no data. With a read-write token the dashboard also offers cancel (a job, a workflow, or
+every job matching the list's filter), replay (dead letters), and pause/resume (queues and cron
+schedules), each behind a confirmation; a read-only key (`token:tenant:ro`) sees the same pages
+without the buttons. The dashboard never creates jobs.
 
 One external dependency: the workflow graph is drawn with [Mermaid](https://mermaid.js.org),
 loaded from `cdn.jsdelivr.net` only when a workflow page is opened. On an air-gapped network the
@@ -437,8 +444,10 @@ Contributions welcome — these are the planned next steps, roughly in priority 
       (see [`PUBLISHING.md`](./PUBLISHING.md)).
 - [x] **Deploy surface** — `docker-compose.yml`, a Helm chart, Fly.io / Render / Railway configs, a
       Homebrew formula, and a Grafana dashboard under [`deploy/`](./deploy/README.md).
-- [x] **Web dashboard**: read-only queues, jobs, workflow DAGs, DLQ, cron, and tasks at `/ui/`.
-      Next: actions (cancel, replay, pause/resume) behind a confirmation.
+- [x] **Web dashboard**: queues, jobs, workflow DAGs, DLQ, cron, and tasks at `/ui/`, with
+      cancel, replay, and pause/resume actions behind a confirmation for read-write tokens.
+- [x] **Queue control and bulk admin** — per-tenant queue pause/resume (and drain), bulk cancel
+      by filter, bulk dead-letter replay, and a queue registry so empty queues stay listed.
 
 ## Contributing
 

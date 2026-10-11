@@ -5,10 +5,12 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use queueflow_client::{Client, CreateJobOptions, ListQuery};
+use queueflow_client::{
+    CancelJobsFilter, Client, CreateJobOptions, ListQuery, ReplayDeadLettersFilter,
+};
 use queueflow_core::{CreateWorkflowRequest, Map};
 
-use crate::cli::{ClientArgs, CronCommand, DlqCommand, JobCommand, WorkflowCommand};
+use crate::cli::{ClientArgs, CronCommand, DlqCommand, JobCommand, QueueCommand, WorkflowCommand};
 
 fn client(args: &ClientArgs) -> Client {
     Client::new(&args.server_url, &args.token)
@@ -65,6 +67,7 @@ pub async fn job(cmd: JobCommand) -> anyhow::Result<()> {
             client: args,
             status,
             queue,
+            task,
             limit,
             offset,
             include_total,
@@ -73,6 +76,7 @@ pub async fn job(cmd: JobCommand) -> anyhow::Result<()> {
                 .list_jobs(&ListQuery {
                     status,
                     queue,
+                    task_name: task,
                     limit,
                     offset,
                     include_total,
@@ -84,6 +88,26 @@ pub async fn job(cmd: JobCommand) -> anyhow::Result<()> {
                 "has_more": page.has_more,
                 "total": page.total,
             }))
+        }
+        JobCommand::CancelMany {
+            client: args,
+            queue,
+            task,
+            status,
+            created_before,
+            limit,
+        } => {
+            let cancelled = client(&args)
+                .cancel_jobs(&CancelJobsFilter {
+                    queue,
+                    task_name: task,
+                    status,
+                    created_before,
+                    limit: Some(limit),
+                    ..Default::default()
+                })
+                .await?;
+            print_json(&serde_json::json!({ "cancelled": cancelled }))
         }
         JobCommand::Cancel { client: args, id } => {
             client(&args).cancel_job(&id).await?;
@@ -188,7 +212,42 @@ pub async fn dlq(cmd: DlqCommand) -> anyhow::Result<()> {
             let job_id = client(&args).replay_dead_letter(id).await?;
             print_json(&serde_json::json!({ "job_id": job_id }))
         }
+        DlqCommand::ReplayMany {
+            client: args,
+            queue,
+            task,
+            limit,
+        } => {
+            let results = client(&args)
+                .replay_dead_letters(&ReplayDeadLettersFilter {
+                    queue,
+                    task_name: task,
+                    limit: Some(limit),
+                    ..Default::default()
+                })
+                .await?;
+            let replayed = results.iter().filter(|r| r.job_id.is_some()).count();
+            print_json(&serde_json::json!({ "replayed": replayed, "results": results }))
+        }
     }
+}
+
+pub async fn queue(cmd: QueueCommand) -> anyhow::Result<()> {
+    match cmd {
+        QueueCommand::List { client: args } => {
+            print_json(&serde_json::json!({ "queues": client(&args).list_queues().await? }))
+        }
+        QueueCommand::Pause { client: args, name } => {
+            print_json(&client(&args).pause_queue(&name).await?)
+        }
+        QueueCommand::Resume { client: args, name } => {
+            print_json(&client(&args).resume_queue(&name).await?)
+        }
+    }
+}
+
+pub async fn whoami(args: ClientArgs) -> anyhow::Result<()> {
+    print_json(&client(&args).whoami().await?)
 }
 
 pub async fn cron(cmd: CronCommand) -> anyhow::Result<()> {

@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 // so depending on queueflow-core directly is optional.
 pub use queueflow_core::{
     BackoffStrategy, CreateCronRequest, CreateWorkflowRequest, CronSchedule, DeadLetter,
-    HandlerError, Job, JobConfig, JobStatus, LeasedJob, Map, OnFailure, StatsSnapshot, Workflow,
-    WorkflowStatus, WorkflowStep,
+    HandlerError, Job, JobConfig, JobStatus, LeasedJob, Map, OnFailure, QueueStats, StatsSnapshot,
+    Workflow, WorkflowStatus, WorkflowStep,
 };
 
 /// Errors returned by [`Client`] calls.
@@ -95,6 +95,78 @@ pub struct ListQuery {
     pub created_after: Option<chrono::DateTime<chrono::Utc>>,
     /// Only rows created strictly before this instant (exclusive).
     pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// Only jobs or dead letters for this task (since 0.5.0).
+    pub task_name: Option<String>,
+    /// Dead letters only (since 0.5.0): `Some(false)` lists entries not yet
+    /// replayed, `Some(true)` the replayed ones.
+    pub replayed: Option<bool>,
+}
+
+/// Which jobs [`Client::cancel_jobs`] applies to. Every field is optional;
+/// the default cancels the oldest non-terminal jobs of the tenant up to the
+/// server's default limit (100).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CancelJobsFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_name: Option<String>,
+    /// `pending`, `retrying` or `running`; all three when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// At most this many, oldest first (capped by the server's `--max-batch`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+}
+
+/// Which dead letters [`Client::replay_dead_letters`] applies to; only
+/// unreplayed entries are ever considered.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ReplayDeadLettersFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+}
+
+/// One dead letter's outcome in [`Client::replay_dead_letters`].
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplayedDeadLetter {
+    pub dead_letter_id: i64,
+    /// The fresh job, when the replay succeeded.
+    #[serde(default)]
+    pub job_id: Option<String>,
+    /// Why it did not (for example the original job was purged).
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The queue's state after [`Client::pause_queue`] or
+/// [`Client::resume_queue`]: a paused queue is drained once `running` is 0.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct QueueControl {
+    pub queue: String,
+    pub paused: bool,
+    pub running: u64,
+    pub pending: u64,
+}
+
+/// The token's identity as the server resolved it ([`Client::whoami`]).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WhoAmI {
+    pub tenant: String,
+    /// `read_write` or `read_only`.
+    pub access: String,
 }
 
 /// One page of jobs or workflows.
@@ -194,6 +266,21 @@ struct WorkflowDiagramResponse {
 #[derive(Deserialize)]
 struct TasksResponse {
     tasks: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct QueuesResponse {
+    queues: Vec<QueueStats>,
+}
+
+#[derive(Deserialize)]
+struct CancelJobsResponse {
+    cancelled: u64,
+}
+
+#[derive(Deserialize)]
+struct ReplayDeadLettersResponse {
+    results: Vec<ReplayedDeadLetter>,
 }
 
 #[derive(Deserialize)]
@@ -401,6 +488,20 @@ impl Client {
         Self::decode(req.send().await?).await
     }
 
+    /// Cancel every non-terminal job matching `filter`, oldest first, up to
+    /// its `limit`; returns how many were cancelled. Repeat until the count
+    /// drops below the limit to drain a large set.
+    pub async fn cancel_jobs(&self, filter: &CancelJobsFilter) -> Result<u64, Error> {
+        let resp: CancelJobsResponse = Self::decode(
+            self.request(reqwest::Method::POST, "/api/v1/jobs/cancel")
+                .json(filter)
+                .send()
+                .await?,
+        )
+        .await?;
+        Ok(resp.cancelled)
+    }
+
     pub async fn cancel_job(&self, id: &str) -> Result<(), Error> {
         Self::expect_no_content(
             self.request(reqwest::Method::POST, &format!("/api/v1/jobs/{id}/cancel"))
@@ -498,6 +599,22 @@ impl Client {
         )
         .await?;
         Ok(resp.job_id)
+    }
+
+    /// Replay every unreplayed dead letter matching `filter`, oldest first;
+    /// one outcome per entry considered.
+    pub async fn replay_dead_letters(
+        &self,
+        filter: &ReplayDeadLettersFilter,
+    ) -> Result<Vec<ReplayedDeadLetter>, Error> {
+        let resp: ReplayDeadLettersResponse = Self::decode(
+            self.request(reqwest::Method::POST, "/api/v1/dlq/replay")
+                .json(filter)
+                .send()
+                .await?,
+        )
+        .await?;
+        Ok(resp.results)
     }
 
     /// Stream the job's status transitions as they happen (Server-Sent
@@ -626,6 +743,55 @@ impl Client {
     pub async fn stats(&self) -> Result<StatsSnapshot, Error> {
         Self::decode(
             self.request(reqwest::Method::GET, "/api/v1/stats")
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// Every queue of the token's tenant with its live backlog and `paused`
+    /// flag (`GET /api/v1/queues`).
+    pub async fn list_queues(&self) -> Result<Vec<QueueStats>, Error> {
+        let resp: QueuesResponse = Self::decode(
+            self.request(reqwest::Method::GET, "/api/v1/queues")
+                .send()
+                .await?,
+        )
+        .await?;
+        Ok(resp.queues)
+    }
+
+    /// Stop claims of this tenant's jobs on `queue`; running jobs finish.
+    /// Idempotent. Drain by polling until the returned `running` is 0.
+    pub async fn pause_queue(&self, queue: &str) -> Result<QueueControl, Error> {
+        Self::decode(
+            self.request(
+                reqwest::Method::POST,
+                &format!("/api/v1/queues/{queue}/pause"),
+            )
+            .send()
+            .await?,
+        )
+        .await
+    }
+
+    /// Resume claims paused by [`Client::pause_queue`]. Idempotent.
+    pub async fn resume_queue(&self, queue: &str) -> Result<QueueControl, Error> {
+        Self::decode(
+            self.request(
+                reqwest::Method::POST,
+                &format!("/api/v1/queues/{queue}/resume"),
+            )
+            .send()
+            .await?,
+        )
+        .await
+    }
+
+    /// The tenant and access level the server grants this token.
+    pub async fn whoami(&self) -> Result<WhoAmI, Error> {
+        Self::decode(
+            self.request(reqwest::Method::GET, "/api/v1/whoami")
                 .send()
                 .await?,
         )
@@ -765,6 +931,12 @@ fn apply_list_query(req: reqwest::RequestBuilder, q: &ListQuery) -> reqwest::Req
     }
     if let Some(t) = &q.created_before {
         params.push(("created_before", t.to_rfc3339()));
+    }
+    if let Some(t) = &q.task_name {
+        params.push(("task_name", t.clone()));
+    }
+    if let Some(r) = q.replayed {
+        params.push(("replayed", r.to_string()));
     }
     req.query(&params)
 }
