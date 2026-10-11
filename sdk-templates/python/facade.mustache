@@ -25,6 +25,7 @@ from .api.health_api import HealthApi
 from .api.cron_api import CronApi
 from .api.dlq_api import DlqApi
 from .exceptions import ApiException
+from .models.cancel_jobs_request import CancelJobsRequest
 from .models.complete_job_request import CompleteJobRequest
 from .models.create_job_request import CreateJobRequest
 from .models.fail_job_request import FailJobRequest
@@ -33,9 +34,13 @@ from .models.lease_jobs_request import LeaseJobsRequest
 from .models.job_config_request import JobConfigRequest
 from .models.create_workflow_request import CreateWorkflowRequest
 from .models.create_cron_request import CreateCronRequest
+from .models.replay_dead_letters_request import ReplayDeadLettersRequest
 from .models.workflow_step import WorkflowStep
 from .models.job import Job
+from .models.queue_control_response import QueueControlResponse
 from .models.queue_stats import QueueStats
+from .models.replayed_dead_letter import ReplayedDeadLetter
+from .models.who_am_i_response import WhoAmIResponse
 from .models.workflow import Workflow
 
 _TERMINAL_JOB = {"completed", "failed", "cancelled"}
@@ -233,6 +238,36 @@ class QueueFlow:
         """Poll until the job reaches a terminal state (completed/failed/cancelled)."""
         return self._poll(lambda: self.jobs.get_job(job_id), _TERMINAL_JOB, job_id, "job", timeout, interval)
 
+    def cancel_jobs(
+        self,
+        queue: Optional[str] = None,
+        task_name: Optional[str] = None,
+        status: Optional[str] = None,
+        created_after: Optional[Any] = None,
+        created_before: Optional[Any] = None,
+        limit: Optional[int] = None,
+    ) -> int:
+        """Cancel this tenant's matching non-terminal jobs, oldest first, and
+        return how many were cancelled (``POST /api/v1/jobs/cancel``).
+
+        Every filter is optional and they combine: ``queue``, ``task_name``,
+        ``status`` (``pending``, ``retrying`` or ``running``; all three when
+        omitted) and the half-open window ``[created_after, created_before)``
+        (datetimes). At most ``limit`` jobs are cancelled per call (server
+        default 100); a count below ``limit`` means the matching set is
+        exhausted, so loop until then to drain a large backlog. A terminal
+        ``status`` is rejected with a 400: history is never rewritten.
+        """
+        req = CancelJobsRequest(
+            queue=queue,
+            task_name=task_name,
+            status=status,
+            created_after=created_after,
+            created_before=created_before,
+            limit=limit,
+        )
+        return self.jobs.cancel_jobs(req).cancelled
+
     # --- workflows ----------------------------------------------------------
 
     def create_workflow(self, workflow: "WorkflowBuilder | CreateWorkflowRequest") -> Workflow:
@@ -274,15 +309,71 @@ class QueueFlow:
         replayed = self.dlq.replay_dead_letter(dead_letter_id)
         return self.jobs.get_job(replayed.job_id)
 
+    def replay_dead_letters(
+        self,
+        queue: Optional[str] = None,
+        task_name: Optional[str] = None,
+        created_after: Optional[Any] = None,
+        created_before: Optional[Any] = None,
+        limit: Optional[int] = None,
+    ) -> List[ReplayedDeadLetter]:
+        """Replay every unreplayed dead letter matching the filter as a fresh
+        job, oldest first, up to ``limit`` (``POST /api/v1/dlq/replay``).
+
+        Returns one :class:`ReplayedDeadLetter` per entry considered: a
+        successful replay carries the new ``job_id``, otherwise ``error`` says
+        why (for example the original job was purged by retention). Entries
+        already replayed are never considered, so repeating the call walks a
+        large backlog; an empty list means nothing was left to replay. The
+        filters (``queue``, ``task_name`` and the half-open datetime window
+        ``[created_after, created_before)``) are optional and combine;
+        ``limit`` defaults to 100 on the server.
+        """
+        req = ReplayDeadLettersRequest(
+            queue=queue,
+            task_name=task_name,
+            created_after=created_after,
+            created_before=created_before,
+            limit=limit,
+        )
+        return self.dlq.replay_dead_letters(req).results
+
     # --- system -------------------------------------------------------------
 
     def queues(self) -> List[QueueStats]:
         """Live backlog per queue (``GET /api/v1/queues``): claimable ``pending``,
-        future-dated ``scheduled`` and ``running`` counts, plus how long the
-        oldest claimable job has waited. Queues with no non-terminal jobs are
-        omitted.
+        future-dated ``scheduled`` and ``running`` counts, how long the oldest
+        claimable job has waited, and whether the queue is ``paused`` for this
+        tenant. Lists every queue this tenant has enqueued to (server 0.5.0 and
+        later; older servers list only queues with non-terminal jobs).
         """
         return self.system.list_queues().queues
+
+    def pause_queue(self, name: str) -> QueueControlResponse:
+        """Stop workers from claiming this tenant's jobs on ``name``
+        (``POST /api/v1/queues/{queue}/pause``).
+
+        Pending jobs wait and keep accumulating; jobs already running finish,
+        so the queue is drained once the returned ``running`` count reaches
+        zero. Idempotent: pausing a paused queue is a no-op. The response
+        reports the queue's ``paused`` flag plus its ``pending`` and
+        ``running`` counts.
+        """
+        return self.system.pause_queue(name)
+
+    def resume_queue(self, name: str) -> QueueControlResponse:
+        """Let workers claim this tenant's jobs on ``name`` again
+        (``POST /api/v1/queues/{queue}/resume``). Parked workers wake
+        immediately. Idempotent.
+        """
+        return self.system.resume_queue(name)
+
+    def whoami(self) -> WhoAmIResponse:
+        """The ``tenant`` this client's token is scoped to and its ``access``
+        level, ``read_write`` or ``read_only`` (``GET /api/v1/whoami``).
+        Useful to validate a credential at startup before doing any work.
+        """
+        return self.system.who_am_i()
 
     # --- worker runtime -------------------------------------------------------
 
