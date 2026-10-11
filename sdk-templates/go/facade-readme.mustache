@@ -1,8 +1,9 @@
 # QueueFlow Go facade
 
 This package ships an ergonomic facade (`facade.go`) layered over the generated client. It is the
-recommended entry point. The generated `APIClient` and its `*APIService` groups remain available for
-anything the helpers do not cover.
+recommended entry point: one method per endpoint, `WaitForJob`/`WaitForWorkflow` pollers, a workflow
+builder with local DAG validation, typed errors, and a worker runtime (`Run`). The generated
+`APIClient` and its `*APIService` groups remain available for anything the helpers do not cover.
 
 ## Quick start
 
@@ -10,21 +11,22 @@ anything the helpers do not cover.
 package main
 
 import (
+	"context"
 	"log"
-	"time"
 
 	queueflow "{{gitHost}}/{{gitUserId}}/{{gitRepoId}}"
 )
 
 func main() {
+	ctx := context.Background()
 	qf := queueflow.NewQueueFlow("http://localhost:8000", "dev")
 
 	// Enqueue a job and wait for the result.
-	job, err := qf.CreateJob("echo", map[string]interface{}{"hello": "world"})
+	id, err := qf.CreateJob(ctx, "echo", map[string]interface{}{"hello": "world"})
 	if err != nil {
 		log.Fatal(err)
 	}
-	done, err := qf.WaitForJob(job.Id, 60*time.Second, 500*time.Millisecond)
+	done, err := qf.WaitForJob(ctx, id, queueflow.WaitOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -35,28 +37,39 @@ func main() {
 		Step("extract", "echo").
 		Step("transform", "echo", "extract").
 		Step("load", "echo", "transform")
-	wf, err := qf.CreateWorkflow(dag)
+	wfID, err := qf.CreateWorkflow(ctx, dag)
 	if err != nil {
 		log.Fatal(err)
 	}
-	finished, _ := qf.WaitForWorkflow(wf.Id, 60*time.Second, 500*time.Millisecond)
+	finished, _ := qf.WaitForWorkflow(ctx, wfID, queueflow.WaitOptions{})
 	log.Println(finished.Status)
 }
 ```
 
 ## API
 
-`NewQueueFlow(baseURL, token) *QueueFlow` exposes:
+`NewQueueFlow(baseURL, token string) *QueueFlow` and
+`NewQueueFlowWithOptions(opts Options) (*QueueFlow, error)` (`WorkerToken`, `Timeout`,
+`HTTPClient`) build a client exposing:
 
-- `.Client` — the generated `*APIClient` (`.Client.JobsAPI`, `.Client.WorkflowsAPI`, ...), for
-  anything the helpers below do not cover.
-- `CreateJob(task string, payload map[string]interface{}) (*Job, error)`
-- `WaitForJob(jobID string, timeout, interval time.Duration) (*Job, error)`
-- `CreateWorkflow(b *WorkflowBuilder) (*Workflow, error)`
-- `WaitForWorkflow(workflowID string, timeout, interval time.Duration) (*Workflow, error)`
+- `.Client` and `.WorkerClient`: the generated `*APIClient`s (tenant and worker credential).
+- Jobs: `CreateJob`, `CreateJobWithOptions`, `GetJob`, `ListJobs`, `CancelJob`, `WaitForJob`.
+- Workflows: `CreateWorkflow`, `GetWorkflow`, `ListWorkflows`, `CancelWorkflow`, `WorkflowDiagram`,
+  `WorkflowSteps`, `WaitForWorkflow`.
+- Cron: `CreateCron`, `CreateCronWithOptions`, `ListCrons`, `GetCron`, `DeleteCron`, `PauseCron`,
+  `ResumeCron`.
+- Dead letters: `ListDeadLetters`, `GetDeadLetter`, `ReplayDeadLetter`.
+- System: `Stats`, `Queues`, `Tasks`, `Health`, `Ready`.
+- Worker: `Run` (the runtime) and the raw protocol `LeaseJobs`, `HeartbeatJob`, `CompleteJob`,
+  `FailJob`.
+
+Create and replay calls return ids; get calls return records. Every method takes a
+`context.Context` first. Non-2xx responses are returned as `*APIError` (`Status`, `Body`, `Op`).
 
 `NewWorkflowBuilder(name)` builds a DAG; `Build()` validates locally (duplicate names, dangling
 dependencies, cycles) and returns an error before any network round-trip.
+
+The repository README documents each method, the worker runtime, and the error types in full.
 
 ## How this package is built
 
@@ -66,18 +79,18 @@ drift from the server. Do not edit `facade.go` directly; edit the template.
 
 ## Worker protocol notes
 
-The worker endpoints (`WorkerAPI`: lease, heartbeat, complete, fail) are exposed as raw calls;
-no worker runtime ships with this SDK. If you build one on top, three rules keep the
-at-least-once contract honest:
+`Run` implements the worker protocol (lease, heartbeat, complete, fail) for you. If you drive the
+raw calls yourself, three rules keep the at-least-once contract honest:
 
-1. Worker routes authenticate with the **worker token**, not a tenant token. Build a second
-   client for it (`NewConfiguration()` + `AddDefaultHeader("Authorization", "Bearer "+workerToken)`).
+1. Worker routes authenticate with the **worker token**, not a tenant token
+   (`Options.WorkerToken`; the facade's worker calls use `.WorkerClient`).
 2. Heartbeat every in-flight job at roughly half its lease interval. A heartbeat whose `status`
    is anything other than `running` (or an HTTP 409) means the server owns the outcome: abandon
    the handler and report nothing. Never process a leased batch sequentially without
-   heartbeating the jobs still waiting - their leases expire and the server redelivers them.
+   heartbeating the jobs still waiting; their leases expire and the server redelivers them.
 3. Delivery is at-least-once, so handlers must be idempotent. Report permanent failures with
-   `retryable: false` so they dead-letter immediately instead of burning retries.
+   `retryable: false` (`NonRetryable(err)` from a handler) so they dead-letter immediately
+   instead of burning retries.
 
 ## Known limitation: StreamJobEvents
 

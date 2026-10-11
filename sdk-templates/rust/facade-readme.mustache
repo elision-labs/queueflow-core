@@ -1,15 +1,15 @@
 # QueueFlow Rust facade
 
 This crate ships an ergonomic facade (`src/facade.rs`) layered over the generated client. It is the
-recommended entry point. The generated `apis::*` modules and `models::*` types remain available for
-anything the helpers do not cover.
+recommended entry point: one method per endpoint, `wait_for_job` / `wait_for_workflow` pollers, a
+workflow builder with local DAG validation, typed errors, and a worker runtime (`run_worker`). The
+generated `apis::*` modules and `models::*` types remain available for anything the helpers do not
+cover.
 
 ## Quick start
 
 ```rust
-use std::time::Duration;
-
-use queueflow_sdk::{QueueFlow, WorkflowBuilder};
+use queueflow_sdk::{QueueFlow, WaitOptions, WorkflowBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,10 +19,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payload = std::collections::HashMap::from([
         ("hello".to_owned(), serde_json::json!("world")),
     ]);
-    let job = qf.create_job("echo", Some(payload)).await?;
-    let done = qf
-        .wait_for_job(&job.id, Duration::from_secs(60), Duration::from_millis(500))
-        .await?;
+    let id = qf.create_job("echo", Some(payload)).await?;
+    let done = qf.wait_for_job(&id, WaitOptions::default()).await?;
     println!("job {} finished as {}", done.id, done.status);
 
     // Define and run a DAG. `build()` validates it locally (duplicate names,
@@ -31,10 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .step("extract", "extract_task", &[])
         .step("transform", "transform_task", &["extract"])
         .step("load", "load_task", &["transform"]);
-    let wf = qf.create_workflow(&builder).await?;
-    let finished = qf
-        .wait_for_workflow(&wf.id, Duration::from_secs(300), Duration::from_secs(1))
-        .await?;
+    let wf_id = qf.create_workflow(&builder).await?;
+    let finished = qf.wait_for_workflow(&wf_id, WaitOptions::default()).await?;
     println!("workflow {} finished as {}", finished.id, finished.status);
     Ok(())
 }
@@ -42,37 +38,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## What the facade adds
 
-- `QueueFlow::new(base_url, token)`: one-line client setup with bearer auth.
-- `create_job` / `create_workflow`: enqueue, then fetch and return the full record.
-- `wait_for_job` / `wait_for_workflow`: poll until a terminal status or time out.
+- `QueueFlow::new(base_url, token)` and `QueueFlow::with_options(QueueFlowOptions)`
+  (`worker_token`, `timeout`): one-line client setup with bearer auth for both credentials.
+- Jobs: `create_job`, `create_job_with_options`, `get_job`, `list_jobs`, `cancel_job`,
+  `wait_for_job`.
+- Workflows: `create_workflow`, `get_workflow`, `list_workflows`, `cancel_workflow`,
+  `workflow_diagram`, `workflow_steps`, `wait_for_workflow`.
+- Cron: `create_cron`, `create_cron_with_options`, `list_crons`, `get_cron`, `delete_cron`,
+  `pause_cron`, `resume_cron`.
+- Dead letters: `list_dead_letters`, `get_dead_letter`, `replay_dead_letter`.
+- System: `stats`, `queues`, `tasks`, `health`, `ready`.
+- Worker: `run_worker` (the runtime, stopped through `WorkerOptions::stop`) and the raw protocol
+  `lease_jobs`, `heartbeat_job`, `complete_job`, `fail_job`.
 - `WorkflowBuilder`: a typed DAG builder that rejects structurally invalid workflows before any
   network round-trip.
+- `FacadeError`: `Http { op, status, body }` for non-2xx responses, `Transport`,
+  `InvalidWorkflow`, `InvalidOptions`, `Timeout`.
 
-Everything else (leasing, heartbeats, batch enqueue, stats, diagrams) is available on the generated
-modules, e.g. `queueflow_sdk::apis::worker_api::lease_jobs(&qf.config, ...)`.
+Create and replay calls return ids; get calls return records. The repository README documents
+each method, the worker runtime, and the error types in full.
 
-## Worker protocol: use `queueflow-client` instead
+## How this crate is built
 
-If you are writing a Rust worker, prefer the first-party `queueflow-client` crate (in the
-`queueflow-core` workspace): it shares the server's own domain types and ships a worker runtime
-with automatic heartbeating, lease-loss detection, and concurrent batch processing. This crate
-exposes the raw worker endpoints only.
+The facade is injected at generation time from the queueflow-core-rs template
+(`sdk-templates/rust/facade.mustache`), so it is regenerated alongside the generated core and can
+never drift from the server. Do not edit `src/facade.rs` directly; edit the template.
 
-If you do call `worker_api` directly, three rules keep the at-least-once contract honest:
+## Worker protocol notes
 
-1. Worker routes authenticate with the **worker token**, not a tenant token. Build a second
-   `Configuration` for it:
+`run_worker` implements the worker protocol (lease, heartbeat, complete, fail) for you. If you
+drive the raw calls yourself, three rules keep the at-least-once contract honest:
 
-   ```rust
-   let mut worker_config = qf.config.clone();
-   worker_config.bearer_access_token = Some(worker_token.to_owned());
-   ```
-
+1. Worker routes authenticate with the **worker token**, not a tenant token
+   (`QueueFlowOptions::worker_token`; the facade's worker calls use `qf.worker_config`).
 2. Heartbeat every in-flight job at roughly half its lease interval. A heartbeat whose `status`
    is anything other than `running` (or an HTTP 409) means the server owns the outcome: abandon
    the handler and report nothing.
 3. Delivery is at-least-once, so handlers must be idempotent. Report permanent failures with
-   `retryable: false` so they dead-letter immediately instead of burning retries.
+   `retryable: false` (`HandlerError::non_retryable` from a handler) so they dead-letter
+   immediately instead of burning retries.
+
+The first-party `queueflow-client` crate in the queueflow-core workspace is the engine-adjacent
+alternative: it shares the server's own domain types but depends on `queueflow-core`, so it cannot
+be published standalone.
 
 ## Known limitation: `stream_job_events`
 

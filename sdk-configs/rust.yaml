@@ -25,7 +25,7 @@ files:
     templateType: SupportingFiles
 additionalProperties:
   packageName: queueflow-sdk
-  packageVersion: 0.2.1
+  packageVersion: 0.3.0
   hideGenerationTimestamp: true
   # Rendered into Cargo.toml [package] by the Cargo.mustache override.
   repositoryUrl: https://github.com/elision-labs/queueflow-sdk-rust

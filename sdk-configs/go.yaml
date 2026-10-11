@@ -22,7 +22,7 @@ files:
     templateType: SupportingFiles
 additionalProperties:
   packageName: queueflow
-  packageVersion: 0.2.0
+  packageVersion: 0.3.0
   isGoSubmodule: false
   enumClassPrefix: true
   hideGenerationTimestamp: true
