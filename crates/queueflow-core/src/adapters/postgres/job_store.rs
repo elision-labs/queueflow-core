@@ -26,12 +26,28 @@ const RETENTION_LOCK_KEY: i64 = 0x7166_6c6f_775f_7274;
 pub struct PostgresJobStore {
     pool: PgPool,
     hub: Arc<WorkHub>,
+    /// The claim statement for this store's lease grace (see
+    /// [`Self::with_lease_grace_secs`]); built once per store, not per call.
+    claim_sql: Arc<str>,
 }
 
 impl PostgresJobStore {
     pub fn new(pool: PgPool) -> Self {
         let hub = WorkHub::new(pool.clone());
-        Self { pool, hub }
+        Self {
+            pool,
+            hub,
+            claim_sql: Arc::from(claim_sql(LEASE_GRACE_SECS)),
+        }
+    }
+
+    /// Headroom added to a job's timeout when a claim covers it (default
+    /// [`LEASE_GRACE_SECS`]). Larger values tolerate slower terminal writes
+    /// after a long handler; smaller values reclaim crashed workers' jobs
+    /// sooner.
+    pub fn with_lease_grace_secs(mut self, secs: u64) -> Self {
+        self.claim_sql = Arc::from(claim_sql(secs));
+        self
     }
 
     /// Delete every job on `queue` regardless of status; returns the number
@@ -98,13 +114,13 @@ fn job_columns_prefixed(alias: &str) -> String {
         .join(", ")
 }
 
-/// The claim statement, built once: it runs on every worker poll, so the
-/// column-list formatting should not be repaid per call. SKIP LOCKED makes
-/// concurrent claimers disjoint without blocking; the CTE-then-UPDATE shape
-/// is the standard Postgres claim pattern. `$4` (cover_timeout) stretches
-/// the lease to the job's configured timeout plus grace, so local workers
-/// need no separate extension round trip.
-static CLAIM_SQL: LazyLock<String> = LazyLock::new(|| {
+/// The claim statement, built once per store: it runs on every worker poll,
+/// so the column-list formatting should not be repaid per call. SKIP LOCKED
+/// makes concurrent claimers disjoint without blocking; the CTE-then-UPDATE
+/// shape is the standard Postgres claim pattern. `$4` (cover_timeout)
+/// stretches the lease to the job's configured timeout plus `grace`, so local
+/// workers need no separate extension round trip.
+fn claim_sql(grace: u64) -> String {
     format!(
         "WITH c AS (\
              SELECT id FROM queueflow.jobs \
@@ -124,10 +140,10 @@ static CLAIM_SQL: LazyLock<String> = LazyLock::new(|| {
              delivery_count = j.delivery_count + 1 \
          FROM c WHERE j.id = c.id \
          RETURNING {cols}, j.lease_token::text AS lease_token",
-        grace = LEASE_GRACE_SECS,
+        grace = grace,
         cols = job_columns_prefixed("j")
     )
-});
+}
 
 /// The janitor's expired-lease reclaim, built once for the same reason.
 static RECLAIM_SQL: LazyLock<String> = LazyLock::new(|| {
@@ -373,7 +389,7 @@ impl JobStore for PostgresJobStore {
         // races this query either made its job visible to the claim or
         // advanced the epoch, so the caller's await_work cannot lose it.
         let epoch = self.hub.epoch(queue);
-        let rows = sqlx::query(CLAIM_SQL.as_str())
+        let rows = sqlx::query(sqlx::AssertSqlSafe(Arc::clone(&self.claim_sql)))
             .bind(queue)
             .bind(count as i64)
             .bind(lease_secs as f64)

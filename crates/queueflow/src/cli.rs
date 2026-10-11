@@ -285,6 +285,11 @@ pub struct ServeArgs {
     #[arg(long, env = "QUEUEFLOW_WORKERS", default_value_t = 10)]
     pub workers: usize,
 
+    /// Queues the in-process workers drain, comma-separated (each gets
+    /// --workers workers). Defaults to the default queue only.
+    #[arg(long, env = "QUEUEFLOW_QUEUES", value_delimiter = ',')]
+    pub queues: Vec<String>,
+
     /// Prometheus metrics port.
     #[arg(long, env = "QUEUEFLOW_METRICS_PORT", default_value_t = 9090)]
     pub metrics_port: u16,
@@ -347,6 +352,51 @@ pub struct ServeArgs {
     /// unaffected either way.
     #[arg(long, env = "QUEUEFLOW_RETENTION_HOURS")]
     pub retention_hours: Option<u64>,
+
+    /// Cadence of the retention sweep, in seconds (only used with
+    /// --retention-hours).
+    #[arg(
+        long,
+        env = "QUEUEFLOW_RETENTION_INTERVAL_SECS",
+        default_value_t = 3600
+    )]
+    pub retention_interval_secs: u64,
+
+    /// Lease taken by in-process workers when claiming a job, in seconds.
+    /// Stretched automatically to cover the job's timeout plus
+    /// --lease-grace-secs.
+    #[arg(long, env = "QUEUEFLOW_LEASE_SECS", default_value_t = 30)]
+    pub lease_secs: u32,
+
+    /// Headroom added to a job's timeout when a claim covers it, in seconds.
+    /// Larger tolerates slow terminal writes after long handlers; smaller
+    /// reclaims crashed workers' jobs sooner.
+    #[arg(long, env = "QUEUEFLOW_LEASE_GRACE_SECS", default_value_t = 30)]
+    pub lease_grace_secs: u64,
+
+    /// Upper bound on an idle worker's wait before re-checking its queue, in
+    /// seconds. NOTIFY wakes workers immediately; this only bounds a missed
+    /// notification (e.g. behind a transaction-pooling pgbouncer).
+    #[arg(long, env = "QUEUEFLOW_WORKER_POLL_SECS", default_value_t = 5)]
+    pub worker_poll_secs: u64,
+
+    /// Cadence of the janitor's expired-lease and workflow-self-heal sweeps,
+    /// in seconds.
+    #[arg(long, env = "QUEUEFLOW_JANITOR_INTERVAL_SECS", default_value_t = 5)]
+    pub janitor_interval_secs: u64,
+
+    /// Max rows the janitor handles per sweep.
+    #[arg(long, env = "QUEUEFLOW_JANITOR_BATCH", default_value_t = 100)]
+    pub janitor_batch: usize,
+
+    /// Lease taken on reclaimed jobs while they are routed through the
+    /// failure policy, in seconds.
+    #[arg(long, env = "QUEUEFLOW_RECLAIM_LEASE_SECS", default_value_t = 60)]
+    pub reclaim_lease_secs: u32,
+
+    /// Maximum jobs accepted by one POST /api/v1/jobs/batch.
+    #[arg(long, env = "QUEUEFLOW_MAX_BATCH", default_value_t = 1000)]
+    pub max_batch: usize,
 }
 
 #[derive(Args, Debug)]

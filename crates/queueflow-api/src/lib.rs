@@ -17,6 +17,9 @@ use std::sync::Arc;
 
 use queueflow_core::JobApi;
 
+/// Default cap on one batch enqueue; see [`ApiState::with_max_batch`].
+pub const DEFAULT_MAX_BATCH: usize = 1000;
+
 /// Shared application state injected into every handler.
 #[derive(Clone)]
 pub struct ApiState {
@@ -30,6 +33,8 @@ pub struct ApiState {
     /// Origins allowed by CORS. Empty = permissive (the development
     /// default); set via [`ApiState::with_cors_origins`] to restrict.
     pub cors_origins: Arc<Vec<String>>,
+    /// Maximum jobs accepted by one `POST /api/v1/jobs/batch` (default 1000).
+    pub max_batch: usize,
 }
 
 impl ApiState {
@@ -38,7 +43,14 @@ impl ApiState {
             engine,
             auth: Arc::new(auth::AuthConfig::default().into()),
             cors_origins: Arc::new(Vec::new()),
+            max_batch: DEFAULT_MAX_BATCH,
         }
+    }
+
+    /// Cap the batch-enqueue size (default [`DEFAULT_MAX_BATCH`]).
+    pub fn with_max_batch(mut self, n: usize) -> Self {
+        self.max_batch = n.max(1);
+        self
     }
 
     /// Replace the whole authentication configuration.

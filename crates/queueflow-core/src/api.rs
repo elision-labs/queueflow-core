@@ -13,7 +13,7 @@ use crate::domain::*;
 use crate::engine::{BatchItem, Engine, EnqueueOptions};
 use crate::error::EngineError;
 use crate::ports::{JobStore, ListFilter, Page, StepRecord};
-use crate::stats::{QueueStats, StatsSnapshot};
+use crate::stats::{LatencySnapshot, QueueStats, StatsSnapshot};
 
 /// The operations the HTTP API needs from the engine.
 #[async_trait]
@@ -107,6 +107,8 @@ pub trait JobApi: Send + Sync {
     /// Process-local engine counters (reset on restart, not tenant-scoped).
     /// Meant for the metrics endpoint, not for tenant-facing responses.
     fn stats(&self) -> StatsSnapshot;
+    /// Process-local latency histograms (handler duration, queue wait).
+    fn latency(&self) -> LatencySnapshot;
     /// Durable counts scoped to `tenant_id` (see
     /// [`crate::JobStore::count_stats`]); this is what `/api/v1/stats` serves.
     async fn tenant_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, EngineError>;
@@ -286,6 +288,10 @@ where
 
     fn stats(&self) -> StatsSnapshot {
         Engine::stats(self).snapshot()
+    }
+
+    fn latency(&self) -> LatencySnapshot {
+        Engine::stats(self).latency()
     }
 
     async fn tenant_stats(&self, tenant_id: Option<&str>) -> Result<StatsSnapshot, EngineError> {

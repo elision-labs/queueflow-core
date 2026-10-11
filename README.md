@@ -47,7 +47,7 @@ is generated from the code and ships with every release.
 - ⏰ **Cron schedules** — recurring enqueues from standard crontab expressions (UTC), deduplicated across servers, with pause/resume.
 - 🧪 **Built to be tested** — a ports-and-adapters core means the whole system runs in memory, deterministically, with a controllable clock.
 - 📜 **Code-generated OpenAPI** — the spec is derived from the handlers and attached to every release; generate a client for any language against it.
-- 📈 **Observable** — Prometheus metrics, structured JSON logs (`tracing`), health/readiness probes.
+- 📈 **Observable** — Prometheus metrics (per-queue backlog gauges read from the database, handler and queue-wait latency histograms, engine counters), structured JSON logs (`tracing`), health/readiness probes, and `GET /api/v1/queues` for live per-queue backlog.
 - 🛑 **Graceful shutdown** — drains in-flight work on `SIGINT`/`SIGTERM`.
 
 ## Architecture
@@ -307,6 +307,7 @@ queueflow stats
 | `--database-url` | `DATABASE_URL` | — | PostgreSQL connection string |
 | `--api-port` | `QUEUEFLOW_API_PORT` | `8000` | REST API port |
 | `--workers` | `QUEUEFLOW_WORKERS` | `10` | Workers per queue |
+| `--queues` | `QUEUEFLOW_QUEUES` | default queue | Comma-separated queues the in-process workers drain; each gets `--workers` workers |
 | `--metrics-port` | `QUEUEFLOW_METRICS_PORT` | `9090` | Prometheus port |
 | `--default-queue` | `QUEUEFLOW_DEFAULT_QUEUE` | `default` | Default queue name |
 | `--worker-token` | `QUEUEFLOW_WORKER_TOKEN` | unset | Credential required by the worker-protocol endpoints (lease/heartbeat/complete/fail). Required in `api`/`all` mode unless `--dev` |
@@ -317,6 +318,14 @@ queueflow stats
 | `--max-db-connections` | `QUEUEFLOW_MAX_DB_CONNECTIONS` | `50` | Connection pool size |
 | `--auto-migrate` | `QUEUEFLOW_AUTO_MIGRATE` | `true` | Apply migrations on startup; `--auto-migrate false` to run them separately with `queueflow migrate` |
 | `--retention-hours` | `QUEUEFLOW_RETENTION_HOURS` | unset | Delete terminal jobs/workflows/dead letters older than this. Unset keeps history forever |
+| `--retention-interval-secs` | `QUEUEFLOW_RETENTION_INTERVAL_SECS` | `3600` | Cadence of the retention sweep |
+| `--lease-secs` | `QUEUEFLOW_LEASE_SECS` | `30` | Lease taken by in-process workers on claim (stretched to cover the job timeout plus grace) |
+| `--lease-grace-secs` | `QUEUEFLOW_LEASE_GRACE_SECS` | `30` | Headroom over a job's timeout when a claim covers it |
+| `--worker-poll-secs` | `QUEUEFLOW_WORKER_POLL_SECS` | `5` | Upper bound on an idle worker's wait when a NOTIFY is missed (e.g. behind a transaction-pooling pgbouncer) |
+| `--janitor-interval-secs` | `QUEUEFLOW_JANITOR_INTERVAL_SECS` | `5` | Cadence of expired-lease reclaim and workflow self-heal |
+| `--janitor-batch` | `QUEUEFLOW_JANITOR_BATCH` | `100` | Rows per janitor sweep |
+| `--reclaim-lease-secs` | `QUEUEFLOW_RECLAIM_LEASE_SECS` | `60` | Lease on reclaimed jobs while they go through the failure policy |
+| `--max-batch` | `QUEUEFLOW_MAX_BATCH` | `1000` | Maximum jobs per `POST /api/v1/jobs/batch` |
 
 ## Testing
 

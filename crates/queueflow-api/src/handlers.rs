@@ -17,8 +17,6 @@ use crate::dto::*;
 use crate::error::ApiError;
 use crate::ApiState;
 
-const MAX_BATCH: usize = 1000;
-
 /// Fallback poll interval for the SSE job stream: status transitions arrive
 /// as push wakeups (`await_job_change`); this only bounds the staleness when
 /// a wakeup is lost (e.g. LISTEN unavailable). Also its maximum lifetime.
@@ -100,9 +98,9 @@ pub async fn create_batch_jobs(
     if req.jobs.is_empty() {
         return Err(EngineError::Validation("jobs array cannot be empty".into()).into());
     }
-    if req.jobs.len() > MAX_BATCH {
+    if req.jobs.len() > s.max_batch {
         return Err(
-            EngineError::Validation(format!("batch size cannot exceed {MAX_BATCH}")).into(),
+            EngineError::Validation(format!("batch size cannot exceed {}", s.max_batch)).into(),
         );
     }
     let jobs = req

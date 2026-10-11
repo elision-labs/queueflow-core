@@ -54,6 +54,16 @@ struct QueueSignal {
 #[derive(Clone)]
 pub struct InMemoryJobStore {
     inner: Arc<Inner>,
+    /// Headroom added to a job's timeout when a claim asks to cover it.
+    lease_grace_secs: u64,
+}
+
+impl InMemoryJobStore {
+    /// Override the lease grace (default [`LEASE_GRACE_SECS`]).
+    pub fn with_lease_grace_secs(mut self, secs: u64) -> Self {
+        self.lease_grace_secs = secs;
+        self
+    }
 }
 
 /// Lock order: when holding more than one of these mutexes, acquire them in
@@ -81,6 +91,7 @@ struct Inner {
 impl InMemoryJobStore {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
+            lease_grace_secs: LEASE_GRACE_SECS,
             inner: Arc::new(Inner {
                 clock,
                 jobs: Mutex::new(HashMap::new()),
@@ -324,8 +335,10 @@ impl JobStore for InMemoryJobStore {
             job.delivery_count += 1;
             let lease = if cover_timeout {
                 lease_secs.max(
-                    (job.config.timeout_secs.saturating_add(LEASE_GRACE_SECS)).min(u32::MAX as u64)
-                        as u32,
+                    (job.config
+                        .timeout_secs
+                        .saturating_add(self.lease_grace_secs))
+                    .min(u32::MAX as u64) as u32,
                 )
             } else {
                 lease_secs

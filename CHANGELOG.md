@@ -10,6 +10,34 @@ versions may contain breaking changes, which are called out explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- `GET /api/v1/queues`: live per-queue backlog for the caller's tenant
+  (claimable `pending`, future `scheduled`, `running`, and the age of the
+  oldest claimable job). `JobStore::queue_stats` / `JobApi::queue_stats`.
+- In-process workers can drain several queues: `--queues a,b,c`
+  (`QUEUEFLOW_QUEUES`), each with `--workers` workers.
+- Tuning flags for values that were hard-coded: `--lease-secs`,
+  `--lease-grace-secs`, `--worker-poll-secs`, `--janitor-interval-secs`,
+  `--janitor-batch`, `--reclaim-lease-secs`, `--retention-interval-secs`,
+  `--max-batch` (and matching `QUEUEFLOW_*` env vars). Library users:
+  `EngineBuilder::worker_poll_secs`, `PostgresJobStore::with_lease_grace_secs`,
+  `InMemoryJobStore::with_lease_grace_secs`, `ApiState::with_max_batch`.
+- Operator metrics on the Prometheus port: per-queue gauges read from the
+  store on each scrape (`queueflow_queue_pending_jobs`,
+  `queueflow_queue_scheduled_jobs`, `queueflow_queue_running_jobs`,
+  `queueflow_queue_oldest_pending_age_seconds`, plus `queueflow_store_up`),
+  and process-local histograms `queueflow_handler_duration_seconds` and
+  `queueflow_job_queue_wait_seconds`. `JobApi::latency`,
+  `EngineStats::latency`.
+- Release binaries for x86_64 macOS, x86_64 Linux (musl, static), aarch64
+  Linux, and x86_64 Windows, alongside the existing targets.
+
+### Changed
+
+- The multi-arch container image is built on native amd64 and arm64 runners
+  and merged into one manifest, instead of emulating arm64 under QEMU.
+
 ## [0.2.0] - 2026-10-09
 
 ### Breaking

@@ -31,16 +31,21 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         tracing::info!("migrations applied");
     }
 
-    let store = Arc::new(PostgresJobStore::new(pool));
+    let store = Arc::new(PostgresJobStore::new(pool).with_lease_grace_secs(args.lease_grace_secs));
 
     let engine = Engine::builder(store, Arc::new(SystemClock))
         .default_queue(args.default_queue.clone())
         .worker_count(args.workers)
+        .lease_secs(args.lease_secs)
+        .worker_poll_secs(args.worker_poll_secs)
         .janitor(JanitorConfig {
+            interval: Duration::from_secs(args.janitor_interval_secs.max(1)),
+            batch: args.janitor_batch.max(1),
+            reclaim_lease_secs: args.reclaim_lease_secs.max(1),
             retention: args
                 .retention_hours
                 .map(|h| Duration::from_secs(h.max(1) * 3600)),
-            ..JanitorConfig::default()
+            retention_interval: Duration::from_secs(args.retention_interval_secs.max(1)),
         })
         .register("echo", builtin::echo())
         .register("log", builtin::log())
@@ -75,22 +80,39 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         })
     };
 
-    // Workers (for `worker` and `all`). In API-only mode workers run in other
-    // processes (or as remote workers over the lease API); mark the engine
-    // running so /ready reflects this process's actual readiness instead of
-    // permanently reporting a missing local worker pool.
-    let workers = match args.mode {
+    // Workers (for `worker` and `all`): --workers tasks for every queue in
+    // --queues (default: the default queue). In API-only mode workers run in
+    // other processes (or as remote workers over the lease API); mark the
+    // engine running so /ready reflects this process's actual readiness
+    // instead of permanently reporting a missing local worker pool.
+    let queues: Vec<String> = {
+        let mut q: Vec<String> = args
+            .queues
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if q.is_empty() {
+            q.push(args.default_queue.clone());
+        }
+        q.dedup();
+        q
+    };
+    let mut workers: Vec<tokio::task::JoinSet<()>> = match args.mode {
         Mode::Api => {
             engine.mark_running();
-            None
+            Vec::new()
         }
-        _ => Some(engine.run_workers(args.default_queue.clone())),
+        _ => queues
+            .iter()
+            .map(|q| engine.run_workers(q.clone()))
+            .collect(),
     };
 
     match args.mode {
         Mode::Worker => {
-            tracing::info!(workers = args.workers, queue = %args.default_queue, "running workers");
-            if let Some(mut set) = workers {
+            tracing::info!(workers = args.workers, queues = ?queues, "running workers");
+            for set in workers.iter_mut() {
                 while set.join_next().await.is_some() {}
             }
         }
@@ -116,7 +138,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             let app = build_router(
                 ApiState::new(engine.clone())
                     .with_auth(auth)
-                    .with_cors_origins(cors_origins),
+                    .with_cors_origins(cors_origins)
+                    .with_max_batch(args.max_batch),
             );
             let listener = TcpListener::bind(("0.0.0.0", args.api_port))
                 .await
@@ -130,12 +153,12 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 .context("API server")?;
 
             // Let in-flight jobs drain (bounded).
-            if let Some(mut set) = workers {
-                let _ = tokio::time::timeout(Duration::from_secs(30), async {
+            let _ = tokio::time::timeout(Duration::from_secs(30), async {
+                for set in workers.iter_mut() {
                     while set.join_next().await.is_some() {}
-                })
-                .await;
-            }
+                }
+            })
+            .await;
         }
     }
 

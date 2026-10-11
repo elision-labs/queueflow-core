@@ -63,10 +63,10 @@ pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Upper bound on a single idle wait. NOTIFY wakes waiters instantly; this is
-/// the missed-notification safety net, so it can be generous without making
-/// idle workers chatty.
-const WORKER_POLL_SECS: u64 = 5;
+/// Default upper bound on a single idle wait. NOTIFY wakes waiters instantly;
+/// this is the missed-notification safety net, so it can be generous without
+/// making idle workers chatty. Tunable via [`EngineBuilder::worker_poll_secs`].
+pub const DEFAULT_WORKER_POLL_SECS: u64 = 5;
 
 /// The core engine, generic over the storage port.
 ///
@@ -80,6 +80,7 @@ pub struct Engine<JS> {
     default_queue: String,
     worker_count: usize,
     lease_secs: u32,
+    poll_secs: u64,
     janitor: JanitorConfig,
     stats: Arc<EngineStats>,
     shutdown: CancellationToken,
@@ -94,6 +95,7 @@ pub struct EngineBuilder<JS> {
     default_queue: String,
     worker_count: usize,
     lease_secs: u32,
+    poll_secs: u64,
     janitor: JanitorConfig,
 }
 
@@ -117,6 +119,15 @@ where
     /// automatically to cover the job's configured timeout.
     pub fn lease_secs(mut self, secs: u32) -> Self {
         self.lease_secs = secs.max(1);
+        self
+    }
+
+    /// Upper bound (seconds) on how long an idle worker parks before
+    /// re-checking its queue. NOTIFY wakes workers immediately; this only
+    /// bounds the damage of a missed notification (for example behind a
+    /// transaction-pooling pgbouncer, where LISTEN is unavailable).
+    pub fn worker_poll_secs(mut self, secs: u64) -> Self {
+        self.poll_secs = secs.max(1);
         self
     }
 
@@ -157,6 +168,7 @@ where
             default_queue: self.default_queue,
             worker_count: self.worker_count,
             lease_secs: self.lease_secs,
+            poll_secs: self.poll_secs,
             janitor: self.janitor,
             stats,
             shutdown: CancellationToken::new(),
@@ -177,6 +189,7 @@ where
             default_queue: "default".to_string(),
             worker_count: 8,
             lease_secs: 30,
+            poll_secs: DEFAULT_WORKER_POLL_SECS,
             janitor: JanitorConfig::default(),
         }
     }
@@ -723,7 +736,7 @@ where
     /// How long an idle worker should park: until the next delayed job is due,
     /// capped by the missed-NOTIFY safety window.
     fn idle_wait(&self, next_due: Option<DateTime<Utc>>) -> StdDuration {
-        let cap = StdDuration::from_secs(WORKER_POLL_SECS);
+        let cap = StdDuration::from_secs(self.poll_secs);
         match next_due {
             Some(due) => {
                 let until = (due - self.clock.now()).num_milliseconds().max(0) as u64;
@@ -775,6 +788,14 @@ where
             return;
         };
 
+        // Backlog latency: how long the job sat claimable before this worker
+        // took it. Negative only under clock skew; clamp to zero.
+        let waited = (self.clock.now() - job.scheduled_at)
+            .num_milliseconds()
+            .max(0) as f64
+            / 1000.0;
+        self.stats.queue_wait.observe(waited);
+
         let timeout = StdDuration::from_secs(job.config.timeout_secs.max(1));
         // The payload is not needed after the handler runs (the failure path
         // reads only config/counters/ids), so hand it over without cloning.
@@ -783,7 +804,11 @@ where
         // At-least-once delivery treats a panic like any other crash, so it
         // consumes retry budget and eventually dead-letters.
         let handler_fut = std::panic::AssertUnwindSafe(handler.handle(payload)).catch_unwind();
+        let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(timeout, handler_fut).await;
+        self.stats
+            .handler_duration
+            .observe(started.elapsed().as_secs_f64());
 
         match outcome {
             Ok(Err(panic)) => {

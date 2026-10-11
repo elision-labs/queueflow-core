@@ -62,12 +62,17 @@ pub use domain::{
     WorkflowStatus, WorkflowStep, CONTEXT_KEY,
 };
 pub use engine::janitor::JanitorSweepReport;
-pub use engine::{BatchItem, Engine, EngineBuilder, EnqueueOptions, JanitorConfig};
+pub use engine::{
+    BatchItem, Engine, EngineBuilder, EnqueueOptions, JanitorConfig, DEFAULT_WORKER_POLL_SECS,
+};
 pub use error::{EngineError, HandlerError};
 pub use ports::{
     Claimed, Clock, FinishedJob, JobStore, ListFilter, Page, PageCursor, StepRecord, StorageError,
 };
-pub use stats::{EngineStats, QueueStats, StatsSnapshot};
+pub use stats::{
+    EngineStats, Histogram, HistogramSnapshot, LatencySnapshot, QueueStats, StatsSnapshot,
+    LATENCY_BUCKETS_SECS,
+};
 pub use task::{handler_fn, FnHandler, TaskHandler};
 pub use workflow::{CycleError, DependencyGraph, StepBuilder, WorkflowBuilder, WorkflowScheduler};
 
