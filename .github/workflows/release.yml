@@ -77,7 +77,7 @@ jobs:
           esac
           ls -l queueflow-${{ matrix.target }}.*
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: queueflow-${{ matrix.target }}.*
 
@@ -94,7 +94,7 @@ jobs:
       - name: Generate spec from code
         run: cargo run -q -p queueflow -- spec --output-dir spec
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             spec/openapi.json
