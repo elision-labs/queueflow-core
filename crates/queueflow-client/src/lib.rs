@@ -268,6 +268,38 @@ struct TasksResponse {
     tasks: Vec<String>,
 }
 
+/// Live state of one workflow step (`GET /workflows/{id}/steps`).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkflowStepState {
+    pub name: String,
+    pub status: queueflow_core::StepStatus,
+    #[serde(default)]
+    pub job_id: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub child_workflow_id: Option<String>,
+    #[serde(default)]
+    pub fan_out: Option<FanOutProgress>,
+}
+
+/// Counts over a fan-out step's children.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct FanOutProgress {
+    pub total: u64,
+    pub completed: u64,
+    pub failed: u64,
+}
+
+#[derive(Deserialize)]
+struct WorkflowStepStatesResponse {
+    steps: Vec<WorkflowStepState>,
+}
+
 #[derive(Deserialize)]
 struct QueuesResponse {
     queues: Vec<QueueStats>,
@@ -710,6 +742,35 @@ impl Client {
             .await?,
         )
         .await
+    }
+
+    /// Re-run a failed, partially failed or cancelled workflow from its
+    /// unfinished steps (server 0.6.0). A running or completed workflow is
+    /// a 409.
+    pub async fn retry_workflow(&self, id: &str) -> Result<(), Error> {
+        Self::expect_no_content(
+            self.request(
+                reqwest::Method::POST,
+                &format!("/api/v1/workflows/{id}/retry"),
+            )
+            .send()
+            .await?,
+        )
+        .await
+    }
+
+    /// Live state of every step, in declaration order.
+    pub async fn workflow_steps(&self, id: &str) -> Result<Vec<WorkflowStepState>, Error> {
+        let resp: WorkflowStepStatesResponse = Self::decode(
+            self.request(
+                reqwest::Method::GET,
+                &format!("/api/v1/workflows/{id}/steps"),
+            )
+            .send()
+            .await?,
+        )
+        .await?;
+        Ok(resp.steps)
     }
 
     /// The workflow's DAG as a Mermaid document.

@@ -215,6 +215,19 @@ pub enum WorkflowCommand {
         client: ClientArgs,
         id: String,
     },
+    /// Re-run a failed, partially failed or cancelled workflow from its
+    /// unfinished steps.
+    Retry {
+        #[command(flatten)]
+        client: ClientArgs,
+        id: String,
+    },
+    /// Print every step's live state as JSON.
+    Steps {
+        #[command(flatten)]
+        client: ClientArgs,
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

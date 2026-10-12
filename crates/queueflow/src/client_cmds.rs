@@ -177,6 +177,13 @@ pub async fn workflow(cmd: WorkflowCommand) -> anyhow::Result<()> {
             println!("{}", client(&args).workflow_diagram(&id).await?);
             Ok(())
         }
+        WorkflowCommand::Retry { client: args, id } => {
+            client(&args).retry_workflow(&id).await?;
+            print_json(&serde_json::json!({ "retried": id }))
+        }
+        WorkflowCommand::Steps { client: args, id } => {
+            print_json(&serde_json::json!({ "steps": client(&args).workflow_steps(&id).await? }))
+        }
     }
 }
 
