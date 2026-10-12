@@ -1531,13 +1531,8 @@ func validateCondition(c *StepCondition) error {
 // false). An empty op lets the server pick the default: CONDITIONOP_EQ with a
 // value, CONDITIONOP_EXISTS without one.
 //
-// The generated StepCondition types value as a JSON object because the
-// server's spec declares it so, which means this release can only compare
-// against objects or send no value at all (as WhenExists does). Scalar and
-// array values need that spec entry widened in queueflow-core; until then a
-// workflow whose condition carries one cannot be built, or decoded by
-// GetWorkflow, through this SDK.
-func When(path string, op ConditionOp, value map[string]interface{}) *StepCondition {
+// value may be any JSON value: a number, string, bool, slice or map.
+func When(path string, op ConditionOp, value interface{}) *StepCondition {
 	c := NewStepCondition()
 	c.SetPath(path)
 	if op != "" {

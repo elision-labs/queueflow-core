@@ -737,9 +737,8 @@ class WorkflowBuilder:
           ``eq`` by default with a value, ``exists`` without); ``{"all": [..]}``,
           ``{"any": [..]}`` and ``{"not": {..}}`` combine leaves. A false
           condition skips the step with the reason ``condition not met`` and
-          its dependents still run, seeing no result for it. With this
-          release ``value`` must be a JSON object: the server's 0.6.0 spec
-          types it as ``object``, so the generated model rejects scalars.
+          its dependents still run, seeing no result for it. ``value`` may
+          be any JSON value.
         * ``fan_out``: a dict or ``models.FanOut`` (``path``, optional
           ``item_key`` and ``max_items``) that runs ``task`` once per element
           of the array at ``path`` in the context, each child getting the
@@ -880,10 +879,7 @@ class WorkflowBuilder:
         try:
             return StepCondition(**fields)
         except ValidationError as err:
-            hint = ""
-            if "value" in fields and not isinstance(fields["value"], dict):
-                hint = " (with this release a condition value must be a JSON object; see the README)"
-            raise WorkflowValidationError('step "' + step + '": when: ' + str(err) + hint) from err
+            raise WorkflowValidationError('step "' + step + '": when: ' + str(err)) from err
 
     @staticmethod
     def _fan_out(step: str, fan_out: Union[None, Dict[str, Any], FanOut]) -> Optional[FanOut]:
