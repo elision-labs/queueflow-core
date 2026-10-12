@@ -10,6 +10,65 @@ versions may contain breaking changes, which are called out explicitly.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-12
+
+### Added
+
+- **Workflows v2.**
+  - Conditional steps: `when` on a step is a JSON predicate over the workflow
+    context (`path` + `op` + `value` leaves, `all` / `any` / `not` nodes). A
+    false condition skips the step with the reason `condition not met`; its
+    dependents still run.
+  - Dynamic fan-out: `fan_out: {path, item_key?, max_items?}` runs the task
+    once per element of an array in the context as concurrent child jobs
+    (each with the element under `item_key`, its position under `_index`, and
+    `fan_out_index` / `fan_out_total` metadata), created in one atomic claim.
+    The step completes with `{"results": [...]}` in order; a failed child
+    follows the step's `on_failure` policy (halt cancels the siblings).
+  - Sub-workflows: `workflow` on a step runs an inline child workflow in the
+    same tenant, linked through `parent_workflow_id` / `parent_step_name` and
+    the step's `child_workflow_id`. The child sees the step payload and the
+    parent's context under `_parent`; its final context is the step's result.
+    Cancelling or timing out the parent cancels the child.
+  - Workflow deadlines: `timeout_secs` on the request sets `deadline_at`; the
+    janitor fails an overdue workflow (`workflow timed out after Ns`),
+    cancelling its unfinished steps.
+  - Retry: `POST /api/v1/workflows/{id}/retry` re-runs a failed, partially
+    failed or cancelled workflow from its unfinished steps, keeping completed
+    results, incrementing `retry_count` and re-arming the deadline.
+  - Per-step `queue`; step `started_at` / `completed_at` / `error`;
+    `error_message` on the workflow; `GET /api/v1/workflows/{id}/events`
+    (Server-Sent Events, driven by a new Postgres notification channel);
+    richer `GET /workflows/{id}/steps` (error, timestamps, child workflow,
+    fan-out progress); fan-out and sub-workflow shapes in the diagram.
+  - Dashboard: the workflow page shows all of the above, offers retry, and
+    follows the event stream. CLI: `workflow retry`, `workflow steps`.
+    Rust client: `retry_workflow`, `workflow_steps`. Builder:
+    `StepBuilder::{when, fan_out, sub_workflow, queue}`,
+    `WorkflowBuilder::timeout_secs`.
+  - Janitor sweeps for overdue workflows and for finished child workflows
+    whose parent step was not settled.
+
+### Changed
+
+- **Migration 0007** adds the columns above to `workflows` and
+  `workflow_steps`, two small partial indexes (`idx_workflows_deadline`,
+  `idx_workflows_parent`), and the `queueflow_workflow_events` triggers.
+  Transactional and quick: no index touches the jobs table.
+- The halt policy now records the failing step's error as the workflow's
+  `error_message`. (The docs said a step under the `skip` policy ends
+  `failed`; it has always ended `skipped`, and the docs now say so.)
+
+### Breaking
+
+- Library users: `JobStore::set_workflow_status` takes an `error` argument;
+  `JobStore` gains `create_step_jobs`, `create_child_workflow`,
+  `step_job_outcomes`, `cancel_step_jobs`, `reset_workflow_for_retry`,
+  `expired_workflows`, `stalled_child_workflows` and (with a default)
+  `await_workflow_change`; `StepRecord`, `Workflow`, `WorkflowStep` and
+  `CreateWorkflowRequest` gained fields. `JanitorSweepReport` gained
+  `timed_out_workflows` and `settled_children`.
+
 ## [0.5.0] - 2026-10-11
 
 ### Added

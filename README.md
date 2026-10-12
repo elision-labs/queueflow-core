@@ -26,7 +26,7 @@ is generated from the code and ships with every release.
 
 ## Design highlights
 
-- **Workflows as a real DAG orchestrator** — dependency gating, context propagation, per-step failure policies, cycle detection, a builder DSL, and a Mermaid diagram endpoint.
+- **Workflows as a real DAG orchestrator** — dependency gating, conditional steps, dynamic fan-out, inline sub-workflows, context propagation, per-step failure policies and queues, workflow deadlines, retry from failure, cycle detection, a builder DSL, a live event stream, and a Mermaid diagram endpoint.
 - **Thoroughly tested** — 128 tests; the entire engine, scheduler, HTTP API, and Rust client run against a deterministic in-memory adapter with **no database**, plus opt-in Postgres integration tests.
 - **Durable retries & scheduling** — a retry (or a `run_at` job) is just a row whose `scheduled_at` lies in the future, so delays survive restarts.
 - **Delivery safety** — lease tokens guard every outcome write (no stale worker can overwrite a finished or cancelled job), and a janitor reclaims expired leases through the normal retry policy, so a crashed worker consumes retry budget instead of crash-looping.
@@ -176,6 +176,13 @@ let workflow_id = engine.create_workflow(req, None).await?;
   downstream payloads under `_context`.
 - **Failure policies** — per step: `halt` (fail the workflow, cancel the rest), `skip` (skip it and its
   dependents, continue), or `continue` (leave it failed, keep going; the workflow ends `partially_failed`).
+- **Conditional steps** — `when` gates a step on the context (`{"path": "fraud.score", "op": "gt", "value": 0.8}`,
+  combinable with `all`/`any`/`not`); a false condition skips the step and its dependents still run.
+- **Fan-out** — `fan_out: {"path": "fetch.images"}` runs the task once per array element as concurrent child
+  jobs and collects their results in order.
+- **Sub-workflows** — `workflow: {...}` on a step runs an inline child workflow; its final context is the step's result.
+- **Deadlines and retries** — `timeout_secs` on the workflow fails it when the budget runs out;
+  `POST /workflows/{id}/retry` re-runs only the steps that did not complete.
 - **Cycle detection** — validated at creation; a cycle is a `400`.
 - **Diagram** — `GET /api/v1/workflows/{id}/diagram` returns a Mermaid `graph TD`:
 
@@ -239,7 +246,8 @@ curl -s http://localhost:9090/metrics
 | `POST /api/v1/queues/{queue}/lease` | Worker protocol: lease jobs (long-poll supported) |
 | `POST /api/v1/jobs/{id}/heartbeat` · `/complete` · `/fail` | Worker protocol: extend lease · report outcome |
 | `POST /api/v1/workflows` | Create a workflow |
-| `GET /api/v1/workflows` · `/{id}` · `/{id}/cancel` · `/{id}/diagram` | List / fetch / cancel / diagram |
+| `GET /api/v1/workflows` · `/{id}` · `/{id}/steps` · `/{id}/diagram` | List / fetch / live step states / diagram |
+| `POST /api/v1/workflows/{id}/cancel` · `/retry` · `GET .../events` | Cancel · retry unfinished steps · SSE stream of workflow progress |
 | `POST /api/v1/cron` · `GET /api/v1/cron` · `/{id}` | Create / list / fetch cron schedules |
 | `DELETE /api/v1/cron/{id}` · `POST .../pause` · `POST .../resume` | Delete / pause / resume a schedule |
 | `GET /api/v1/dlq` · `/{id}` | List / inspect dead-lettered jobs |
@@ -436,8 +444,9 @@ Contributions welcome — these are the planned next steps, roughly in priority 
       servers via per-firing idempotency keys, with pause/resume and catch-up-once semantics.
 - [x] **DLQ admin API** — list, inspect, and replay dead-lettered jobs (each entry replays at
       most once, as a fresh detached job).
-- [ ] **Conditional steps** — evaluate a per-step predicate before scheduling (skip when false).
-- [ ] **Sub-workflows & fan-out** — a step that spawns a child workflow or a dynamic batch.
+- [x] **Conditional steps** — `when` predicates over the context, evaluated when a step becomes ready.
+- [x] **Sub-workflows & fan-out** — inline child workflows and one-job-per-element fan-out steps, plus
+      workflow deadlines, retry from failure, per-step queues, step timestamps and a workflow event stream.
 - [ ] **OpenTelemetry** — distributed tracing export alongside the Prometheus metrics.
 - [ ] **Per-tenant rate limiting & quotas.**
 - [x] **Publish** — crates.io, GHCR image, and GitHub release binaries ship from the tag pipeline
