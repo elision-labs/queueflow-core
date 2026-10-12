@@ -54,6 +54,11 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route("/workflows/{id}", get(handlers::get_workflow))
         .route("/workflows/{id}/cancel", post(handlers::cancel_workflow))
+        .route("/workflows/{id}/retry", post(handlers::retry_workflow))
+        .route(
+            "/workflows/{id}/events",
+            get(handlers::stream_workflow_events),
+        )
         .route(
             "/workflows/{id}/diagram",
             get(handlers::get_workflow_diagram),

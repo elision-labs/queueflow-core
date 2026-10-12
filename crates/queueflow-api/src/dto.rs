@@ -339,9 +339,65 @@ pub struct WorkflowStepState {
     /// The step's name (its address within the workflow).
     pub name: String,
     pub status: queueflow_core::StepStatus,
-    /// The job executing this step, once one has been scheduled.
+    /// The job executing this step, once one has been scheduled (the first
+    /// child, for a fan-out).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
+    /// Why the step failed, was skipped (`condition not met` for a false
+    /// `when`) or was cancelled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When the step was scheduled (its job or child workflow created).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// When the step reached a terminal status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    /// The child workflow of a sub-workflow step, once spawned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_workflow_id: Option<String>,
+    /// Progress of a fan-out step's children, once spawned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_out: Option<FanOutProgress>,
+}
+
+impl From<queueflow_core::StepRecord> for WorkflowStepState {
+    fn from(r: queueflow_core::StepRecord) -> Self {
+        Self {
+            name: r.name,
+            status: r.status,
+            job_id: r.job_id,
+            error: r.error,
+            started_at: r.started_at,
+            completed_at: r.completed_at,
+            child_workflow_id: r.child_workflow_id,
+            fan_out: r.fan_out.map(|p| FanOutProgress {
+                total: p.total,
+                completed: p.completed,
+                failed: p.failed,
+            }),
+        }
+    }
+}
+
+/// Counts over a fan-out step's child jobs.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct FanOutProgress {
+    pub total: u64,
+    pub completed: u64,
+    /// Failed or cancelled children.
+    pub failed: u64,
+}
+
+/// One `status` event of the workflow stream: the workflow's status and
+/// every step's live state.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct WorkflowEvent {
+    pub workflow_id: String,
+    pub status: queueflow_core::WorkflowStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub steps: Vec<WorkflowStepState>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]

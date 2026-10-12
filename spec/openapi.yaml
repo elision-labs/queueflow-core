@@ -1396,6 +1396,90 @@ paths:
                 $ref: '#/components/schemas/ErrorBody'
       security:
       - bearerAuth: []
+  /api/v1/workflows/{id}/events:
+    get:
+      tags:
+      - workflows
+      summary: |-
+        Stream a workflow's progress as Server-Sent Events: one `status` event
+        whenever the workflow or any step changes, until the workflow is
+        terminal.
+      operationId: streamWorkflowEvents
+      parameters:
+      - name: id
+        in: path
+        description: Workflow id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: SSE stream; each `status` event carries a WorkflowEvent (the workflow status and every step's state). The first event is the current state; the stream closes after the terminal one, or after 15 minutes (reconnect to keep following).
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/WorkflowEvent'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+      security:
+      - bearerAuth: []
+  /api/v1/workflows/{id}/retry:
+    post:
+      tags:
+      - workflows
+      operationId: retryWorkflow
+      parameters:
+      - name: id
+        in: path
+        description: Workflow id
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: 'The workflow is running again: every step that did not complete went back to pending and is re-scheduled; completed steps keep their results. The deadline, if any, is re-armed from the original timeout.'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: The workflow is running or completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+      security:
+      - bearerAuth: []
   /api/v1/workflows/{id}/steps:
     get:
       tags:
@@ -1552,6 +1636,19 @@ components:
           additionalProperties: {}
           propertyNames:
             type: string
+    ConditionOp:
+      type: string
+      description: How a [`StepCondition`] leaf compares the value at `path` with `value`.
+      enum:
+      - eq
+      - ne
+      - gt
+      - gte
+      - lt
+      - lte
+      - exists
+      - contains
+      - in
     CreateBatchJobsRequest:
       type: object
       required:
@@ -1668,6 +1765,16 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/WorkflowStep'
+        timeout_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Whole-workflow time budget in seconds. When it runs out the janitor
+            cancels every unfinished step and fails the workflow with
+            `workflow timed out`. Unset means no limit.
+          minimum: 0
     CreateWorkflowResponse:
       type: object
       required:
@@ -1816,6 +1923,56 @@ components:
           description: |-
             Whether the engine may retry (subject to the job's max_retries).
             Defaults to true; send false for permanent failures (e.g. bad input).
+    FanOut:
+      type: object
+      description: |-
+        Dynamic fan-out: run the step's task once per element of the array found
+        at `path` in the workflow context. Each child job receives the step
+        payload plus the element under `item_key` and its position under
+        `_index`. The step completes when every child has, with the result
+        `{"results": [...]}` in element order; a failed child follows the step's
+        `on_failure` policy.
+      required:
+      - path
+      properties:
+        item_key:
+          type:
+          - string
+          - 'null'
+          description: Payload key the element is passed under (default `item`).
+        max_items:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Upper bound on elements; more than this fails the step before any
+            child runs. Default [`limits::MAX_FAN_OUT`].
+          minimum: 0
+        path:
+          type: string
+          description: Dotted path into the context, for example `fetch.images`.
+    FanOutProgress:
+      type: object
+      description: Counts over a fan-out step's child jobs.
+      required:
+      - total
+      - completed
+      - failed
+      properties:
+        completed:
+          type: integer
+          format: int64
+          minimum: 0
+        failed:
+          type: integer
+          format: int64
+          description: Failed or cancelled children.
+          minimum: 0
+        total:
+          type: integer
+          format: int64
+          minimum: 0
     HealthStatus:
       type: object
       required:
@@ -2494,6 +2651,47 @@ components:
           type: integer
           format: int64
           minimum: 0
+    StepCondition:
+      type: object
+      description: |-
+        A predicate over the workflow context, evaluated when a step becomes
+        ready. Exactly one of `path`, `all`, `any` or `not` is set. A leaf names
+        a dotted `path` into the context (step results live under their step
+        name, so `validate.ok` is the `ok` key of the `validate` step's result)
+        and compares it with `value` using `op`. A false condition skips the step
+        with the reason `condition not met`; its dependents still run, seeing no
+        result for it.
+      properties:
+        all:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/StepCondition'
+          description: True when every member is true.
+        any:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/StepCondition'
+          description: True when at least one member is true.
+        not:
+          oneOf:
+          - $ref: '#/components/schemas/StepCondition'
+          - type: 'null'
+        op:
+          oneOf:
+          - $ref: '#/components/schemas/ConditionOp'
+          - type: 'null'
+        path:
+          type:
+          - string
+          - 'null'
+        value:
+          type:
+          - object
+          - 'null'
     StepStatus:
       type: string
       description: Lifecycle state of a single workflow step.
@@ -2552,6 +2750,21 @@ components:
         created_at:
           type: string
           format: date-time
+        deadline_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: |-
+            When the janitor fails the workflow if it is still running (set from
+            `timeout_secs`; pushed forward by a retry).
+        error_message:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Why the workflow ended `failed` or `cancelled`, when known (an
+            upstream failure, a timeout, a user cancel).
         id:
           type: string
         metadata:
@@ -2561,6 +2774,21 @@ components:
             type: string
         name:
           type: string
+        parent_step_name:
+          type:
+          - string
+          - 'null'
+          description: The parent's step that spawned this child.
+        parent_workflow_id:
+          type:
+          - string
+          - 'null'
+          description: Set on a child workflow spawned by a sub-workflow step.
+        retry_count:
+          type: integer
+          format: int32
+          description: How many times `POST /workflows/{id}/retry` re-ran this workflow.
+          minimum: 0
         started_at:
           type:
           - string
@@ -2576,6 +2804,13 @@ components:
           type:
           - string
           - 'null'
+        timeout_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: The whole-workflow time budget it was created with, if any.
+          minimum: 0
     WorkflowDiagramResponse:
       type: object
       required:
@@ -2588,6 +2823,28 @@ components:
         format:
           type: string
           description: Diagram source format. Always `mermaid` today.
+    WorkflowEvent:
+      type: object
+      description: |-
+        One `status` event of the workflow stream: the workflow's status and
+        every step's live state.
+      required:
+      - workflow_id
+      - status
+      - steps
+      properties:
+        error_message:
+          type:
+          - string
+          - 'null'
+        status:
+          $ref: '#/components/schemas/WorkflowStatus'
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkflowStepState'
+        workflow_id:
+          type: string
     WorkflowStatus:
       type: string
       description: Lifecycle state of a workflow instance.
@@ -2603,9 +2860,12 @@ components:
       description: |-
         A node in a workflow DAG. Steps are addressed by their unique `name`;
         `depends_on` lists the names of steps that must complete first.
+
+        A step is one of three kinds: a plain task (`task_name`), a fan-out
+        (`task_name` plus `fan_out`), or a sub-workflow (`workflow`, in which case
+        `task_name` may be empty). `when` gates any kind on the context.
       required:
       - name
-      - task_name
       properties:
         config:
           oneOf:
@@ -2615,6 +2875,11 @@ components:
           type: array
           items:
             type: string
+        fan_out:
+          oneOf:
+          - $ref: '#/components/schemas/FanOut'
+            description: Run the task once per element of an array in the context.
+          - type: 'null'
         metadata:
           type: object
           additionalProperties: {}
@@ -2631,8 +2896,31 @@ components:
           additionalProperties: {}
           propertyNames:
             type: string
+        queue:
+          type:
+          - string
+          - 'null'
+          description: Queue for this step's job(s); the server's default queue when absent.
         task_name:
           type: string
+          description: The task handler to run. May be omitted for a sub-workflow step.
+        when:
+          oneOf:
+          - $ref: '#/components/schemas/StepCondition'
+            description: |-
+              Run only when this condition holds against the workflow context at
+              the moment the step becomes ready; otherwise the step is skipped
+              with reason `condition not met` and its dependents proceed.
+          - type: 'null'
+        workflow:
+          oneOf:
+          - $ref: '#/components/schemas/CreateWorkflowRequest'
+            description: |-
+              Run an inline child workflow instead of a task. The child's context
+              is its own declared context plus this step's payload, with the
+              parent's context under `_parent`; the step's result is the child's
+              final context.
+          - type: 'null'
     WorkflowStepState:
       type: object
       description: Runtime status of one workflow step (the live progress view).
@@ -2640,14 +2928,45 @@ components:
       - name
       - status
       properties:
+        child_workflow_id:
+          type:
+          - string
+          - 'null'
+          description: The child workflow of a sub-workflow step, once spawned.
+        completed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When the step reached a terminal status.
+        error:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Why the step failed, was skipped (`condition not met` for a false
+            `when`) or was cancelled.
+        fan_out:
+          oneOf:
+          - $ref: '#/components/schemas/FanOutProgress'
+            description: Progress of a fan-out step's children, once spawned.
+          - type: 'null'
         job_id:
           type:
           - string
           - 'null'
-          description: The job executing this step, once one has been scheduled.
+          description: |-
+            The job executing this step, once one has been scheduled (the first
+            child, for a fan-out).
         name:
           type: string
           description: The step's name (its address within the workflow).
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When the step was scheduled (its job or child workflow created).
         status:
           $ref: '#/components/schemas/StepStatus'
     WorkflowStepStatesResponse:

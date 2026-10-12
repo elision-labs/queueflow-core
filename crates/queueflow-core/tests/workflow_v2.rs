@@ -333,7 +333,7 @@ async fn fan_out_runs_one_child_per_item_and_collects_results_in_order() {
     assert_eq!(results[2]["doubled"], 60);
     assert_eq!(results[2]["index"], 2);
     // The collector saw it through _context.
-    let seen = &c.grabbed.lock().unwrap()[0];
+    let seen = c.grabbed.lock().unwrap()[0].clone();
     assert_eq!(seen[CONTEXT_KEY]["work"]["results"][1]["doubled"], 40);
     // Children carry their position in metadata and the step linkage.
     let children = c

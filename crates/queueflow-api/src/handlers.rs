@@ -393,13 +393,102 @@ pub async fn get_workflow_step_states(
         .workflow_step_statuses(&id)
         .await?
         .into_iter()
-        .map(|r| WorkflowStepState {
-            name: r.name,
-            status: r.status,
-            job_id: r.job_id,
-        })
+        .map(WorkflowStepState::from)
         .collect();
     Ok(Json(WorkflowStepStatesResponse { steps }))
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/workflows/{id}/retry", tag = "workflows", operation_id = "retryWorkflow",
+    params(("id" = String, Path, description = "Workflow id")),
+    responses(
+        (status = 204, description = "The workflow is running again: every step that did not \
+                                      complete went back to pending and is re-scheduled; \
+                                      completed steps keep their results. The deadline, if any, \
+                                      is re-armed from the original timeout."),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+        (status = 409, description = "The workflow is running or completed", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn retry_workflow(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let wf = s.engine.get_workflow(&id).await?;
+    ensure_owner(wf.tenant_id.as_deref(), &t)?;
+    s.engine.retry_workflow(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stream a workflow's progress as Server-Sent Events: one `status` event
+/// whenever the workflow or any step changes, until the workflow is
+/// terminal.
+#[utoipa::path(
+    get, path = "/api/v1/workflows/{id}/events", tag = "workflows", operation_id = "streamWorkflowEvents",
+    params(("id" = String, Path, description = "Workflow id")),
+    responses(
+        (status = 200, description = "SSE stream; each `status` event carries a WorkflowEvent \
+                                      (the workflow status and every step's state). The first \
+                                      event is the current state; the stream closes after the \
+                                      terminal one, or after 15 minutes (reconnect to keep \
+                                      following).",
+         body = WorkflowEvent, content_type = "text/event-stream"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn stream_workflow_events(
+    State(s): State<ApiState>,
+    Extension(t): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let wf = s.engine.get_workflow(&id).await?;
+    ensure_owner(wf.tenant_id.as_deref(), &t)?;
+
+    let engine = s.engine.clone();
+    let stream = futures::stream::unfold(
+        (engine, id, None::<String>, std::time::Instant::now(), false),
+        |(engine, id, last, started, done)| async move {
+            if done || started.elapsed() > SSE_MAX_LIFETIME {
+                return None;
+            }
+            loop {
+                let snapshot = async {
+                    let wf = engine.get_workflow(&id).await?;
+                    let steps = engine.workflow_step_statuses(&id).await?;
+                    Ok::<_, EngineError>(WorkflowEvent {
+                        workflow_id: wf.id,
+                        status: wf.status,
+                        error_message: wf.error_message,
+                        steps: steps.into_iter().map(WorkflowStepState::from).collect(),
+                    })
+                }
+                .await;
+                match snapshot {
+                    Ok(ev) => {
+                        let json = serde_json::to_string(&ev).unwrap_or_default();
+                        if last.as_deref() != Some(&json) {
+                            let terminal = ev.status.is_terminal();
+                            let event = Event::default().event("status").data(json.clone());
+                            return Some((Ok(event), (engine, id, Some(json), started, terminal)));
+                        }
+                    }
+                    Err(_) => return None, // workflow deleted: end the stream
+                }
+                if started.elapsed() > SSE_MAX_LIFETIME {
+                    return None;
+                }
+                let _ = engine.await_workflow_change(&id, SSE_POLL_INTERVAL).await;
+            }
+        },
+    );
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 /// Stream a job's status transitions as Server-Sent Events until it reaches a

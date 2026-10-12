@@ -1552,3 +1552,282 @@ async fn jobs_list_filters_by_task_name() {
     assert_eq!(jobs.len(), 1, "{body}");
     assert_eq!(jobs[0]["task_name"], "b");
 }
+
+// ---- Workflows v2 ---------------------------------------------------------------
+
+/// An engine with handlers for the v2 workflow tests, driven by hand.
+fn v2_engine() -> Arc<Engine<InMemoryJobStore>> {
+    let clock = Arc::new(SystemClock);
+    let store = Arc::new(InMemoryJobStore::new(clock.clone()));
+    let engine = Engine::builder(store, clock)
+        .register("echo", builtin::echo())
+        .register_fn("items", |_p| async {
+            let mut m = Map::new();
+            m.insert("items".into(), json!([1, 2]));
+            Ok(m)
+        })
+        .register_fn("fail", |_p| async { Err(HandlerError::permanent("nope")) })
+        .build();
+    engine.mark_running();
+    engine
+}
+
+async fn drain(engine: &Engine<InMemoryJobStore>) {
+    while engine.process_once("default").await.unwrap() {}
+}
+
+#[tokio::test]
+async fn v2_workflow_definition_round_trips_and_step_states_carry_v2_fields() {
+    let engine = v2_engine();
+    let app = build_router(ApiState::new(engine.clone()).with_auth(AuthConfig::development()));
+    let def = json!({
+        "name": "v2",
+        "timeout_secs": 3600,
+        "steps": [
+            {"name": "load", "task_name": "items"},
+            {"name": "each", "task_name": "echo", "depends_on": ["load"],
+             "fan_out": {"path": "load.items", "item_key": "n"}},
+            {"name": "gated", "task_name": "echo", "depends_on": ["load"],
+             "when": {"path": "load.items.0", "op": "gt", "value": 5}},
+            {"name": "sub", "depends_on": ["each"],
+             "workflow": {"name": "child", "steps": [{"name": "inner", "task_name": "echo"}]}}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/workflows", Some("dev"), Some(def)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id = body_json(resp).await["workflow_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The definition comes back intact.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/api/v1/workflows/{id}"),
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let wf = body_json(resp).await;
+    assert_eq!(wf["timeout_secs"], 3600);
+    assert!(wf["deadline_at"].is_string());
+    assert_eq!(wf["steps"][1]["fan_out"]["path"], "load.items");
+    assert_eq!(wf["steps"][2]["when"]["op"], "gt");
+    assert_eq!(wf["steps"][3]["workflow"]["steps"][0]["name"], "inner");
+
+    drain(&engine).await;
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/api/v1/workflows/{id}/steps"),
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let steps = body_json(resp).await["steps"].as_array().unwrap().clone();
+    let by_name = |n: &str| steps.iter().find(|s| s["name"] == n).unwrap().clone();
+    assert_eq!(by_name("each")["status"], "completed");
+    assert_eq!(by_name("each")["fan_out"]["total"], 2);
+    assert_eq!(by_name("each")["fan_out"]["completed"], 2);
+    assert!(by_name("each")["started_at"].is_string());
+    assert!(by_name("each")["completed_at"].is_string());
+    assert_eq!(by_name("gated")["status"], "skipped");
+    assert_eq!(by_name("gated")["error"], "condition not met");
+    assert_eq!(by_name("sub")["status"], "completed");
+    assert!(by_name("sub")["child_workflow_id"].is_string());
+
+    // The child is a workflow of its own, scoped to the same tenant.
+    let child_id = by_name("sub")["child_workflow_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = app
+        .oneshot(req(
+            "GET",
+            &format!("/api/v1/workflows/{child_id}"),
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let child = body_json(resp).await;
+    assert_eq!(child["parent_workflow_id"], id);
+    assert_eq!(child["parent_step_name"], "sub");
+    assert_eq!(child["status"], "completed");
+}
+
+#[tokio::test]
+async fn v2_invalid_definition_is_400_with_the_step_named() {
+    let app = build_router(ApiState::new(v2_engine()).with_auth(AuthConfig::development()));
+    let def = json!({"name": "bad", "steps": [
+        {"name": "a", "task_name": "echo", "when": {"path": "x", "op": "in", "value": 3}}
+    ]});
+    let resp = app
+        .oneshot(req("POST", "/api/v1/workflows", Some("dev"), Some(def)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["error"].as_str().unwrap().contains("step 'a'"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn v2_retry_endpoint_reruns_a_failed_workflow_and_conflicts_otherwise() {
+    let engine = v2_engine();
+    let app = build_router(ApiState::new(engine.clone()).with_auth(AuthConfig::development()));
+    let def = json!({"name": "r", "steps": [
+        {"name": "a", "task_name": "echo"},
+        {"name": "b", "task_name": "fail", "depends_on": ["a"], "on_failure": "continue"}
+    ]});
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/workflows", Some("dev"), Some(def)))
+        .await
+        .unwrap();
+    let id = body_json(resp).await["workflow_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Running: conflict.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            &format!("/api/v1/workflows/{id}/retry"),
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    drain(&engine).await;
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/api/v1/workflows/{id}"),
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let wf = body_json(resp).await;
+    assert_eq!(wf["status"], "partially_failed");
+    assert!(wf["error_message"].as_str().unwrap().contains("nope"));
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            &format!("/api/v1/workflows/{id}/retry"),
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/api/v1/workflows/{id}"),
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let wf = body_json(resp).await;
+    assert_eq!(wf["status"], "running");
+    assert_eq!(wf["retry_count"], 1);
+    assert!(wf.get("error_message").is_none(), "{wf}");
+
+    // Another tenant cannot retry it.
+    let other = build_router(ApiState::new(engine.clone()).with_auth(AuthConfig {
+        api_keys: vec![queueflow_api::auth::ApiKey::new("k", "globex")],
+        ..Default::default()
+    }));
+    let resp = other
+        .oneshot(req(
+            "POST",
+            &format!("/api/v1/workflows/{id}/retry"),
+            Some("k"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn v2_workflow_events_stream_emits_until_terminal() {
+    let engine = v2_engine();
+    let def = CreateWorkflowRequest {
+        name: "s".into(),
+        steps: vec![WorkflowStep {
+            name: "a".into(),
+            task_name: "echo".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let id = engine
+        .create_workflow(def, Some("tenant1".into()))
+        .await
+        .unwrap();
+    drain(&engine).await;
+    let app = build_router(ApiState::new(engine).with_auth(AuthConfig::development()));
+    let resp = app
+        .oneshot(req(
+            "GET",
+            &format!("/api/v1/workflows/{id}/events"),
+            Some("dev"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["content-type"].to_str().unwrap(),
+        "text/event-stream"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: status"), "got: {text}");
+    assert!(text.contains("\"status\":\"completed\""), "got: {text}");
+    assert!(text.contains("\"steps\":[{\"name\":\"a\""), "got: {text}");
+}
+
+#[tokio::test]
+async fn v2_read_only_key_cannot_retry() {
+    use queueflow_api::auth::ApiKey;
+    let engine = v2_engine();
+    let app = build_router(ApiState::new(engine).with_auth(AuthConfig {
+        api_keys: vec![ApiKey::read_only("viewer", "acme")],
+        ..Default::default()
+    }));
+    let resp = app
+        .oneshot(req(
+            "POST",
+            "/api/v1/workflows/x/retry",
+            Some("viewer"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

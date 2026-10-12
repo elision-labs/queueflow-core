@@ -798,3 +798,257 @@ async fn pg_dead_letters_filter_by_replayed_and_task() {
     assert_eq!(replayed.len(), 1);
     assert_eq!(replayed[0].task_name.as_deref(), Some("ghost_a"));
 }
+
+// ---- Workflows v2 ------------------------------------------------------------
+
+fn v2_engine(store: Arc<PostgresJobStore>, queue: &str) -> Arc<Engine<PostgresJobStore>> {
+    Engine::builder(store, Arc::new(SystemClock))
+        .default_queue(queue)
+        .register("echo", builtin::echo())
+        .register_fn("items", |_p| async {
+            Ok(map(json!({"items": ["a", "b", "c"]})))
+        })
+        .register_fn("upper", |p: Map| async move {
+            let item = p
+                .get("item")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_uppercase();
+            Ok(map(json!({"upper": item})))
+        })
+        .register_fn("flaky_pg", |p: Map| async move {
+            // Fails until the context carries a "fixed" flag; the retry test
+            // never sets it, so it relies on the Continue policy instead.
+            let _ = p;
+            Err(HandlerError::permanent("pg flaky"))
+        })
+        .build()
+}
+
+async fn pg_drain(engine: &Engine<PostgresJobStore>, queue: &str) {
+    while engine.process_once(queue).await.unwrap() {}
+}
+
+#[tokio::test]
+async fn pg_fan_out_children_settle_in_index_order_and_sub_workflow_links() {
+    let queue = "test_wf_v2";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    let engine = v2_engine(store.clone(), queue);
+    let req = WorkflowBuilder::new("v2")
+        .timeout_secs(600)
+        .step(StepBuilder::new("load").task("items"))
+        .step(
+            StepBuilder::new("each")
+                .task("upper")
+                .after("load")
+                .fan_out("load.items"),
+        )
+        .step(
+            StepBuilder::new("gated")
+                .task("echo")
+                .after("load")
+                .when(StepCondition {
+                    path: Some("load.items.5".into()),
+                    ..Default::default()
+                }),
+        )
+        .step(
+            StepBuilder::new("sub").after("each").sub_workflow(
+                WorkflowBuilder::new("child")
+                    .step(StepBuilder::new("inner").task("echo"))
+                    .build()
+                    .unwrap(),
+            ),
+        )
+        .build()
+        .unwrap();
+    let id = engine
+        .create_workflow(req, Some("acme".into()))
+        .await
+        .unwrap();
+    pg_drain(&engine, queue).await;
+
+    let wf = engine.get_workflow(&id).await.unwrap();
+    assert_eq!(wf.status, WorkflowStatus::Completed, "{wf:?}");
+    assert_eq!(wf.timeout_secs, Some(600));
+    assert!(wf.deadline_at.is_some());
+    let results = wf.context["each"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["upper"], "A");
+    assert_eq!(results[2]["upper"], "C");
+    let outcomes = store.step_job_outcomes(&id, "each").await.unwrap();
+    assert_eq!(
+        outcomes.iter().map(|o| o.index).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    let steps = store.workflow_step_statuses(&id).await.unwrap();
+    let get = |n: &str| steps.iter().find(|s| s.name == n).unwrap().clone();
+    assert_eq!(get("gated").status, StepStatus::Skipped);
+    assert_eq!(get("gated").error.as_deref(), Some(CONDITION_NOT_MET));
+    let each = get("each");
+    assert_eq!(each.fan_out.unwrap().completed, 3);
+    assert!(each.started_at.is_some() && each.completed_at.is_some());
+    let sub = get("sub");
+    let child_id = sub.child_workflow_id.clone().expect("child");
+    let child = engine.get_workflow(&child_id).await.unwrap();
+    assert_eq!(child.parent_workflow_id.as_deref(), Some(id.as_str()));
+    assert_eq!(child.parent_step_name.as_deref(), Some("sub"));
+    assert_eq!(child.status, WorkflowStatus::Completed);
+    assert_eq!(child.context[PARENT_CONTEXT_KEY]["load"]["items"][0], "a");
+    assert!(wf.context["sub"]["inner"].is_object());
+
+    // The parent-step claim is single-shot: a second child for the same
+    // step persists nothing.
+    let dup = Workflow {
+        id: "dup-child".into(),
+        parent_workflow_id: Some(id.clone()),
+        parent_step_name: Some("sub".into()),
+        ..child.clone()
+    };
+    assert!(!store.create_child_workflow(&dup).await.unwrap());
+    assert!(engine.get_workflow("dup-child").await.is_err());
+}
+
+#[tokio::test]
+async fn pg_retry_resets_unfinished_steps_and_timeout_sweep_fails_expired() {
+    let queue = "test_wf_v2_retry";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    let engine = v2_engine(store.clone(), queue);
+    let req = WorkflowBuilder::new("retry")
+        .timeout_secs(60)
+        .step(StepBuilder::new("a").task("echo"))
+        .step(
+            StepBuilder::new("b")
+                .task("flaky_pg")
+                .after("a")
+                .on_failure(OnFailure::Continue),
+        )
+        .build()
+        .unwrap();
+    let id = engine.create_workflow(req, None).await.unwrap();
+    pg_drain(&engine, queue).await;
+    let wf = engine.get_workflow(&id).await.unwrap();
+    assert_eq!(wf.status, WorkflowStatus::PartiallyFailed);
+    assert!(wf.error_message.as_deref().unwrap().contains("pg flaky"));
+
+    engine.retry_workflow(&id).await.unwrap();
+    let wf = engine.get_workflow(&id).await.unwrap();
+    assert_eq!(wf.status, WorkflowStatus::Running);
+    assert_eq!(wf.retry_count, 1);
+    assert!(wf.error_message.is_none());
+    let steps = store.workflow_step_statuses(&id).await.unwrap();
+    let b = steps.iter().find(|s| s.name == "b").unwrap();
+    assert_eq!(b.status, StepStatus::Pending);
+    assert!(b.job_id.is_some(), "re-scheduled");
+    assert!(b.error.is_none() && b.completed_at.is_none());
+    assert_eq!(
+        steps.iter().find(|s| s.name == "a").unwrap().status,
+        StepStatus::Completed
+    );
+
+    // Pretend the deadline passed: the janitor's deadline sweep fails it,
+    // cancelling the pending retry job.
+    let expired = store
+        .expired_workflows(chrono::Utc::now() + chrono::Duration::seconds(61), 10)
+        .await
+        .unwrap();
+    assert!(expired.contains(&id));
+    assert!(
+        store
+            .expired_workflows(chrono::Utc::now(), 10)
+            .await
+            .unwrap()
+            .is_empty()
+            || !store
+                .expired_workflows(chrono::Utc::now(), 10)
+                .await
+                .unwrap()
+                .contains(&id)
+    );
+    engine.cancel_workflow(&id).await.unwrap(); // clean up the pending job
+    let wf = engine.get_workflow(&id).await.unwrap();
+    assert_eq!(wf.status, WorkflowStatus::Cancelled);
+    assert_eq!(wf.error_message.as_deref(), Some("cancelled by user"));
+    assert!(!engine.process_once(queue).await.unwrap());
+}
+
+#[tokio::test]
+async fn pg_workflow_change_notification_wakes_a_watcher() {
+    let queue = "test_wf_v2_events";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    let engine = v2_engine(store.clone(), queue);
+    let req = WorkflowBuilder::new("w")
+        .step(StepBuilder::new("a").task("echo"))
+        .build()
+        .unwrap();
+    let id = engine.create_workflow(req, None).await.unwrap();
+    let e2 = engine.clone();
+    let wid = id.clone();
+    let waiter = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        e2.await_workflow_change(&wid, Duration::from_secs(20))
+            .await
+            .unwrap();
+        started.elapsed()
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(engine.process_once(queue).await.unwrap());
+    let waited = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("woken")
+        .unwrap();
+    assert!(
+        waited < Duration::from_secs(10),
+        "woke by NOTIFY, not timeout"
+    );
+}
+
+#[tokio::test]
+async fn pg_stalled_child_and_step_sweeps_only_see_settled_work() {
+    let queue = "test_wf_v2_sweeps";
+    let Some(store) = setup(queue).await else {
+        return;
+    };
+    let engine = v2_engine(store.clone(), queue);
+    let req = WorkflowBuilder::new("p")
+        .step(StepBuilder::new("load").task("items"))
+        .step(
+            StepBuilder::new("each")
+                .task("upper")
+                .after("load")
+                .fan_out("load.items"),
+        )
+        .build()
+        .unwrap();
+    let id = engine.create_workflow(req, None).await.unwrap();
+    assert!(engine.process_once(queue).await.unwrap()); // load -> 3 children
+    assert!(engine.process_once(queue).await.unwrap()); // one child done
+                                                        // Two children are still pending, so the fan-out step is not stalled.
+    let stalled = store.stalled_step_jobs(50).await.unwrap();
+    assert!(
+        !stalled
+            .iter()
+            .any(|j| j.workflow_id.as_deref() == Some(&id)),
+        "{stalled:?}"
+    );
+    pg_drain(&engine, queue).await;
+    assert_eq!(
+        engine.get_workflow(&id).await.unwrap().status,
+        WorkflowStatus::Completed
+    );
+    assert!(
+        store.stalled_child_workflows(50).await.unwrap().is_empty()
+            || !store
+                .stalled_child_workflows(50)
+                .await
+                .unwrap()
+                .contains(&id)
+    );
+}
