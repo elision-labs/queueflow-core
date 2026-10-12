@@ -18,7 +18,7 @@ kill_signal = "SIGTERM"
 kill_timeout = 60
 
 [build]
-  image = "ghcr.io/elision-labs/queueflow:0.5"
+  image = "ghcr.io/elision-labs/queueflow:0.6"
 
 # Non-secret configuration. DATABASE_URL, QUEUEFLOW_API_KEYS and
 # QUEUEFLOW_WORKER_TOKEN come from `fly secrets set`, never from this file.

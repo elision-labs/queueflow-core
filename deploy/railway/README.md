@@ -1,6 +1,6 @@
 # QueueFlow on Railway
 
-Manual steps to run the prebuilt image `ghcr.io/elision-labs/queueflow:0.5`
+Manual steps to run the prebuilt image `ghcr.io/elision-labs/queueflow:0.6`
 next to a Railway Postgres in one project. Nothing here creates resources for
 you; it is a checklist for the Dashboard (or the `railway` CLI).
 
@@ -23,7 +23,7 @@ References used:
 
 ## 2. QueueFlow service
 
-1. **+ New** -> **Docker Image**, enter `ghcr.io/elision-labs/queueflow:0.5`
+1. **+ New** -> **Docker Image**, enter `ghcr.io/elision-labs/queueflow:0.6`
    (pin `0.2.0` for an exact version). The image is public; no registry
    credentials are needed.
 2. Rename the service to `queueflow` (or `engine`).
