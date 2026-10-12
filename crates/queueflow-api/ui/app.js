@@ -830,6 +830,29 @@ async function renderDiagram(el, source, steps) {
   }
 }
 
+const WORKFLOW_RETRYABLE = new Set(["failed", "partially_failed", "cancelled"]);
+
+function stepKind(def, st) {
+  if (def.workflow) {
+    return st.child_workflow_id
+      ? html`sub-workflow <a class="id" href="#/workflows/${enc(st.child_workflow_id)}" title="${st.child_workflow_id}">${shortId(st.child_workflow_id)}</a>`
+      : html`sub-workflow <span class="zero">(${def.workflow.name})</span>`;
+  }
+  if (def.fan_out) {
+    const p = st.fan_out;
+    const progress = p ? html` <span class="zero">${num(p.completed)}${p.failed ? html` + ${num(p.failed)} failed` : ""} of ${num(p.total)}</span>` : "";
+    return html`${def.task_name} <span class="zero">fan-out over</span> ${def.fan_out.path}${progress}`;
+  }
+  return html`${def.task_name}${def.when ? html` <span class="zero" title="Runs only when its condition holds">(conditional)</span>` : ""}`;
+}
+
+function stepTiming(st) {
+  if (!st.started_at) return html`<span class="zero">not started</span>`;
+  const end = st.completed_at ? Date.parse(st.completed_at) : Date.now();
+  const secs = Math.max(0, Math.round((end - Date.parse(st.started_at)) / 1000));
+  return html`${time(st.started_at)} <span class="zero">${st.completed_at ? "" : "running "}${duration(secs)}</span>`;
+}
+
 async function workflowDetail(ctx, id) {
   ctx.set(html`${crumbs("workflows", "Workflows")}${loadingState("workflow")}`);
   let [wf, stepsResp, diagram] = await Promise.all([
@@ -841,6 +864,7 @@ async function workflowDetail(ctx, id) {
 
   let steps = stepsResp.steps || [];
   let live = !WORKFLOW_TERMINAL.has(wf.status);
+  let mode = live ? "connecting" : "done";
 
   function stepRows() {
     const byName = new Map(steps.map((s) => [s.name, s]));
@@ -849,21 +873,31 @@ async function workflowDetail(ctx, id) {
       return html`<tr>
         <td>${st.status ? status(st.status) : html`<span class="zero">unknown</span>`}</td>
         <td>${def.name}</td>
-        <td>${def.task_name}</td>
+        <td class="wrap">${stepKind(def, st)}</td>
         <td class="wrap">${def.depends_on && def.depends_on.length ? def.depends_on.join(", ") : html`<span class="zero">none</span>`}</td>
-        <td>${def.on_failure || "halt"}</td>
-        <td>${st.job_id ? html`<a class="id" href="#/jobs/${enc(st.job_id)}" title="${st.job_id}">${shortId(st.job_id)}</a>` : html`<span class="zero">not scheduled</span>`}</td>
+        <td>${def.on_failure || "halt"}${def.queue ? html` <span class="zero">on ${def.queue}</span>` : ""}</td>
+        <td class="wrap">${stepTiming(st)}</td>
+        <td>${st.job_id ? html`<a class="id" href="#/jobs/${enc(st.job_id)}" title="${st.job_id}">${shortId(st.job_id)}</a>` : html`<span class="zero">${st.child_workflow_id ? "child" : "none"}</span>`}</td>
+        <td class="trunc" title="${st.error || ""}">${st.error || ""}</td>
       </tr>`;
     });
   }
 
   function render() {
     document.title = `${wf.name} | QueueFlow`;
-    const cancel = api.canWrite() && live ? actionButton("Cancel workflow", { action: "cancel-workflow" }, "danger") : "";
+    const liveLabel = {
+      connecting: ["Connecting", false],
+      live: ["Live", true],
+      polling: ["Polling every 3s", true],
+      done: ["Finished", false],
+    }[mode];
+    const actions = [];
+    if (api.canWrite() && live) actions.push(actionButton("Cancel workflow", { action: "cancel-workflow" }, "danger"));
+    if (api.canWrite() && WORKFLOW_RETRYABLE.has(wf.status)) actions.push(actionButton("Retry unfinished steps", { action: "retry-workflow" }));
     ctx.set(html`${crumbs("workflows", "Workflows")}
     <div class="view-head">
       <div class="title-row"><h1>${wf.name}</h1>${status(wf.status)}<span class="mono">${wf.id}</span></div>
-      <div class="meta actions">${cancel}<span class="live" data-on="${live}">${live ? "Following every 3s" : "Finished"}</span></div>
+      <div class="meta actions">${actions}<span class="live" data-on="${liveLabel[1]}">${liveLabel[0]}</span></div>
     </div>
     <div class="detail">
       <div class="stack">
@@ -873,8 +907,12 @@ async function workflowDetail(ctx, id) {
           ["Created", time(wf.created_at)],
           ["Started", time(wf.started_at)],
           ["Completed", time(wf.completed_at)],
+          wf.timeout_secs ? ["Timeout", html`${duration(wf.timeout_secs)}${wf.deadline_at && live ? html` <span class="zero">(deadline ${time(wf.deadline_at)})</span>` : ""}`] : null,
+          wf.retry_count ? ["Retries", String(wf.retry_count)] : null,
+          wf.parent_workflow_id ? ["Parent", html`<a class="id" href="#/workflows/${enc(wf.parent_workflow_id)}">${shortId(wf.parent_workflow_id)}</a> <span class="zero">step</span> ${wf.parent_step_name || ""}`] : null,
           tenantFact(wf),
         ])}
+        ${wf.error_message ? html`<section><h2>Error</h2><pre class="panel err">${wf.error_message}</pre></section>` : ""}
         <section><h2>Context</h2>${isEmptyObject(wf.context) ? html`<p class="note">Empty. Step results are merged here as they complete.</p>` : json(wf.context)}</section>
         ${isEmptyObject(wf.metadata) ? "" : html`<section><h2>Metadata</h2>${json(wf.metadata)}</section>`}
       </div>
@@ -888,7 +926,7 @@ async function workflowDetail(ctx, id) {
         </section>
         <section>
           <h2>Steps</h2>
-          ${table(["Status", "Step", "Task", "Depends on", "On failure", "Job"], stepRows())}
+          ${table(["Status", "Step", "Runs", "Depends on", "On failure", "Started", "Job", "Error"], stepRows())}
         </section>
       </div>
     </div>`);
@@ -903,46 +941,109 @@ async function workflowDetail(ctx, id) {
     }
   }
 
-  render();
-  const onCancel = (ev) => {
-    const btn = ev.target.closest("[data-action='cancel-workflow']");
-    if (!btn || !ctx.alive()) return;
-    act(btn, {
-      title: `Cancel ${wf.name}?`,
-      body: "Every step that has not finished is cancelled, including their jobs. Completed steps keep their results. This cannot be undone.",
-      verb: "Cancel workflow",
-      path: `/workflows/${enc(id)}/cancel`,
-      success: "Workflow cancelled",
-      onDone: async () => {
-        const [w, s] = await Promise.all([api.get(`/workflows/${enc(id)}`), api.get(`/workflows/${enc(id)}/steps`)]);
-        wf = w;
-        steps = s.steps || [];
-        live = !WORKFLOW_TERMINAL.has(wf.status);
-        render();
-      },
-    });
-  };
-  main.addEventListener("click", onCancel);
-  ctx.cleanups.push(() => main.removeEventListener("click", onCancel));
-  if (!live) return;
+  async function refresh() {
+    const [w, s] = await Promise.all([api.get(`/workflows/${enc(id)}`), api.get(`/workflows/${enc(id)}/steps`)]);
+    if (!ctx.alive()) return;
+    wf = w;
+    steps = s.steps || [];
+    live = !WORKFLOW_TERMINAL.has(wf.status);
+    if (!live) mode = "done";
+  }
 
-  const timer = setInterval(async () => {
-    try {
-      const [w, s] = await Promise.all([api.get(`/workflows/${enc(id)}`), api.get(`/workflows/${enc(id)}/steps`)]);
-      if (!ctx.alive()) return;
-      const changed = w.status !== wf.status || JSON.stringify(s.steps) !== JSON.stringify(steps) || JSON.stringify(w.context) !== JSON.stringify(wf.context);
-      wf = w;
-      steps = s.steps || [];
-      if (WORKFLOW_TERMINAL.has(wf.status)) {
-        live = false;
-        clearInterval(timer);
-      }
-      if (changed || !live) render();
-    } catch {
-      // transient; try again on the next tick
+  render();
+  const onAction = (ev) => {
+    const btn = ev.target.closest("[data-action='cancel-workflow'], [data-action='retry-workflow']");
+    if (!btn || !ctx.alive()) return;
+    if (btn.dataset.action === "cancel-workflow") {
+      act(btn, {
+        title: `Cancel ${wf.name}?`,
+        body: "Every step that has not finished is cancelled, including their jobs and any child workflow. Completed steps keep their results. This cannot be undone.",
+        verb: "Cancel workflow",
+        path: `/workflows/${enc(id)}/cancel`,
+        success: "Workflow cancelled",
+        onDone: async () => {
+          await refresh();
+          render();
+        },
+      });
+    } else {
+      act(btn, {
+        title: `Retry ${wf.name}?`,
+        body: "Every step that did not complete goes back to pending and is scheduled again. Completed steps keep their results and do not run again. The deadline, if any, is re-armed.",
+        verb: "Retry",
+        path: `/workflows/${enc(id)}/retry`,
+        success: "Workflow retried",
+        onDone: async () => {
+          await refresh();
+          mode = live ? "connecting" : "done";
+          render();
+          if (live) follow();
+        },
+      });
     }
-  }, POLL_MS);
-  ctx.cleanups.push(() => clearInterval(timer));
+  };
+  main.addEventListener("click", onAction);
+  ctx.cleanups.push(() => main.removeEventListener("click", onAction));
+
+  // Live updates: the workflow event stream, then polling if unavailable.
+  let ac = null;
+  let pollTimer = null;
+  ctx.cleanups.push(() => {
+    if (ac) ac.abort();
+    clearInterval(pollTimer);
+  });
+
+  function startPolling() {
+    if (!ctx.alive() || !live) return;
+    mode = "polling";
+    render();
+    pollTimer = setInterval(async () => {
+      try {
+        await refresh();
+        if (!ctx.alive()) return;
+        render();
+        if (!live) clearInterval(pollTimer);
+      } catch (e) {
+        if (!ctx.alive() || (e && e.name === "AbortError")) clearInterval(pollTimer);
+      }
+    }, POLL_MS);
+  }
+
+  async function follow() {
+    if (ac) ac.abort();
+    ac = new AbortController();
+    try {
+      await api.streamWorkflow(
+        id,
+        async (ev) => {
+          if (!ctx.alive()) return;
+          if (mode !== "done") mode = "live";
+          // The event carries status and steps; the context lives on the
+          // workflow record, so re-read that too.
+          try {
+            wf = await api.get(`/workflows/${enc(id)}`);
+          } catch {
+            wf.status = ev.status;
+            wf.error_message = ev.error_message;
+          }
+          steps = ev.steps || [];
+          live = !WORKFLOW_TERMINAL.has(wf.status);
+          if (!live) mode = "done";
+          render();
+        },
+        ac.signal,
+      );
+      // Stream closed. If the workflow is still running, the server's stream
+      // lifetime ran out: keep following by polling.
+      if (ctx.alive() && live) startPolling();
+    } catch (e) {
+      if (!ctx.alive() || (e && e.name === "AbortError")) return;
+      if (e instanceof api.ApiError && e.status === 401) return;
+      startPolling();
+    }
+  }
+
+  if (live) follow();
 }
 
 // ---- Dead letters ---------------------------------------------------------------------

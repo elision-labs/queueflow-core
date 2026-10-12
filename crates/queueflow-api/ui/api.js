@@ -128,8 +128,17 @@ async function request(method, pathAndQuery, body, signal) {
  * when the stream ends; rejects if streaming is unavailable so the caller
  * can fall back to polling.
  */
-export async function streamJob(id, onJob, signal) {
-  const resp = await fetch(`${BASE}/jobs/${encodeURIComponent(id)}/events`, {
+export function streamJob(id, onJob, signal) {
+  return streamEvents(`/jobs/${encodeURIComponent(id)}/events`, onJob, signal);
+}
+
+/** Same for a workflow: onEvent(workflowEvent) per `status` event. */
+export function streamWorkflow(id, onEvent, signal) {
+  return streamEvents(`/workflows/${encodeURIComponent(id)}/events`, onEvent, signal);
+}
+
+async function streamEvents(path, onData, signal) {
+  const resp = await fetch(BASE + path, {
     headers: { Authorization: `Bearer ${token()}`, Accept: "text/event-stream" },
     signal,
   });
@@ -150,7 +159,7 @@ export async function streamJob(id, onJob, signal) {
       const payload = data.join("\n");
       if (eventName === "status" || eventName === "") {
         try {
-          onJob(JSON.parse(payload));
+          onData(JSON.parse(payload));
         } catch {
           // keep-alive or malformed frame: ignore
         }
