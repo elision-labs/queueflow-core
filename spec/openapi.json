@@ -3922,10 +3922,7 @@
             ]
           },
           "value": {
-            "type": [
-              "object",
-              "null"
-            ]
+            "description": "Any JSON value: a number, string, boolean, array or object."
           }
         }
       },

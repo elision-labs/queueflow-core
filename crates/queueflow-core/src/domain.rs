@@ -368,8 +368,9 @@ pub struct StepCondition {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op: Option<ConditionOp>,
+    /// Any JSON value: a number, string, boolean, array or object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Object, nullable)]
+    #[schema(value_type = Option<serde_json::Value>)]
     pub value: Option<Json>,
     /// True when every member is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]

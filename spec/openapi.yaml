@@ -2689,9 +2689,7 @@ components:
           - string
           - 'null'
         value:
-          type:
-          - object
-          - 'null'
+          description: 'Any JSON value: a number, string, boolean, array or object.'
     StepStatus:
       type: string
       description: Lifecycle state of a single workflow step.
