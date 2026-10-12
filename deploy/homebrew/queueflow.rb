@@ -10,7 +10,7 @@
 class Queueflow < Formula
   desc "PostgreSQL-native job queue and workflow engine (server + CLI)"
   homepage "https://queueflow.dev"
-  version "0.5.0"
+  version "0.6.0"
   license "MIT"
 
   livecheck do
@@ -21,13 +21,13 @@ class Queueflow < Formula
   on_macos do
     on_arm do
       url "https://github.com/elision-labs/queueflow-core/releases/download/v#{version}/queueflow-aarch64-apple-darwin.tar.gz"
-      sha256 "deb986aead27bf4728119162f31bc89877283d18ea4ce75f96f20fd8a5ba8562"
+      sha256 "eaa4b01b547e3a2828bb5cea1d550f256381d77faa93d3573ebb49dada927876"
     end
     # BEGIN x86_64-apple-darwin
     # Enabled by update-formula.sh once release.yml publishes this asset.
     on_intel do
       url "https://github.com/elision-labs/queueflow-core/releases/download/v#{version}/queueflow-x86_64-apple-darwin.tar.gz"
-      sha256 "b26df65c9beb195abfe2cbe12b7f50abc5f34ba2c4b19631007a532401dcf21f"
+      sha256 "f3c1cdfaeaaeb8782883138f93a1e70222403fb8270ff704eceaadf382d19b21"
     end
     # END x86_64-apple-darwin
   end
@@ -35,13 +35,13 @@ class Queueflow < Formula
   on_linux do
     on_intel do
       url "https://github.com/elision-labs/queueflow-core/releases/download/v#{version}/queueflow-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "fb401a3806e8f6eb073b8ad88f65ec59241381b026adaf6d964d080a2e1d431f"
+      sha256 "82751db6cdcb1e2f3e15f206e82ab7f21d636036e6629e11279ffe0039bbc5ae"
     end
     # BEGIN aarch64-unknown-linux-gnu
     # Enabled by update-formula.sh once release.yml publishes this asset.
     on_arm do
       url "https://github.com/elision-labs/queueflow-core/releases/download/v#{version}/queueflow-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "807fabe59803a2b847380d7a83c7d965491e32126bfdd5ce557b9251bd23e765"
+      sha256 "4674fffc9aecff7e231f494363c5b02b3b87c18c91114fde24bf202b41869411"
     end
     # END aarch64-unknown-linux-gnu
   end
