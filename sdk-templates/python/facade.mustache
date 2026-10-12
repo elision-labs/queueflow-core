@@ -15,6 +15,8 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from pydantic import ValidationError
+
 from .api_client import ApiClient
 from .configuration import Configuration
 from .api.jobs_api import JobsApi
@@ -34,14 +36,17 @@ from .models.lease_jobs_request import LeaseJobsRequest
 from .models.job_config_request import JobConfigRequest
 from .models.create_workflow_request import CreateWorkflowRequest
 from .models.create_cron_request import CreateCronRequest
+from .models.fan_out import FanOut
 from .models.replay_dead_letters_request import ReplayDeadLettersRequest
 from .models.workflow_step import WorkflowStep
 from .models.job import Job
 from .models.queue_control_response import QueueControlResponse
 from .models.queue_stats import QueueStats
 from .models.replayed_dead_letter import ReplayedDeadLetter
+from .models.step_condition import StepCondition
 from .models.who_am_i_response import WhoAmIResponse
 from .models.workflow import Workflow
+from .models.workflow_step_state import WorkflowStepState
 
 _TERMINAL_JOB = {"completed", "failed", "cancelled"}
 _TERMINAL_WORKFLOW = {"completed", "failed", "partially_failed", "cancelled"}
@@ -271,6 +276,9 @@ class QueueFlow:
     # --- workflows ----------------------------------------------------------
 
     def create_workflow(self, workflow: "WorkflowBuilder | CreateWorkflowRequest") -> Workflow:
+        """Create a workflow from a :class:`WorkflowBuilder` (built, and so
+        validated locally, here) or a prebuilt ``CreateWorkflowRequest`` and
+        return its freshly-created record."""
         body = workflow.build() if isinstance(workflow, WorkflowBuilder) else workflow
         created = self.workflows.create_workflow(body)
         return self.workflows.get_workflow(created.workflow_id)
@@ -284,6 +292,37 @@ class QueueFlow:
             timeout,
             interval,
         )
+
+    def workflow_steps(self, workflow_id: str) -> List[WorkflowStepState]:
+        """Live progress of every step, in declaration order
+        (``GET /api/v1/workflows/{id}/steps``).
+
+        Each :class:`WorkflowStepState` carries ``name``, ``status`` and
+        ``job_id`` (the step's job; the first child, for a fan-out) plus, on
+        server 0.6.0 and later, ``error`` (why it failed or was cancelled, or
+        ``condition not met`` for a step skipped by its ``when``),
+        ``started_at`` and ``completed_at``, ``child_workflow_id`` once a
+        sub-workflow step has spawned its child, and ``fan_out`` (``total``,
+        ``completed``, ``failed`` children) for a fan-out step.
+        """
+        return self.workflows.get_workflow_step_states(workflow_id).steps
+
+    def retry_workflow(self, workflow_id: str) -> Workflow:
+        """Re-run a ``failed``, ``partially_failed`` or ``cancelled`` workflow
+        from where it stopped (``POST /api/v1/workflows/{id}/retry``, server
+        0.6.0 and later) and return its refreshed record.
+
+        Every step that did not complete (failed, cancelled, or skipped by a
+        failure policy) goes back to ``pending`` and is scheduled again as its
+        dependencies allow; completed steps and condition-skipped steps keep
+        their results and do not run again. The workflow becomes ``running``,
+        its ``error_message`` clears, ``retry_count`` increments and the
+        deadline, if any, is re-armed from the original ``timeout_secs``.
+        Retrying a running or completed workflow is a 409 (``ApiException``).
+        Fix the cause first: a retry with the same inputs fails the same way.
+        """
+        self.workflows.retry_workflow(workflow_id)
+        return self.workflows.get_workflow(workflow_id)
 
     # --- cron & dead letters ------------------------------------------------
 
@@ -648,7 +687,15 @@ class QueueFlow:
 
 
 class WorkflowBuilder:
-    """Typed builder for a workflow DAG, with local validation before the round-trip."""
+    """Typed builder for a workflow DAG, with local validation before the round-trip.
+
+    ``step`` adds a task step (a fan-out when ``fan_out`` is given) and
+    ``sub_workflow`` an inline child workflow; ``context``, ``metadata`` and
+    ``timeout_secs`` set the workflow-level fields. ``build()`` produces the
+    ``CreateWorkflowRequest`` the server expects and raises
+    :class:`WorkflowValidationError` for a structurally invalid DAG before
+    any network call.
+    """
 
     def __init__(self, name: str) -> None:
         if not name:
@@ -657,6 +704,7 @@ class WorkflowBuilder:
         self._steps: List[WorkflowStep] = []
         self._context: Dict[str, Any] = {}
         self._metadata: Dict[str, Any] = {}
+        self._timeout_secs: Optional[int] = None
 
     def step(
         self,
@@ -667,24 +715,119 @@ class WorkflowBuilder:
         on_failure: Optional[str] = None,
         on_success: Optional[str] = None,
         config: Optional[Any] = None,
+        queue: Optional[str] = None,
+        when: Union[None, Dict[str, Any], StepCondition] = None,
+        fan_out: Union[None, Dict[str, Any], FanOut] = None,
     ) -> "WorkflowBuilder":
-        """Add a step. config is a models.JobConfig override for this step;
-        the server fills defaults for any field left unset."""
+        """Add a step that runs ``task`` once every step in ``after`` has finished.
+
+        ``config`` is a models.JobConfig override for this step; the server
+        fills defaults for any field left unset. ``on_failure`` is ``halt``
+        (default), ``skip`` or ``continue``.
+
+        Server 0.6.0 and later also take:
+
+        * ``queue``: the queue for this step's job(s); the server's default
+          queue when None.
+        * ``when``: a condition over the workflow context, as a dict in the
+          wire shape or a ``models.StepCondition``. A leaf names a dotted
+          ``path`` (``validate.ok`` is the ``ok`` key of step ``validate``'s
+          result) and compares it with ``value`` using ``op`` (``eq``, ``ne``,
+          ``gt``, ``gte``, ``lt``, ``lte``, ``exists``, ``contains``, ``in``;
+          ``eq`` by default with a value, ``exists`` without); ``{"all": [..]}``,
+          ``{"any": [..]}`` and ``{"not": {..}}`` combine leaves. A false
+          condition skips the step with the reason ``condition not met`` and
+          its dependents still run, seeing no result for it. With this
+          release ``value`` must be a JSON object: the server's 0.6.0 spec
+          types it as ``object``, so the generated model rejects scalars.
+        * ``fan_out``: a dict or ``models.FanOut`` (``path``, optional
+          ``item_key`` and ``max_items``) that runs ``task`` once per element
+          of the array at ``path`` in the context, each child getting the
+          payload plus the element under ``item_key`` (``item`` by default)
+          and its position under ``_index``. The step's result is
+          ``{"results": [...]}`` in element order.
+        """
+        fields = {
+            "on_failure": on_failure,
+            "on_success": on_success,
+            "config": config,
+            "queue": queue,
+            "when": self._condition(name, when),
+            "fan_out": self._fan_out(name, fan_out),
+        }
         self._steps.append(
             WorkflowStep(
                 name=name,
                 task_name=task,
                 depends_on=after or [],
                 payload=payload or {},
-                on_failure=on_failure,
-                on_success=on_success,
-                config=config,
+                **{k: v for k, v in fields.items() if v is not None},
+            )
+        )
+        return self
+
+    def sub_workflow(
+        self,
+        name: str,
+        child: "WorkflowBuilder | CreateWorkflowRequest",
+        after: Optional[List[str]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        on_failure: Optional[str] = None,
+        on_success: Optional[str] = None,
+        when: Union[None, Dict[str, Any], StepCondition] = None,
+    ) -> "WorkflowBuilder":
+        """Add a step that runs ``child`` as an inline child workflow instead
+        of a task (server 0.6.0 and later).
+
+        ``child`` is a :class:`WorkflowBuilder` (built, and so validated, here)
+        or a prebuilt ``CreateWorkflowRequest``; its steps carry their own
+        ``queue``. When the step becomes ready the child is created as a
+        workflow of its own, in the same tenant, with ``parent_workflow_id``
+        and ``parent_step_name`` set. Its context is the child's declared
+        context, then this step's ``payload``, then the parent's whole
+        context under ``_parent``. A completed child completes the step with
+        the child's final context as the step result; a failed, partially
+        failed or cancelled child fails the step under ``on_failure``.
+        ``after`` and ``when`` work as for :meth:`step`. Children nest up to
+        8 levels.
+        """
+        body = child.build() if isinstance(child, WorkflowBuilder) else child
+        fields = {
+            "on_failure": on_failure,
+            "on_success": on_success,
+            "when": self._condition(name, when),
+        }
+        self._steps.append(
+            WorkflowStep(
+                name=name,
+                depends_on=after or [],
+                payload=payload or {},
+                workflow=body,
+                **{k: v for k, v in fields.items() if v is not None},
             )
         )
         return self
 
     def context(self, **kwargs: Any) -> "WorkflowBuilder":
+        """Seed the shared workflow context (what downstream steps see as ``_context``)."""
         self._context.update(kwargs)
+        return self
+
+    def metadata(self, **kwargs: Any) -> "WorkflowBuilder":
+        """Free-form JSON stored on the workflow for your own bookkeeping."""
+        self._metadata.update(kwargs)
+        return self
+
+    def timeout_secs(self, secs: int) -> "WorkflowBuilder":
+        """Whole-workflow deadline in seconds (server 0.6.0 and later): the
+        record's ``deadline_at`` is set that long after creation. A workflow
+        still running when the janitor finds the deadline passed has every
+        unfinished step cancelled (their jobs and child workflows too) and
+        ends ``failed`` with ``error_message`` ``workflow timed out after
+        <secs>s``; a retry re-arms the deadline. At most 30 days."""
+        if secs <= 0:
+            raise WorkflowValidationError("timeout_secs must be a positive number of seconds")
+        self._timeout_secs = secs
         return self
 
     def build(self) -> CreateWorkflowRequest:
@@ -700,9 +843,66 @@ class WorkflowBuilder:
                 if dep not in names:
                     raise WorkflowValidationError('step "' + s.name + '" depends on unknown step "' + dep + '"')
         self._assert_acyclic()
+        fields: Dict[str, Any] = {}
+        if self._timeout_secs is not None:
+            fields["timeout_secs"] = self._timeout_secs
         return CreateWorkflowRequest(
-            name=self.name, steps=self._steps, context=self._context, metadata=self._metadata
+            name=self.name, steps=self._steps, context=self._context, metadata=self._metadata, **fields
         )
+
+    @classmethod
+    def _condition(
+        cls, step: str, when: Union[None, Dict[str, Any], StepCondition]
+    ) -> Optional[StepCondition]:
+        """Coerce a ``when`` argument into a StepCondition, checking the shape locally."""
+        if when is None or isinstance(when, StepCondition):
+            return when
+        if not isinstance(when, dict):
+            raise WorkflowValidationError(
+                'step "' + step + '": when must be a dict or a StepCondition, not ' + type(when).__name__
+            )
+        fields: Dict[str, Any] = {}
+        for key, value in when.items():
+            if key in ("all", "any"):
+                if not isinstance(value, list):
+                    raise WorkflowValidationError('step "' + step + '": when: ' + key + ' must be a list')
+                fields[key] = [cls._condition(step, item) for item in value]
+            elif key == "not":
+                fields["var_not"] = cls._condition(step, value)
+            elif key in ("op", "path", "value"):
+                fields[key] = value
+            else:
+                raise WorkflowValidationError('step "' + step + '": when: unknown key "' + key + '"')
+        if sum(1 for key in ("path", "all", "any", "var_not") if key in fields) != 1:
+            raise WorkflowValidationError(
+                'step "' + step + '": when: exactly one of path, all, any or not must be set'
+            )
+        try:
+            return StepCondition(**fields)
+        except ValidationError as err:
+            hint = ""
+            if "value" in fields and not isinstance(fields["value"], dict):
+                hint = " (with this release a condition value must be a JSON object; see the README)"
+            raise WorkflowValidationError('step "' + step + '": when: ' + str(err) + hint) from err
+
+    @staticmethod
+    def _fan_out(step: str, fan_out: Union[None, Dict[str, Any], FanOut]) -> Optional[FanOut]:
+        """Coerce a ``fan_out`` argument into a FanOut, checking the shape locally."""
+        if fan_out is None or isinstance(fan_out, FanOut):
+            return fan_out
+        if not isinstance(fan_out, dict):
+            raise WorkflowValidationError(
+                'step "' + step + '": fan_out must be a dict or a FanOut, not ' + type(fan_out).__name__
+            )
+        unknown = sorted(set(fan_out) - {"item_key", "max_items", "path"})
+        if unknown:
+            raise WorkflowValidationError('step "' + step + '": fan_out: unknown key "' + unknown[0] + '"')
+        if not fan_out.get("path"):
+            raise WorkflowValidationError('step "' + step + '": fan_out needs a path')
+        try:
+            return FanOut(**fan_out)
+        except (TypeError, ValidationError) as err:
+            raise WorkflowValidationError('step "' + step + '": fan_out: ' + str(err)) from err
 
     def _assert_acyclic(self) -> None:
         by_name = {s.name: s for s in self._steps}
