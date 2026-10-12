@@ -600,11 +600,24 @@ impl QueueFlow {
             .map_err(api_err("list_workflows"))
     }
 
-    /// Cancels a workflow and its not-yet-finished steps.
+    /// Cancels a workflow and its not-yet-finished steps (fan-out children
+    /// and child workflows included).
     pub async fn cancel_workflow(&self, id: &str) -> Result<(), FacadeError> {
         workflows_api::cancel_workflow(&self.config, id)
             .await
             .map_err(api_err("cancel_workflow"))
+    }
+
+    /// Re-runs a `failed`, `partially_failed` or `cancelled` workflow from
+    /// where it stopped: every step that did not complete goes back to
+    /// pending and is scheduled again; completed and condition-skipped steps
+    /// keep their results. The workflow becomes `running`, its
+    /// `error_message` clears, `retry_count` increments and the deadline, if
+    /// any, is re-armed. Retrying a running or completed workflow is a 409.
+    pub async fn retry_workflow(&self, id: &str) -> Result<(), FacadeError> {
+        workflows_api::retry_workflow(&self.config, id)
+            .await
+            .map_err(api_err("retry_workflow"))
     }
 
     /// The Mermaid (`graph TD`) diagram of the DAG.
@@ -617,8 +630,12 @@ impl QueueFlow {
             .map_err(api_err("workflow_diagram"))
     }
 
-    /// Runtime status of every step in declaration order, with the id of the
-    /// job executing each step once scheduled.
+    /// Runtime status of every step in declaration order: its `status`, the
+    /// `job_id` executing it once scheduled (the first child, for a
+    /// fan-out), the `error` behind a failed, skipped (`condition not met`)
+    /// or cancelled step, `started_at` / `completed_at`, the
+    /// `child_workflow_id` of a sub-workflow step and the `fan_out`
+    /// `{total, completed, failed}` counts of a fan-out step.
     pub async fn workflow_steps(&self, id: &str) -> Result<Vec<models::WorkflowStepState>, FacadeError> {
         workflows_api::get_workflow_step_states(&self.config, id)
             .await
@@ -1428,19 +1445,47 @@ impl WorkerShared {
 // Workflow builder
 // ---------------------------------------------------------------------------
 
-/// Per-step options for [`WorkflowBuilder::step_with_options`].
+/// Per-step options for [`WorkflowBuilder::step_with_options`] and
+/// [`WorkflowBuilder::sub_workflow`].
 #[derive(Clone, Debug, Default)]
 pub struct StepOptions {
     /// Names of the steps that must complete before this one runs.
     pub after: Vec<String>,
-    /// Passed to the task handler.
+    /// Passed to the task handler (merged into a child workflow's context
+    /// for a sub-workflow step).
     pub payload: Option<Json>,
     /// Execution config override (retries, timeout, ...).
     pub config: Option<models::JobConfig>,
+    /// Queue for this step's job(s); the server's default queue when `None`.
+    pub queue: Option<String>,
     /// `Halt` (default), `Skip` or `Continue`.
     pub on_failure: Option<models::OnFailure>,
     pub on_success: Option<models::OnSuccess>,
+    /// Gates the step on the workflow context at the moment it becomes
+    /// ready: a leaf (`path`, `op`, `value`) or an `all` / `any` / `not`
+    /// node. A false condition skips the step with the reason `condition not
+    /// met`; its dependents still run.
+    pub when: Option<models::StepCondition>,
+    /// Runs the task once per element of the array at `fan_out.path` in the
+    /// context. Not valid on a sub-workflow step.
+    pub fan_out: Option<models::FanOut>,
     pub metadata: Option<Json>,
+}
+
+impl StepOptions {
+    fn apply(self, step: &mut models::WorkflowStep) {
+        if !self.after.is_empty() {
+            step.depends_on = Some(self.after);
+        }
+        step.payload = self.payload;
+        step.config = self.config.map(|c| Some(Box::new(c)));
+        step.queue = self.queue.map(Some);
+        step.on_failure = self.on_failure;
+        step.on_success = self.on_success;
+        step.when = self.when.map(|c| Some(Box::new(c)));
+        step.fan_out = self.fan_out.map(|f| Some(Box::new(f)));
+        step.metadata = self.metadata;
+    }
 }
 
 /// A typed builder for a workflow DAG with local validation.
@@ -1450,6 +1495,7 @@ pub struct WorkflowBuilder {
     steps: Vec<models::WorkflowStep>,
     context: Option<Json>,
     metadata: Option<Json>,
+    timeout_secs: Option<i64>,
 }
 
 impl WorkflowBuilder {
@@ -1460,6 +1506,7 @@ impl WorkflowBuilder {
             steps: Vec::new(),
             context: None,
             metadata: None,
+            timeout_secs: None,
         }
     }
 
@@ -1475,18 +1522,31 @@ impl WorkflowBuilder {
         )
     }
 
-    /// Adds a step with a payload, failure policy, config override and
-    /// dependencies.
+    /// Adds a step running `task` with a payload, queue, failure policy,
+    /// config override, condition, fan-out and dependencies.
     pub fn step_with_options(mut self, name: &str, task: &str, opts: StepOptions) -> Self {
-        let mut step = models::WorkflowStep::new(name.to_owned(), task.to_owned());
-        if !opts.after.is_empty() {
-            step.depends_on = Some(opts.after);
-        }
-        step.payload = opts.payload;
-        step.config = opts.config.map(|c| Some(Box::new(c)));
-        step.on_failure = opts.on_failure;
-        step.on_success = opts.on_success;
-        step.metadata = opts.metadata;
+        let mut step = models::WorkflowStep::new(name.to_owned());
+        step.task_name = Some(task.to_owned());
+        opts.apply(&mut step);
+        self.steps.push(step);
+        self
+    }
+
+    /// Adds a step that runs the inline `child` workflow instead of a task
+    /// (build it with another `WorkflowBuilder`). The child runs as a
+    /// workflow of its own with `parent_workflow_id` and `parent_step_name`
+    /// set; its context is its own `context`, then `opts.payload`, then the
+    /// parent's context under `_parent`. The step's result is the child's
+    /// final context. `opts.fan_out` is rejected by `build`.
+    pub fn sub_workflow(
+        mut self,
+        name: &str,
+        child: models::CreateWorkflowRequest,
+        opts: StepOptions,
+    ) -> Self {
+        let mut step = models::WorkflowStep::new(name.to_owned());
+        step.workflow = Some(Some(Box::new(child)));
+        opts.apply(&mut step);
         self.steps.push(step);
         self
     }
@@ -1503,45 +1563,190 @@ impl WorkflowBuilder {
         self
     }
 
-    /// Validates the DAG (duplicate names, dangling deps, cycles) and returns
-    /// the request body. A structurally invalid DAG returns an error before
-    /// any network round-trip.
+    /// Sets the whole-workflow deadline, in seconds from creation (1 to 30
+    /// days). Past it the server cancels every unfinished step and fails the
+    /// workflow with `workflow timed out`; a retry re-arms it.
+    pub fn timeout_secs(mut self, secs: i64) -> Self {
+        self.timeout_secs = Some(secs);
+        self
+    }
+
+    /// Validates the definition the way the server will (duplicate names,
+    /// dangling deps, cycles, step kinds, conditions, fan-outs, the timeout
+    /// and sub-workflow nesting, recursively) and returns the request body.
+    /// A structurally invalid definition returns `FacadeError::InvalidWorkflow`
+    /// before any network round-trip.
     pub fn build(&self) -> Result<models::CreateWorkflowRequest, FacadeError> {
-        if self.name.is_empty() {
-            return Err(FacadeError::InvalidWorkflow(
-                "workflow name is required".to_owned(),
-            ));
-        }
-        if self.steps.is_empty() {
-            return Err(FacadeError::InvalidWorkflow(format!(
-                "workflow {:?} has no steps",
-                self.name
-            )));
-        }
-        let mut names = HashSet::new();
-        for step in &self.steps {
-            if !names.insert(step.name.as_str()) {
-                return Err(FacadeError::InvalidWorkflow(format!(
-                    "duplicate step name {:?}",
-                    step.name
-                )));
-            }
-        }
-        for step in &self.steps {
-            for dep in step.depends_on.iter().flatten() {
-                if !names.contains(dep.as_str()) {
-                    return Err(FacadeError::InvalidWorkflow(format!(
-                        "step {:?} depends on unknown step {:?}",
-                        step.name, dep
-                    )));
-                }
-            }
-        }
-        assert_acyclic(&self.steps)?;
         let mut req = models::CreateWorkflowRequest::new(self.name.clone(), self.steps.clone());
         req.context = self.context.clone();
         req.metadata = self.metadata.clone();
+        req.timeout_secs = self.timeout_secs.map(Some);
+        validate_request(&req, 0)?;
         Ok(req)
+    }
+}
+
+/// Server limits mirrored by the local validation.
+const MAX_WORKFLOW_TIMEOUT_SECS: i64 = 2_592_000;
+const MAX_FAN_OUT: i32 = 10_000;
+const MAX_WORKFLOW_DEPTH: usize = 8;
+
+fn invalid(msg: String) -> FacadeError {
+    FacadeError::InvalidWorkflow(msg)
+}
+
+fn validate_request(req: &models::CreateWorkflowRequest, depth: usize) -> Result<(), FacadeError> {
+    if depth > MAX_WORKFLOW_DEPTH {
+        return Err(invalid(format!(
+            "sub-workflows nest deeper than {}",
+            MAX_WORKFLOW_DEPTH
+        )));
+    }
+    if req.name.trim().is_empty() {
+        return Err(invalid("workflow name is required".to_owned()));
+    }
+    if req.steps.is_empty() {
+        return Err(invalid(format!("workflow {:?} has no steps", req.name)));
+    }
+    if let Some(Some(t)) = req.timeout_secs {
+        if t <= 0 || t > MAX_WORKFLOW_TIMEOUT_SECS {
+            return Err(invalid(format!(
+                "workflow {:?}: timeout_secs must be within 1..={}",
+                req.name, MAX_WORKFLOW_TIMEOUT_SECS
+            )));
+        }
+    }
+    let mut names = HashSet::new();
+    for step in &req.steps {
+        if step.name.trim().is_empty() {
+            return Err(invalid("step name is required".to_owned()));
+        }
+        if !names.insert(step.name.as_str()) {
+            return Err(invalid(format!("duplicate step name {:?}", step.name)));
+        }
+    }
+    for step in &req.steps {
+        for dep in step.depends_on.iter().flatten() {
+            if !names.contains(dep.as_str()) {
+                return Err(invalid(format!(
+                    "step {:?} depends on unknown step {:?}",
+                    step.name, dep
+                )));
+            }
+        }
+    }
+    assert_acyclic(&req.steps)?;
+    for step in &req.steps {
+        validate_step(step, depth)?;
+    }
+    Ok(())
+}
+
+fn validate_step(step: &models::WorkflowStep, depth: usize) -> Result<(), FacadeError> {
+    let at = |msg: String| invalid(format!("step {:?}: {}", step.name, msg));
+    match step.workflow.as_ref().and_then(Option::as_ref) {
+        Some(child) => {
+            if step.fan_out.as_ref().is_some_and(Option::is_some) {
+                return Err(at(
+                    "a step is either a sub-workflow or a fan-out, not both".to_owned(),
+                ));
+            }
+            validate_request(child, depth + 1).map_err(|e| at(format!("sub-workflow: {}", e)))?;
+        }
+        None => {
+            if step.task_name.as_deref().unwrap_or("").trim().is_empty() {
+                return Err(at(
+                    "task_name is required unless the step runs a workflow".to_owned(),
+                ));
+            }
+        }
+    }
+    if let Some(Some(q)) = &step.queue {
+        if q.trim().is_empty() {
+            return Err(at("queue must not be empty".to_owned()));
+        }
+    }
+    if let Some(Some(cond)) = &step.when {
+        validate_condition(cond).map_err(|e| at(format!("when: {}", e)))?;
+    }
+    if let Some(Some(f)) = &step.fan_out {
+        if f.path.trim().is_empty() {
+            return Err(at("fan_out.path is required".to_owned()));
+        }
+        if let Some(Some(m)) = f.max_items {
+            if m <= 0 || m > MAX_FAN_OUT {
+                return Err(at(format!(
+                    "fan_out.max_items must be within 1..={}",
+                    MAX_FAN_OUT
+                )));
+            }
+        }
+        if let Some(Some(k)) = &f.item_key {
+            if k.is_empty() || k == "_context" {
+                return Err(at(
+                    "fan_out.item_key must be a non-empty key other than _context".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The shape check the server applies to a `when` condition: exactly one of
+/// `path`, `all`, `any` or `not`; `op` and `value` only with `path`; `op`
+/// consistent with `value` (`exists` takes none, `in` takes an array, every
+/// other operator needs one).
+fn validate_condition(cond: &models::StepCondition) -> Result<(), String> {
+    let path = cond.path.as_ref().and_then(Option::as_ref);
+    let all = cond.all.as_ref().and_then(Option::as_ref);
+    let any = cond.any.as_ref().and_then(Option::as_ref);
+    let not = cond.not.as_ref().and_then(Option::as_ref);
+    let op = cond.op.flatten();
+    let value = cond.value.as_ref().and_then(Option::as_ref);
+    let branches = [path.is_some(), all.is_some(), any.is_some(), not.is_some()]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if branches != 1 {
+        return Err("a condition needs exactly one of path, all, any or not".to_owned());
+    }
+    match path {
+        Some(p) => {
+            if p.is_empty() {
+                return Err("condition path must not be empty".to_owned());
+            }
+            let effective = op.unwrap_or(if value.is_some() {
+                models::ConditionOp::Eq
+            } else {
+                models::ConditionOp::Exists
+            });
+            match (effective, value) {
+                (models::ConditionOp::Exists, Some(_)) => {
+                    Err("op exists does not take a value".to_owned())
+                }
+                (models::ConditionOp::Exists, None) => Ok(()),
+                (o, None) => Err(format!("op {} needs a value", o)),
+                (models::ConditionOp::In, Some(v)) if !v.is_array() => {
+                    Err("op in needs an array value".to_owned())
+                }
+                _ => Ok(()),
+            }
+        }
+        None => {
+            if op.is_some() || value.is_some() {
+                return Err("op and value are only valid with path".to_owned());
+            }
+            if all.is_some_and(|v| v.is_empty()) || any.is_some_and(|v| v.is_empty()) {
+                return Err("all and any need at least one member".to_owned());
+            }
+            for member in all.into_iter().chain(any).flatten() {
+                validate_condition(member)?;
+            }
+            if let Some(n) = not {
+                validate_condition(n)?;
+            }
+            Ok(())
+        }
     }
 }
 
