@@ -8,9 +8,10 @@ the per-tag API services come from the generated files and are never edited.
 
 The facade is the recommended entry point: a QueueFlow client with one method
 per endpoint (including the bulk CancelJobs and ReplayDeadLetters, queue
-PauseQueue/ResumeQueue and WhoAmI), WaitForJob/WaitForWorkflow pollers, a
-workflow builder with local DAG validation, typed errors, and a worker runtime
-(Run) that leases jobs, heartbeats them, and reports outcomes.
+PauseQueue/ResumeQueue, WhoAmI and RetryWorkflow), WaitForJob/WaitForWorkflow
+pollers, a workflow builder with local DAG validation (steps, per-step queues,
+conditions, fan-out and inline sub-workflows), typed errors, and a worker
+runtime (Run) that leases jobs, heartbeats them, and reports outcomes.
 */
 
 package queueflow
@@ -578,10 +579,23 @@ func (q *QueueFlow) ListWorkflows(ctx context.Context, opts ListOptions) (*ListW
 	return out, nil
 }
 
-// CancelWorkflow cancels a workflow and its not-yet-finished steps.
+// CancelWorkflow cancels a workflow and its not-yet-finished steps, fan-out
+// children and child workflows included.
 func (q *QueueFlow) CancelWorkflow(ctx context.Context, id string) error {
 	resp, err := q.Client.WorkflowsAPI.CancelWorkflow(ctx, id).Execute()
 	return wrap("CancelWorkflow", resp, err)
+}
+
+// RetryWorkflow re-runs a failed, partially_failed or cancelled workflow from
+// where it stopped: every step that did not complete goes back to pending and
+// is scheduled again as its dependencies allow, while completed steps and
+// condition-skipped steps keep their results. The workflow becomes running,
+// its ErrorMessage clears, RetryCount increments and the deadline, if any, is
+// re-armed from the original TimeoutSecs. Retrying a running or completed
+// workflow is an *APIError with Status 409.
+func (q *QueueFlow) RetryWorkflow(ctx context.Context, id string) error {
+	resp, err := q.Client.WorkflowsAPI.RetryWorkflow(ctx, id).Execute()
+	return wrap("RetryWorkflow", resp, err)
 }
 
 // WorkflowDiagram returns the Mermaid ("graph TD") diagram of the DAG.
@@ -593,8 +607,12 @@ func (q *QueueFlow) WorkflowDiagram(ctx context.Context, id string) (*WorkflowDi
 	return out, nil
 }
 
-// WorkflowSteps returns the runtime status of every step in declaration
-// order, with the id of the job executing each step once scheduled.
+// WorkflowSteps returns the live state of every step in declaration order:
+// Status, the JobId executing it once scheduled (the first child for a
+// fan-out), Error (why it failed, was cancelled, or was skipped: "condition
+// not met" for a false When), StartedAt and CompletedAt, ChildWorkflowId for
+// a sub-workflow step once spawned, and FanOut progress (Total, Completed,
+// Failed) for a fan-out step.
 func (q *QueueFlow) WorkflowSteps(ctx context.Context, id string) ([]WorkflowStepState, error) {
 	out, resp, err := q.Client.WorkflowsAPI.GetWorkflowStepStates(ctx, id).Execute()
 	if err != nil {
@@ -1229,26 +1247,50 @@ func callHandler(ctx context.Context, h Handler, job *Job) (result map[string]in
 // Workflow builder
 // ---------------------------------------------------------------------------
 
-// StepOptions configures one workflow step for StepWithOptions.
+// StepOptions configures one workflow step for StepWithOptions and
+// SubWorkflow. Zero values are not sent, so the server defaults apply.
 type StepOptions struct {
-	// After names the steps that must complete before this one runs.
+	// After names the steps that must finish before this one runs. A step
+	// skipped by its When condition still satisfies its dependents; a step
+	// skipped by an on_failure: skip policy does not.
 	After []string
-	// Payload is passed to the task handler.
+	// Payload is passed to the task handler (the engine adds _context to it
+	// at enqueue time). For a sub-workflow step it is merged into the child's
+	// context.
 	Payload map[string]interface{}
-	// Config overrides the step's execution config (retries, timeout, ...).
+	// Config overrides the step's execution config (retries, per-attempt
+	// timeout, ...).
 	Config *JobConfig
+	// Queue is the queue for this step's job(s); the server's default queue
+	// when empty.
+	Queue string
+	// When gates the step on the workflow context at the moment it becomes
+	// ready: a false condition skips it with the reason "condition not met"
+	// and its dependents run as normal. Build with When, WhenExists, WhenAll,
+	// WhenAny and WhenNot, or fill a StepCondition directly.
+	When *StepCondition
+	// FanOut runs the task once per element of the array at FanOut.Path in
+	// the context, each child getting the element under FanOut.ItemKey
+	// ("item" by default) and its position under _index. The step's result is
+	// a "results" array in element order. Not combinable with SubWorkflow.
+	FanOut *FanOut
 	// OnFailure is ONFAILURE_HALT (default), ONFAILURE_SKIP or ONFAILURE_CONTINUE.
 	OnFailure OnFailure
 	OnSuccess OnSuccess
-	Metadata  map[string]interface{}
+	// Metadata is copied onto the step's job(s).
+	Metadata map[string]interface{}
 }
 
 // WorkflowBuilder is a typed builder for a workflow DAG with local validation.
 type WorkflowBuilder struct {
-	name     string
-	steps    []WorkflowStep
+	name  string
+	steps []WorkflowStep
+	// children maps a step index to the inline child workflow SubWorkflow
+	// registered for it; children are built (and validated) in Build.
+	children map[int]*WorkflowBuilder
 	context  map[string]interface{}
 	metadata map[string]interface{}
+	timeout  *int64
 }
 
 // NewWorkflowBuilder starts a workflow definition named name.
@@ -1261,10 +1303,38 @@ func (b *WorkflowBuilder) Step(name, task string, after ...string) *WorkflowBuil
 	return b.StepWithOptions(name, task, StepOptions{After: after})
 }
 
-// StepWithOptions adds a step with a payload, failure policy, config override
-// and dependencies.
+// StepWithOptions adds a step running task with a payload, queue, condition,
+// fan-out, failure policy, config override and dependencies.
 func (b *WorkflowBuilder) StepWithOptions(name, task string, opts StepOptions) *WorkflowBuilder {
-	s := NewWorkflowStep(name, task)
+	s := NewWorkflowStep(name)
+	if task != "" {
+		s.TaskName = PtrString(task)
+	}
+	applyStepOptions(s, opts)
+	b.steps = append(b.steps, *s)
+	return b
+}
+
+// SubWorkflow adds a step that runs child as an inline child workflow instead
+// of a task. When the step becomes ready the child is created as a workflow
+// of its own (ParentWorkflowId and ParentStepName set, the step's state
+// carrying its ChildWorkflowId), with its context seeded from the child's
+// Context, then opts.Payload, then the parent's whole context under _parent.
+// The step completes with the child's final context as its result; a failed,
+// partially failed or cancelled child fails the step under opts.OnFailure.
+// Children nest up to 8 levels. child is validated by the parent's Build.
+func (b *WorkflowBuilder) SubWorkflow(name string, child *WorkflowBuilder, opts StepOptions) *WorkflowBuilder {
+	s := NewWorkflowStep(name)
+	applyStepOptions(s, opts)
+	if b.children == nil {
+		b.children = map[int]*WorkflowBuilder{}
+	}
+	b.children[len(b.steps)] = child
+	b.steps = append(b.steps, *s)
+	return b
+}
+
+func applyStepOptions(s *WorkflowStep, opts StepOptions) {
 	if len(opts.After) > 0 {
 		s.DependsOn = opts.After
 	}
@@ -1273,6 +1343,15 @@ func (b *WorkflowBuilder) StepWithOptions(name, task string, opts StepOptions) *
 	}
 	if opts.Config != nil {
 		s.Config = *NewNullableJobConfig(opts.Config)
+	}
+	if opts.Queue != "" {
+		s.Queue = *NewNullableString(PtrString(opts.Queue))
+	}
+	if opts.When != nil {
+		s.When = *NewNullableStepCondition(opts.When)
+	}
+	if opts.FanOut != nil {
+		s.FanOut = *NewNullableFanOut(opts.FanOut)
 	}
 	if opts.OnFailure != "" {
 		f := opts.OnFailure
@@ -1285,7 +1364,14 @@ func (b *WorkflowBuilder) StepWithOptions(name, task string, opts StepOptions) *
 	if opts.Metadata != nil {
 		s.Metadata = opts.Metadata
 	}
-	b.steps = append(b.steps, *s)
+}
+
+// Timeout sets the whole-workflow deadline, in seconds, counted from
+// creation: a workflow still running when it passes has every unfinished step
+// cancelled and ends failed with "workflow timed out after Ns". A retry
+// re-arms it. The server accepts 1 second to 30 days.
+func (b *WorkflowBuilder) Timeout(secs int64) *WorkflowBuilder {
+	b.timeout = PtrInt64(secs)
 	return b
 }
 
@@ -1311,15 +1397,22 @@ func (b *WorkflowBuilder) Metadata(metadata map[string]interface{}) *WorkflowBui
 	return b
 }
 
-// Build validates the DAG (duplicate names, dangling deps, cycles) and returns
+// Build validates the DAG (duplicate names, dangling deps, cycles, a step
+// with neither a task nor a sub-workflow or with both a fan-out and a
+// sub-workflow, a fan-out without a path, a malformed condition, a
+// non-positive timeout, and every inline child workflow in turn) and returns
 // the request body. A structurally invalid DAG returns an error before any
-// network round-trip.
+// network round-trip. Semantic checks (queue names, limits, nesting depth)
+// stay with the server, which answers 400 with the offending step named.
 func (b *WorkflowBuilder) Build() (*CreateWorkflowRequest, error) {
 	if b.name == "" {
 		return nil, fmt.Errorf("workflow name is required")
 	}
 	if len(b.steps) == 0 {
 		return nil, fmt.Errorf("workflow %q has no steps", b.name)
+	}
+	if b.timeout != nil && *b.timeout <= 0 {
+		return nil, fmt.Errorf("workflow %q: timeout must be positive, got %d", b.name, *b.timeout)
 	}
 	names := map[string]bool{}
 	for _, s := range b.steps {
@@ -1328,24 +1421,170 @@ func (b *WorkflowBuilder) Build() (*CreateWorkflowRequest, error) {
 		}
 		names[s.Name] = true
 	}
-	for _, s := range b.steps {
+	for i, s := range b.steps {
 		for _, dep := range s.DependsOn {
 			if !names[dep] {
 				return nil, fmt.Errorf("step %q depends on unknown step %q", s.Name, dep)
+			}
+		}
+		_, isChild := b.children[i]
+		if s.TaskName == nil && !isChild {
+			return nil, fmt.Errorf("step %q needs a task or a sub-workflow", s.Name)
+		}
+		if s.FanOut.IsSet() {
+			if isChild {
+				return nil, fmt.Errorf("step %q cannot both fan out and run a sub-workflow", s.Name)
+			}
+			if f := s.FanOut.Get(); f == nil || f.Path == "" {
+				return nil, fmt.Errorf("step %q: fan_out needs a path", s.Name)
+			}
+		}
+		if s.When.IsSet() {
+			if err := validateCondition(s.When.Get()); err != nil {
+				return nil, fmt.Errorf("step %q: when: %w", s.Name, err)
 			}
 		}
 	}
 	if err := b.assertAcyclic(); err != nil {
 		return nil, err
 	}
-	req := NewCreateWorkflowRequest(b.name, b.steps)
+	steps := make([]WorkflowStep, len(b.steps))
+	copy(steps, b.steps)
+	for i, child := range b.children {
+		if child == nil {
+			return nil, fmt.Errorf("step %q: sub-workflow is nil", steps[i].Name)
+		}
+		childReq, err := child.Build()
+		if err != nil {
+			return nil, fmt.Errorf("step %q: sub-workflow: %w", steps[i].Name, err)
+		}
+		steps[i].Workflow = *NewNullableCreateWorkflowRequest(childReq)
+	}
+	req := NewCreateWorkflowRequest(b.name, steps)
 	if b.context != nil {
 		req.Context = b.context
 	}
 	if b.metadata != nil {
 		req.Metadata = b.metadata
 	}
+	if b.timeout != nil {
+		req.TimeoutSecs = *NewNullableInt64(b.timeout)
+	}
 	return req, nil
+}
+
+// validateCondition checks the shape the server requires: exactly one of
+// path, all, any or not per node, with non-empty all/any lists.
+func validateCondition(c *StepCondition) error {
+	if c == nil {
+		return fmt.Errorf("condition is nil")
+	}
+	selectors := 0
+	if c.Path.IsSet() && c.Path.Get() != nil {
+		selectors++
+	}
+	if c.All != nil {
+		selectors++
+	}
+	if c.Any != nil {
+		selectors++
+	}
+	if c.Not.IsSet() && c.Not.Get() != nil {
+		selectors++
+	}
+	if selectors != 1 {
+		return fmt.Errorf("exactly one of path, all, any or not is required")
+	}
+	if c.All != nil && len(c.All) == 0 {
+		return fmt.Errorf("all needs at least one condition")
+	}
+	if c.Any != nil && len(c.Any) == 0 {
+		return fmt.Errorf("any needs at least one condition")
+	}
+	for i := range c.All {
+		if err := validateCondition(&c.All[i]); err != nil {
+			return fmt.Errorf("all[%d]: %w", i, err)
+		}
+	}
+	for i := range c.Any {
+		if err := validateCondition(&c.Any[i]); err != nil {
+			return fmt.Errorf("any[%d]: %w", i, err)
+		}
+	}
+	if c.Not.IsSet() && c.Not.Get() != nil {
+		if err := validateCondition(c.Not.Get()); err != nil {
+			return fmt.Errorf("not: %w", err)
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Step conditions
+// ---------------------------------------------------------------------------
+
+// When is a leaf condition: the value at the dotted path in the workflow
+// context (step results live under their step name, so "validate.ok" is the
+// ok key of the validate step's result; numeric segments index arrays)
+// compared with value using op. A missing path never errors: it compares as
+// absent (CONDITIONOP_EXISTS false, CONDITIONOP_NE true, everything else
+// false). An empty op lets the server pick the default: CONDITIONOP_EQ with a
+// value, CONDITIONOP_EXISTS without one.
+//
+// The generated StepCondition types value as a JSON object because the
+// server's spec declares it so, which means this release can only compare
+// against objects or send no value at all (as WhenExists does). Scalar and
+// array values need that spec entry widened in queueflow-core; until then a
+// workflow whose condition carries one cannot be built, or decoded by
+// GetWorkflow, through this SDK.
+func When(path string, op ConditionOp, value map[string]interface{}) *StepCondition {
+	c := NewStepCondition()
+	c.SetPath(path)
+	if op != "" {
+		c.SetOp(op)
+	}
+	if value != nil {
+		c.SetValue(value)
+	}
+	return c
+}
+
+// WhenExists is true when path resolves to something other than null.
+func WhenExists(path string) *StepCondition {
+	return When(path, CONDITIONOP_EXISTS, nil)
+}
+
+// WhenAll is true when every member is true.
+func WhenAll(conds ...*StepCondition) *StepCondition {
+	c := NewStepCondition()
+	c.SetAll(derefConditions(conds))
+	return c
+}
+
+// WhenAny is true when at least one member is true.
+func WhenAny(conds ...*StepCondition) *StepCondition {
+	c := NewStepCondition()
+	c.SetAny(derefConditions(conds))
+	return c
+}
+
+// WhenNot inverts cond.
+func WhenNot(cond *StepCondition) *StepCondition {
+	c := NewStepCondition()
+	if cond != nil {
+		c.SetNot(*cond)
+	}
+	return c
+}
+
+func derefConditions(conds []*StepCondition) []StepCondition {
+	out := make([]StepCondition, 0, len(conds))
+	for _, c := range conds {
+		if c != nil {
+			out = append(out, *c)
+		}
+	}
+	return out
 }
 
 func (b *WorkflowBuilder) assertAcyclic() error {
