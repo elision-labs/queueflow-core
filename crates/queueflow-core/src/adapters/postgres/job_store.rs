@@ -244,6 +244,124 @@ where
     Ok(affected > 0)
 }
 
+/// Insert many job rows in one UNNEST statement (every column that an
+/// engine-created job carries, workflow linkage and metadata included).
+/// Generic over the executor so it runs standalone and inside the
+/// fan-out claim transaction.
+async fn insert_jobs<'e, E>(executor: E, jobs: &[Job]) -> Result<(), StorageError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let n = jobs.len();
+    let mut ids = Vec::with_capacity(n);
+    let mut queues = Vec::with_capacity(n);
+    let mut tasks = Vec::with_capacity(n);
+    let mut payloads = Vec::with_capacity(n);
+    let mut configs = Vec::with_capacity(n);
+    let mut priorities = Vec::with_capacity(n);
+    let mut created = Vec::with_capacity(n);
+    let mut scheduled = Vec::with_capacity(n);
+    let mut metadatas = Vec::with_capacity(n);
+    let mut tenants: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut workflow_ids: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut step_ids: Vec<Option<String>> = Vec::with_capacity(n);
+    for job in jobs {
+        ids.push(job.id.clone());
+        queues.push(job.queue_name.clone());
+        tasks.push(job.task_name.clone());
+        payloads.push(to_jsonb(&job.payload)?);
+        configs.push(to_jsonb(&job.config)?);
+        priorities.push(job.config.priority);
+        created.push(job.created_at);
+        scheduled.push(job.scheduled_at);
+        metadatas.push(to_jsonb(&job.metadata)?);
+        tenants.push(job.tenant_id.clone());
+        workflow_ids.push(job.workflow_id.clone());
+        step_ids.push(job.workflow_step_id.clone());
+    }
+    sqlx::query(
+        "INSERT INTO queueflow.jobs (id, queue_name, task_name, payload, config, status, \
+         priority, created_at, scheduled_at, retry_count, metadata, tenant_id, \
+         workflow_id, workflow_step_id) \
+         SELECT u.id, u.queue_name, u.task_name, u.payload, u.config, 'pending', \
+         u.priority, u.created_at, u.scheduled_at, 0, u.metadata, u.tenant_id, \
+         u.workflow_id, u.workflow_step_id \
+         FROM UNNEST($1::text[], $2::text[], $3::text[], $4::jsonb[], $5::jsonb[], \
+         $6::int[], $7::timestamptz[], $8::timestamptz[], $9::jsonb[], $10::text[], \
+         $11::text[], $12::text[]) \
+         AS u(id, queue_name, task_name, payload, config, priority, created_at, scheduled_at, \
+         metadata, tenant_id, workflow_id, workflow_step_id)",
+    )
+    .bind(&ids)
+    .bind(&queues)
+    .bind(&tasks)
+    .bind(&payloads)
+    .bind(&configs)
+    .bind(&priorities)
+    .bind(&created)
+    .bind(&scheduled)
+    .bind(&metadatas)
+    .bind(&tenants)
+    .bind(&workflow_ids)
+    .bind(&step_ids)
+    .execute(executor)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+/// Insert a workflow row and its pending step rows. Generic over the
+/// executor so it runs standalone and inside the sub-workflow claim
+/// transaction.
+async fn insert_workflow(tx: &mut sqlx::PgConnection, wf: &Workflow) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO queueflow.workflows (id, name, status, created_at, context, metadata, \
+         tenant_id, timeout_secs, deadline_at, parent_workflow_id, parent_step_name) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+    )
+    .bind(&wf.id)
+    .bind(&wf.name)
+    .bind(wf.status.as_str())
+    .bind(wf.created_at)
+    .bind(to_jsonb(&wf.context)?)
+    .bind(to_jsonb(&wf.metadata)?)
+    .bind(wf.tenant_id.as_deref())
+    .bind(wf.timeout_secs.map(|t| t as i64))
+    .bind(wf.deadline_at)
+    .bind(wf.parent_workflow_id.as_deref())
+    .bind(wf.parent_step_name.as_deref())
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
+
+    for (idx, step) in wf.steps.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO queueflow.workflow_steps (workflow_id, name, idx, task_name, payload, \
+             depends_on, config, on_success, on_failure, status, metadata, queue_name, \
+             condition, fan_out, child_workflow) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,$11,$12,$13,$14)",
+        )
+        .bind(&wf.id)
+        .bind(&step.name)
+        .bind(idx as i32)
+        .bind(&step.task_name)
+        .bind(to_jsonb(&step.payload)?)
+        .bind(to_jsonb(&step.depends_on)?)
+        .bind(step.config.as_ref().map(to_jsonb).transpose()?)
+        .bind(on_success_str(step.on_success))
+        .bind(on_failure_str(step.on_failure))
+        .bind(to_jsonb(&step.metadata)?)
+        .bind(step.queue.as_deref())
+        .bind(step.when.as_ref().map(to_jsonb).transpose()?)
+        .bind(step.fan_out.as_ref().map(to_jsonb).transpose()?)
+        .bind(step.workflow.as_ref().map(|w| to_jsonb(&**w)).transpose()?)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl JobStore for PostgresJobStore {
     async fn create_job(&self, job: &Job) -> Result<bool, StorageError> {
@@ -274,52 +392,8 @@ impl JobStore for PostgresJobStore {
         if jobs.is_empty() {
             return Ok(vec![]);
         }
-        let n = jobs.len();
-        let mut ids = Vec::with_capacity(n);
-        let mut queues = Vec::with_capacity(n);
-        let mut tasks = Vec::with_capacity(n);
-        let mut payloads = Vec::with_capacity(n);
-        let mut configs = Vec::with_capacity(n);
-        let mut priorities = Vec::with_capacity(n);
-        let mut created = Vec::with_capacity(n);
-        let mut scheduled = Vec::with_capacity(n);
-        let mut metadatas = Vec::with_capacity(n);
-        let mut tenants: Vec<Option<String>> = Vec::with_capacity(n);
-        for job in jobs {
-            ids.push(job.id.clone());
-            queues.push(job.queue_name.clone());
-            tasks.push(job.task_name.clone());
-            payloads.push(to_jsonb(&job.payload)?);
-            configs.push(to_jsonb(&job.config)?);
-            priorities.push(job.config.priority);
-            created.push(job.created_at);
-            scheduled.push(job.scheduled_at);
-            metadatas.push(to_jsonb(&job.metadata)?);
-            tenants.push(job.tenant_id.clone());
-        }
-        sqlx::query(
-            "INSERT INTO queueflow.jobs (id, queue_name, task_name, payload, config, status, \
-             priority, created_at, scheduled_at, retry_count, metadata, tenant_id) \
-             SELECT u.id, u.queue_name, u.task_name, u.payload, u.config, 'pending', \
-             u.priority, u.created_at, u.scheduled_at, 0, u.metadata, u.tenant_id \
-             FROM UNNEST($1::text[], $2::text[], $3::text[], $4::jsonb[], $5::jsonb[], \
-             $6::int[], $7::timestamptz[], $8::timestamptz[], $9::jsonb[], $10::text[]) \
-             AS u(id, queue_name, task_name, payload, config, priority, created_at, scheduled_at, metadata, tenant_id)",
-        )
-        .bind(&ids)
-        .bind(&queues)
-        .bind(&tasks)
-        .bind(&payloads)
-        .bind(&configs)
-        .bind(&priorities)
-        .bind(&created)
-        .bind(&scheduled)
-        .bind(&metadatas)
-        .bind(&tenants)
-        .execute(&self.pool)
-        .await
-        .map_err(db)?;
-        Ok(ids)
+        insert_jobs(&self.pool, jobs).await?;
+        Ok(jobs.iter().map(|j| j.id.clone()).collect())
     }
 
     async fn get_job(&self, id: &str) -> Result<Job, StorageError> {
@@ -1094,11 +1168,21 @@ impl JobStore for PostgresJobStore {
         // Driven from the (few) non-terminal steps: the positive status list
         // is exhaustive and keeps idx_workflow_steps_status usable, so this
         // sweep stays cheap however much terminal history accumulates.
+        // A step is stalled when every job linked to it is terminal (for a
+        // fan-out, the last child settled) and the step is not. One job per
+        // step is enough: re-driving it settles the whole step.
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {} FROM queueflow.workflow_steps s \
-             JOIN queueflow.jobs j ON j.id = s.job_id \
-             WHERE s.status IN ('pending','running') \
-               AND j.status IN ('completed','failed','cancelled') \
+            "SELECT DISTINCT ON (s.workflow_id, s.name) {} \
+             FROM queueflow.workflow_steps s \
+             JOIN queueflow.jobs j \
+               ON j.workflow_id = s.workflow_id AND j.workflow_step_id = s.name \
+             WHERE s.status IN ('pending','running') AND s.job_id IS NOT NULL \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM queueflow.jobs x \
+                   WHERE x.workflow_id = s.workflow_id AND x.workflow_step_id = s.name \
+                     AND x.status IN ('pending','running','retrying')\
+               ) \
+             ORDER BY s.workflow_id, s.name \
              LIMIT $1",
             job_columns_prefixed("j")
         )))
@@ -1116,10 +1200,15 @@ impl JobStore for PostgresJobStore {
             "SELECT w.id FROM queueflow.workflows w \
              WHERE w.status IN ('created','running') \
                AND NOT EXISTS (\
-                   SELECT 1 FROM queueflow.workflow_steps s \
-                   JOIN queueflow.jobs j ON j.id = s.job_id \
-                   WHERE s.workflow_id = w.id \
+                   SELECT 1 FROM queueflow.jobs j \
+                   WHERE j.workflow_id = w.id \
                      AND j.status IN ('pending','running','retrying')\
+               ) \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM queueflow.workflow_steps s \
+                   JOIN queueflow.workflows c ON c.id = s.child_workflow_id \
+                   WHERE s.workflow_id = w.id AND s.status IN ('pending','running') \
+                     AND c.status IN ('created','running')\
                ) \
              LIMIT $1",
         )
@@ -1201,42 +1290,167 @@ impl JobStore for PostgresJobStore {
 
     async fn create_workflow(&self, wf: &Workflow) -> Result<(), StorageError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
-        sqlx::query(
-            "INSERT INTO queueflow.workflows (id, name, status, created_at, context, metadata, tenant_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        insert_workflow(&mut tx, wf).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(())
+    }
+
+    async fn create_child_workflow(&self, child: &Workflow) -> Result<bool, StorageError> {
+        let parent = child.parent_workflow_id.as_deref().unwrap_or_default();
+        let step = child.parent_step_name.as_deref().unwrap_or_default();
+        // Claim the parent step and persist the child together, so the
+        // child only ever exists linked to the step it won.
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let claimed = sqlx::query(
+            "UPDATE queueflow.workflow_steps SET child_workflow_id = $3, started_at = now() \
+             WHERE workflow_id = $1 AND name = $2 AND job_id IS NULL AND child_workflow_id IS NULL",
         )
-        .bind(&wf.id)
-        .bind(&wf.name)
-        .bind(wf.status.as_str())
-        .bind(wf.created_at)
-        .bind(to_jsonb(&wf.context)?)
-        .bind(to_jsonb(&wf.metadata)?)
-        .bind(wf.tenant_id.as_deref())
+        .bind(parent)
+        .bind(step)
+        .bind(&child.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if claimed == 0 {
+            tx.rollback().await.map_err(db)?;
+            return Ok(false);
+        }
+        insert_workflow(&mut tx, child).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+
+    async fn step_job_outcomes(
+        &self,
+        workflow_id: &str,
+        step_name: &str,
+    ) -> Result<Vec<StepJobOutcome>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT id, status, result, error_message, \
+                    COALESCE((metadata->>'fan_out_index')::bigint, 0) AS idx \
+             FROM queueflow.jobs WHERE workflow_id = $1 AND workflow_step_id = $2 \
+             ORDER BY idx ASC, created_at ASC",
+        )
+        .bind(workflow_id)
+        .bind(step_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|r| {
+                let status: String = r.try_get("status").map_err(db)?;
+                let idx: i64 = r.try_get("idx").map_err(db)?;
+                Ok(StepJobOutcome {
+                    job_id: r.try_get("id").map_err(db)?,
+                    index: idx.max(0) as u64,
+                    status: enum_from_str(&status)?,
+                    result: r.try_get("result").map_err(db)?,
+                    error: r.try_get("error_message").map_err(db)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn cancel_step_jobs(
+        &self,
+        workflow_id: &str,
+        step_name: &str,
+        reason: &str,
+    ) -> Result<u64, StorageError> {
+        let affected = sqlx::query(
+            "UPDATE queueflow.jobs SET status = 'cancelled', error_message = $3, \
+             completed_at = now(), locked_until = NULL, lease_token = NULL \
+             WHERE workflow_id = $1 AND workflow_step_id = $2 \
+               AND status IN ('pending','retrying','running')",
+        )
+        .bind(workflow_id)
+        .bind(step_name)
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        Ok(affected)
+    }
+
+    async fn reset_workflow_for_retry(
+        &self,
+        workflow_id: &str,
+        step_names: &[String],
+        deadline_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, StorageError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let affected = sqlx::query(
+            "UPDATE queueflow.workflows SET status = 'running', completed_at = NULL, \
+             error_message = NULL, retry_count = retry_count + 1, deadline_at = $2 \
+             WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .bind(deadline_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if affected == 0 {
+            tx.rollback().await.map_err(db)?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE queueflow.workflow_steps SET status = 'pending', job_id = NULL, \
+             child_workflow_id = NULL, error_message = NULL, started_at = NULL, \
+             completed_at = NULL \
+             WHERE workflow_id = $1 AND name = ANY($2)",
+        )
+        .bind(workflow_id)
+        .bind(step_names)
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-
-        for (idx, step) in wf.steps.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO queueflow.workflow_steps (workflow_id, name, idx, task_name, payload, \
-                 depends_on, config, on_success, on_failure, status, metadata) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10)",
-            )
-            .bind(&wf.id)
-            .bind(&step.name)
-            .bind(idx as i32)
-            .bind(&step.task_name)
-            .bind(to_jsonb(&step.payload)?)
-            .bind(to_jsonb(&step.depends_on)?)
-            .bind(step.config.as_ref().map(to_jsonb).transpose()?)
-            .bind(on_success_str(step.on_success))
-            .bind(on_failure_str(step.on_failure))
-            .bind(to_jsonb(&step.metadata)?)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
-        }
         tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+
+    async fn expired_workflows(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM queueflow.workflows \
+             WHERE deadline_at IS NOT NULL AND deadline_at < $1 \
+               AND status IN ('created','running') \
+             ORDER BY deadline_at LIMIT $2",
+        )
+        .bind(now)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    async fn stalled_child_workflows(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT c.id FROM queueflow.workflows c \
+             JOIN queueflow.workflow_steps s \
+               ON s.workflow_id = c.parent_workflow_id AND s.name = c.parent_step_name \
+             WHERE c.parent_workflow_id IS NOT NULL \
+               AND c.status IN ('completed','failed','partially_failed','cancelled') \
+               AND s.status IN ('pending','running') \
+             LIMIT $1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    async fn await_workflow_change(
+        &self,
+        workflow_id: &str,
+        max_wait: Duration,
+    ) -> Result<(), StorageError> {
+        self.hub.await_workflow_change(workflow_id, max_wait).await;
         Ok(())
     }
 
@@ -1264,7 +1478,7 @@ impl JobStore for PostgresJobStore {
 
     async fn get_workflow(&self, id: &str) -> Result<Workflow, StorageError> {
         let row = sqlx::query(
-            "SELECT id, name, status, created_at, started_at, completed_at, context, metadata, tenant_id \
+            "SELECT id, name, status, created_at, started_at, completed_at, context, metadata, tenant_id, error_message, timeout_secs, deadline_at, retry_count, parent_workflow_id, parent_step_name \
              FROM queueflow.workflows WHERE id = $1",
         )
         .bind(id)
@@ -1274,7 +1488,7 @@ impl JobStore for PostgresJobStore {
         .ok_or_else(|| StorageError::WorkflowNotFound(id.to_string()))?;
 
         let step_rows = sqlx::query(
-            "SELECT name, task_name, payload, depends_on, config, on_success, on_failure, metadata \
+            "SELECT name, task_name, payload, depends_on, config, on_success, on_failure, metadata, queue_name, condition, fan_out, child_workflow \
              FROM queueflow.workflow_steps WHERE workflow_id = $1 ORDER BY idx ASC",
         )
         .bind(id)
@@ -1309,7 +1523,7 @@ impl JobStore for PostgresJobStore {
         };
 
         let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-            "SELECT id, name, status, created_at, started_at, completed_at, context, metadata, tenant_id \
+            "SELECT id, name, status, created_at, started_at, completed_at, context, metadata, tenant_id, error_message, timeout_secs, deadline_at, retry_count, parent_workflow_id, parent_step_name \
              FROM queueflow.workflows WHERE 1=1",
         );
         push_workflow_filters(&mut qb, filter);
@@ -1337,8 +1551,7 @@ impl JobStore for PostgresJobStore {
             std::collections::HashMap::new();
         if !ids.is_empty() {
             let step_rows = sqlx::query(
-                "SELECT workflow_id, name, task_name, payload, depends_on, config, on_success, \
-                 on_failure, metadata \
+                "SELECT workflow_id, name, task_name, payload, depends_on, config, on_success, on_failure, metadata, queue_name, condition, fan_out, child_workflow \
                  FROM queueflow.workflow_steps WHERE workflow_id = ANY($1) \
                  ORDER BY workflow_id, idx ASC",
             )
@@ -1373,21 +1586,65 @@ impl JobStore for PostgresJobStore {
         workflow_id: &str,
     ) -> Result<Vec<StepRecord>, StorageError> {
         let rows = sqlx::query(
-            "SELECT name, status, job_id FROM queueflow.workflow_steps \
-             WHERE workflow_id = $1 ORDER BY idx ASC",
+            "SELECT name, status, job_id, error_message, started_at, completed_at, \
+                    child_workflow_id, fan_out IS NOT NULL AS is_fan_out \
+             FROM queueflow.workflow_steps WHERE workflow_id = $1 ORDER BY idx ASC",
         )
         .bind(workflow_id)
         .fetch_all(&self.pool)
         .await
         .map_err(db)?;
+        // Child counts per fan-out step, one grouped query over the
+        // workflow's jobs (served by idx_jobs_workflow).
+        let mut progress: std::collections::HashMap<String, FanOutProgress> = Default::default();
+        if rows
+            .iter()
+            .any(|r| r.try_get::<bool, _>("is_fan_out").unwrap_or(false))
+        {
+            let counts = sqlx::query(
+                "SELECT workflow_step_id, status, COUNT(*) AS n FROM queueflow.jobs \
+                 WHERE workflow_id = $1 AND workflow_step_id IS NOT NULL \
+                 GROUP BY workflow_step_id, status",
+            )
+            .bind(workflow_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+            for c in &counts {
+                let step: String = c.try_get("workflow_step_id").map_err(db)?;
+                let status: String = c.try_get("status").map_err(db)?;
+                let n: i64 = c.try_get("n").map_err(db)?;
+                let n = n.max(0) as u64;
+                let p = progress.entry(step).or_default();
+                p.total += n;
+                match status.as_str() {
+                    "completed" => p.completed += n,
+                    "failed" | "cancelled" => p.failed += n,
+                    _ => {}
+                }
+            }
+        }
 
         rows.iter()
             .map(|r| {
                 let status: String = r.try_get("status").map_err(db)?;
+                let name: String = r.try_get("name").map_err(db)?;
+                let is_fan_out: bool = r.try_get("is_fan_out").map_err(db)?;
+                let job_id: Option<String> = r.try_get("job_id").map_err(db)?;
+                let fan_out = if is_fan_out && job_id.is_some() {
+                    Some(progress.get(&name).copied().unwrap_or_default())
+                } else {
+                    None
+                };
                 Ok(StepRecord {
-                    name: r.try_get("name").map_err(db)?,
                     status: enum_from_str(&status)?,
-                    job_id: r.try_get("job_id").map_err(db)?,
+                    job_id,
+                    error: r.try_get("error_message").map_err(db)?,
+                    started_at: r.try_get("started_at").map_err(db)?,
+                    completed_at: r.try_get("completed_at").map_err(db)?,
+                    child_workflow_id: r.try_get("child_workflow_id").map_err(db)?,
+                    fan_out,
+                    name,
                 })
             })
             .collect()
@@ -1402,8 +1659,8 @@ impl JobStore for PostgresJobStore {
         // `job_id IS NULL` makes this a claim: exactly one concurrent advance
         // can win, so a step is never enqueued twice.
         let affected = sqlx::query(
-            "UPDATE queueflow.workflow_steps SET job_id = $3 \
-             WHERE workflow_id = $1 AND name = $2 AND job_id IS NULL",
+            "UPDATE queueflow.workflow_steps SET job_id = $3, started_at = now() \
+             WHERE workflow_id = $1 AND name = $2 AND job_id IS NULL AND child_workflow_id IS NULL",
         )
         .bind(workflow_id)
         .bind(step_name)
@@ -1416,18 +1673,25 @@ impl JobStore for PostgresJobStore {
     }
 
     async fn create_step_job(&self, job: &Job) -> Result<bool, StorageError> {
-        let wf_id = job.workflow_id.as_deref().unwrap_or_default();
-        let step_name = job.workflow_step_id.as_deref().unwrap_or_default();
-        // Claim and insert commit together: the job only ever exists linked
-        // to the step it won, and a loser persists nothing.
+        self.create_step_jobs(std::slice::from_ref(job)).await
+    }
+
+    async fn create_step_jobs(&self, jobs: &[Job]) -> Result<bool, StorageError> {
+        let Some(first) = jobs.first() else {
+            return Ok(false);
+        };
+        let wf_id = first.workflow_id.as_deref().unwrap_or_default();
+        let step_name = first.workflow_step_id.as_deref().unwrap_or_default();
+        // Claim and insert commit together: the jobs only ever exist linked
+        // to the step they won, and a loser persists nothing.
         let mut tx = self.pool.begin().await.map_err(db)?;
         let claimed = sqlx::query(
-            "UPDATE queueflow.workflow_steps SET job_id = $3 \
-             WHERE workflow_id = $1 AND name = $2 AND job_id IS NULL",
+            "UPDATE queueflow.workflow_steps SET job_id = $3, started_at = now() \
+             WHERE workflow_id = $1 AND name = $2 AND job_id IS NULL AND child_workflow_id IS NULL",
         )
         .bind(wf_id)
         .bind(step_name)
-        .bind(&job.id)
+        .bind(&first.id)
         .execute(&mut *tx)
         .await
         .map_err(db)?
@@ -1436,7 +1700,11 @@ impl JobStore for PostgresJobStore {
             tx.rollback().await.map_err(db)?;
             return Ok(false);
         }
-        insert_job(&mut *tx, job).await?;
+        if jobs.len() == 1 {
+            insert_job(&mut *tx, first).await?;
+        } else {
+            insert_jobs(&mut *tx, jobs).await?;
+        }
         tx.commit().await.map_err(db)?;
         Ok(true)
     }
@@ -1450,7 +1718,9 @@ impl JobStore for PostgresJobStore {
     ) -> Result<(), StorageError> {
         sqlx::query(
             "UPDATE queueflow.workflow_steps SET status = $3, \
-             error_message = COALESCE($4, error_message) \
+             error_message = COALESCE($4, error_message), \
+             completed_at = CASE WHEN $3 IN ('completed','failed','cancelled','skipped') \
+                                 THEN now() ELSE completed_at END \
              WHERE workflow_id = $1 AND name = $2",
         )
         .bind(workflow_id)
@@ -1467,11 +1737,13 @@ impl JobStore for PostgresJobStore {
         &self,
         workflow_id: &str,
         status: WorkflowStatus,
+        error: Option<&str>,
     ) -> Result<bool, StorageError> {
         // Terminal workflows are never overwritten, and a same-status write
         // reports false so concurrent aggregations count each transition once.
         let affected = sqlx::query(
             "UPDATE queueflow.workflows SET status = $2, \
+             error_message = COALESCE($3, error_message), \
              started_at = CASE WHEN $2 = 'running' AND started_at IS NULL THEN now() ELSE started_at END, \
              completed_at = CASE WHEN $2 IN ('completed','failed','partially_failed','cancelled') THEN now() ELSE completed_at END \
              WHERE id = $1 AND status <> $2 \
@@ -1479,6 +1751,7 @@ impl JobStore for PostgresJobStore {
         )
         .bind(workflow_id)
         .bind(status.as_str())
+        .bind(error)
         .execute(&self.pool)
         .await
         .map_err(db)?
@@ -1516,14 +1789,24 @@ fn step_from_row(r: &sqlx::postgres::PgRow) -> Result<WorkflowStep, StorageError
     let metadata: Json = r.try_get("metadata").map_err(db)?;
     let on_success: String = r.try_get("on_success").map_err(db)?;
     let on_failure: String = r.try_get("on_failure").map_err(db)?;
+    let condition: Option<Json> = r.try_get("condition").map_err(db)?;
+    let fan_out: Option<Json> = r.try_get("fan_out").map_err(db)?;
+    let child_workflow: Option<Json> = r.try_get("child_workflow").map_err(db)?;
     Ok(WorkflowStep {
         name: r.try_get("name").map_err(db)?,
         task_name: r.try_get("task_name").map_err(db)?,
         payload: serde_json::from_value(payload)?,
         depends_on: serde_json::from_value(depends_on)?,
         config: config.map(serde_json::from_value).transpose()?,
+        queue: r.try_get("queue_name").map_err(db)?,
         on_success: enum_from_str(&on_success)?,
         on_failure: enum_from_str(&on_failure)?,
+        when: condition.map(serde_json::from_value).transpose()?,
+        fan_out: fan_out.map(serde_json::from_value).transpose()?,
+        workflow: child_workflow
+            .map(serde_json::from_value::<CreateWorkflowRequest>)
+            .transpose()?
+            .map(Box::new),
         metadata: serde_json::from_value(metadata)?,
     })
 }
@@ -1544,6 +1827,15 @@ fn workflow_from_row(
         created_at: row.try_get("created_at").map_err(db)?,
         started_at: row.try_get("started_at").map_err(db)?,
         completed_at: row.try_get("completed_at").map_err(db)?,
+        error_message: row.try_get("error_message").map_err(db)?,
+        timeout_secs: row
+            .try_get::<Option<i64>, _>("timeout_secs")
+            .map_err(db)?
+            .map(|t| t.max(0) as u64),
+        deadline_at: row.try_get("deadline_at").map_err(db)?,
+        retry_count: row.try_get::<i32, _>("retry_count").map_err(db)?.max(0) as u32,
+        parent_workflow_id: row.try_get("parent_workflow_id").map_err(db)?,
+        parent_step_name: row.try_get("parent_step_name").map_err(db)?,
         context: serde_json::from_value(context)?,
         metadata: serde_json::from_value(metadata)?,
         tenant_id: row.try_get("tenant_id").map_err(db)?,

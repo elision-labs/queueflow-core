@@ -55,6 +55,11 @@ pub trait JobApi: Send + Sync {
     async fn get_workflow(&self, id: &str) -> Result<Workflow, EngineError>;
     async fn list_workflows(&self, filter: ListFilter) -> Result<Page<Workflow>, EngineError>;
     async fn cancel_workflow(&self, id: &str) -> Result<(), EngineError>;
+    /// Re-run a failed, partially failed or cancelled workflow from its
+    /// unfinished steps.
+    async fn retry_workflow(&self, id: &str) -> Result<(), EngineError>;
+    /// Park until the workflow may have changed (or `max_wait` passes).
+    async fn await_workflow_change(&self, id: &str, max_wait: Duration) -> Result<(), EngineError>;
     async fn workflow_diagram(&self, id: &str) -> Result<String, EngineError>;
     /// Runtime status of every step, in declaration order (the live
     /// progress view; the workflow record itself carries only definitions).
@@ -207,6 +212,14 @@ where
 
     async fn cancel_workflow(&self, id: &str) -> Result<(), EngineError> {
         Engine::cancel_workflow(self, id).await
+    }
+
+    async fn retry_workflow(&self, id: &str) -> Result<(), EngineError> {
+        Engine::retry_workflow(self, id).await
+    }
+
+    async fn await_workflow_change(&self, id: &str, max_wait: Duration) -> Result<(), EngineError> {
+        Engine::await_workflow_change(self, id, max_wait).await
     }
 
     async fn workflow_diagram(&self, id: &str) -> Result<String, EngineError> {

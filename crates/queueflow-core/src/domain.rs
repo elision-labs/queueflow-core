@@ -85,9 +85,10 @@ impl WorkflowStatus {
 }
 
 /// Lifecycle state of a single workflow step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
+    #[default]
     Pending,
     Running,
     Completed,
@@ -204,6 +205,12 @@ pub mod limits {
     pub const MAX_TIMEOUT_SECS: u64 = 86_400;
     /// Maximum accepted retry delay (base and cap): 30 days.
     pub const MAX_RETRY_DELAY_SECS: u64 = 2_592_000;
+    /// Default and maximum number of children a fan-out step may spawn.
+    pub const MAX_FAN_OUT: u32 = 10_000;
+    /// Maximum accepted workflow timeout: 30 days.
+    pub const MAX_WORKFLOW_TIMEOUT_SECS: u64 = 2_592_000;
+    /// How deep inline sub-workflows may nest.
+    pub const MAX_WORKFLOW_DEPTH: usize = 8;
 }
 
 impl JobConfig {
@@ -326,6 +333,76 @@ pub enum OnFailure {
     Continue,
 }
 
+/// How a [`StepCondition`] leaf compares the value at `path` with `value`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionOp {
+    /// JSON equality (the default when `value` is given).
+    #[default]
+    Eq,
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    /// The path resolves to a value other than `null` (the default when no
+    /// `value` is given).
+    Exists,
+    /// The value at `path` is an array containing `value`, a string
+    /// containing the string `value`, or an object with the key `value`.
+    Contains,
+    /// `value` is an array containing the value at `path`.
+    In,
+}
+
+/// A predicate over the workflow context, evaluated when a step becomes
+/// ready. Exactly one of `path`, `all`, `any` or `not` is set. A leaf names
+/// a dotted `path` into the context (step results live under their step
+/// name, so `validate.ok` is the `ok` key of the `validate` step's result)
+/// and compares it with `value` using `op`. A false condition skips the step
+/// with the reason `condition not met`; its dependents still run, seeing no
+/// result for it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct StepCondition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<ConditionOp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object, nullable)]
+    pub value: Option<Json>,
+    /// True when every member is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(no_recursion)]
+    pub all: Option<Vec<StepCondition>>,
+    /// True when at least one member is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(no_recursion)]
+    pub any: Option<Vec<StepCondition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(no_recursion)]
+    pub not: Option<Box<StepCondition>>,
+}
+
+/// Dynamic fan-out: run the step's task once per element of the array found
+/// at `path` in the workflow context. Each child job receives the step
+/// payload plus the element under `item_key` and its position under
+/// `_index`. The step completes when every child has, with the result
+/// `{"results": [...]}` in element order; a failed child follows the step's
+/// `on_failure` policy.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct FanOut {
+    /// Dotted path into the context, for example `fetch.images`.
+    pub path: String,
+    /// Payload key the element is passed under (default `item`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_key: Option<String>,
+    /// Upper bound on elements; more than this fails the step before any
+    /// child runs. Default [`limits::MAX_FAN_OUT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u32>,
+}
+
 /// Reserved for future expansion; only `Continue` is meaningful today.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -336,9 +413,15 @@ pub enum OnSuccess {
 
 /// A node in a workflow DAG. Steps are addressed by their unique `name`;
 /// `depends_on` lists the names of steps that must complete first.
+///
+/// A step is one of three kinds: a plain task (`task_name`), a fan-out
+/// (`task_name` plus `fan_out`), or a sub-workflow (`workflow`, in which case
+/// `task_name` may be empty). `when` gates any kind on the context.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct WorkflowStep {
     pub name: String,
+    /// The task handler to run. May be omitted for a sub-workflow step.
+    #[serde(default)]
     pub task_name: String,
     #[serde(default)]
     #[schema(value_type = HashMap<String, serde_json::Value>)]
@@ -347,13 +430,38 @@ pub struct WorkflowStep {
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<JobConfig>,
+    /// Queue for this step's job(s); the server's default queue when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
     #[serde(default)]
     pub on_success: OnSuccess,
     #[serde(default)]
     pub on_failure: OnFailure,
+    /// Run only when this condition holds against the workflow context at
+    /// the moment the step becomes ready; otherwise the step is skipped
+    /// with reason `condition not met` and its dependents proceed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<StepCondition>,
+    /// Run the task once per element of an array in the context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_out: Option<FanOut>,
+    /// Run an inline child workflow instead of a task. The child's context
+    /// is its own declared context plus this step's payload, with the
+    /// parent's context under `_parent`; the step's result is the child's
+    /// final context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(no_recursion)]
+    pub workflow: Option<Box<CreateWorkflowRequest>>,
     #[serde(default)]
     #[schema(value_type = HashMap<String, serde_json::Value>)]
     pub metadata: Map,
+}
+
+impl WorkflowStep {
+    /// A step that runs an inline child workflow.
+    pub fn is_sub_workflow(&self) -> bool {
+        self.workflow.is_some()
+    }
 }
 
 /// A workflow instance and its steps.
@@ -368,6 +476,26 @@ pub struct Workflow {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// Why the workflow ended `failed` or `cancelled`, when known (an
+    /// upstream failure, a timeout, a user cancel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// The whole-workflow time budget it was created with, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// When the janitor fails the workflow if it is still running (set from
+    /// `timeout_secs`; pushed forward by a retry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<DateTime<Utc>>,
+    /// How many times `POST /workflows/{id}/retry` re-ran this workflow.
+    #[serde(default)]
+    pub retry_count: u32,
+    /// Set on a child workflow spawned by a sub-workflow step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_workflow_id: Option<String>,
+    /// The parent's step that spawned this child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_step_name: Option<String>,
     /// Accumulated step results, keyed by step name. Passed to downstream steps
     /// under the `_context` payload key.
     #[serde(default)]
@@ -392,7 +520,27 @@ pub struct CreateWorkflowRequest {
     #[serde(default)]
     #[schema(value_type = HashMap<String, serde_json::Value>)]
     pub metadata: Map,
+    /// Whole-workflow time budget in seconds. When it runs out the janitor
+    /// cancels every unfinished step and fails the workflow with
+    /// `workflow timed out`. Unset means no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
+
+/// The reason recorded on a step skipped because its `when` condition was
+/// false. Dependents of such a step still run; dependents of a step skipped
+/// by its failure policy do not.
+pub const CONDITION_NOT_MET: &str = "condition not met";
+
+/// The context key under which a child workflow sees its parent's context.
+pub const PARENT_CONTEXT_KEY: &str = "_parent";
+
+/// Payload key carrying a fan-out child's position.
+pub const FAN_OUT_INDEX_KEY: &str = "_index";
+
+/// Job metadata keys stamped on fan-out children.
+pub const FAN_OUT_INDEX_META: &str = "fan_out_index";
+pub const FAN_OUT_TOTAL_META: &str = "fan_out_total";
 
 /// A dead-lettered job: a terminal failure recorded for inspection and
 /// replay. The original job row remains (subject to retention); this entry

@@ -36,6 +36,50 @@ const WORK_CHANNEL: &str = "queueflow_work";
 /// (payload: the job id).
 const JOB_EVENTS_CHANNEL: &str = "queueflow_job_events";
 
+/// The NOTIFY channel the workflow triggers publish to (payload: the
+/// workflow id) on step or workflow state changes.
+const WORKFLOW_EVENTS_CHANNEL: &str = "queueflow_workflow_events";
+
+/// Reference-counted per-key notifiers: entries exist only while something
+/// is watching the key, so the map is bounded by concurrent watchers.
+#[derive(Default)]
+struct WatchMap {
+    inner: Mutex<HashMap<String, (usize, Arc<Notify>)>>,
+}
+
+impl WatchMap {
+    fn subscribe(&self, key: &str) -> Arc<Notify> {
+        let mut map = self.inner.lock().unwrap();
+        let entry = map
+            .entry(key.to_string())
+            .or_insert_with(|| (0, Arc::new(Notify::new())));
+        entry.0 += 1;
+        entry.1.clone()
+    }
+
+    fn unsubscribe(&self, key: &str) {
+        let mut map = self.inner.lock().unwrap();
+        if let Some(entry) = map.get_mut(key) {
+            entry.0 -= 1;
+            if entry.0 == 0 {
+                map.remove(key);
+            }
+        }
+    }
+
+    fn notify(&self, key: &str) {
+        if let Some((_, n)) = self.inner.lock().unwrap().get(key) {
+            n.notify_waiters();
+        }
+    }
+
+    fn notify_all(&self) {
+        for (_, n) in self.inner.lock().unwrap().values() {
+            n.notify_waiters();
+        }
+    }
+}
+
 /// Per-queue wakeup channel: epoch + notifier (see the module docs).
 #[derive(Default)]
 struct QueueSignal {
@@ -46,29 +90,23 @@ struct QueueSignal {
 pub(crate) struct WorkHub {
     pool: PgPool,
     waiters: Mutex<HashMap<String, Arc<QueueSignal>>>,
-    /// job_id -> (watcher count, notifier). Entries are reference-counted by
-    /// [`JobWatch`] guards and removed when the last watcher unsubscribes,
-    /// so the map is bounded by concurrently-watched jobs, not job history.
-    job_waiters: Mutex<HashMap<String, (usize, Arc<Notify>)>>,
+    /// Per-job watchers (the job SSE stream), released by [`Watch`] guards.
+    job_waiters: WatchMap,
+    /// Per-workflow watchers (the workflow SSE stream).
+    workflow_waiters: WatchMap,
     listener_started: tokio::sync::OnceCell<()>,
 }
 
-/// Guard holding one subscription in [`WorkHub::job_waiters`]. Dropping it —
-/// including a cancelled `await_job_change` future — releases the entry.
-struct JobWatch {
-    hub: Arc<WorkHub>,
-    job_id: String,
+/// Guard holding one subscription in a [`WatchMap`]. Dropping it, including
+/// a cancelled await future, releases the entry.
+struct Watch<'a> {
+    map: &'a WatchMap,
+    key: String,
 }
 
-impl Drop for JobWatch {
+impl Drop for Watch<'_> {
     fn drop(&mut self) {
-        let mut map = self.hub.job_waiters.lock().unwrap();
-        if let Some(entry) = map.get_mut(&self.job_id) {
-            entry.0 -= 1;
-            if entry.0 == 0 {
-                map.remove(&self.job_id);
-            }
-        }
+        self.map.unsubscribe(&self.key);
     }
 }
 
@@ -77,7 +115,8 @@ impl WorkHub {
         Arc::new(Self {
             pool,
             waiters: Mutex::new(HashMap::new()),
-            job_waiters: Mutex::new(HashMap::new()),
+            job_waiters: WatchMap::default(),
+            workflow_waiters: WatchMap::default(),
             listener_started: tokio::sync::OnceCell::new(),
         })
     }
@@ -124,17 +163,25 @@ impl WorkHub {
     /// May wake spuriously; callers re-read the job in a loop.
     pub(crate) async fn await_job_change(self: &Arc<Self>, job_id: &str, max_wait: Duration) {
         self.ensure_listener().await;
-        let notify = {
-            let mut map = self.job_waiters.lock().unwrap();
-            let entry = map
-                .entry(job_id.to_string())
-                .or_insert_with(|| (0, Arc::new(Notify::new())));
-            entry.0 += 1;
-            entry.1.clone()
-        };
-        let _watch = JobWatch {
-            hub: self.clone(),
-            job_id: job_id.to_string(),
+        Self::await_key(&self.job_waiters, job_id, max_wait).await;
+    }
+
+    /// Park until `workflow_id` (or one of its steps) may have changed, or
+    /// `max_wait` passes. May wake spuriously.
+    pub(crate) async fn await_workflow_change(
+        self: &Arc<Self>,
+        workflow_id: &str,
+        max_wait: Duration,
+    ) {
+        self.ensure_listener().await;
+        Self::await_key(&self.workflow_waiters, workflow_id, max_wait).await;
+    }
+
+    async fn await_key(map: &WatchMap, key: &str, max_wait: Duration) {
+        let notify = map.subscribe(key);
+        let _watch = Watch {
+            map,
+            key: key.to_string(),
         };
         tokio::select! {
             _ = notify.notified() => {}
@@ -148,12 +195,6 @@ impl WorkHub {
         signal.notify.notify_waiters();
     }
 
-    fn notify_job(&self, job_id: &str) {
-        if let Some((_, n)) = self.job_waiters.lock().unwrap().get(job_id) {
-            n.notify_waiters();
-        }
-    }
-
     /// Wake everyone — used after a listener (re)connect, when notifications
     /// may have been missed.
     fn notify_all(&self) {
@@ -161,9 +202,8 @@ impl WorkHub {
             signal.epoch.fetch_add(1, Ordering::SeqCst);
             signal.notify.notify_waiters();
         }
-        for (_, n) in self.job_waiters.lock().unwrap().values() {
-            n.notify_waiters();
-        }
+        self.job_waiters.notify_all();
+        self.workflow_waiters.notify_all();
     }
 
     async fn ensure_listener(self: &Arc<Self>) {
@@ -186,7 +226,7 @@ impl WorkHub {
                 }
             };
             if let Err(e) = listener
-                .listen_all([WORK_CHANNEL, JOB_EVENTS_CHANNEL])
+                .listen_all([WORK_CHANNEL, JOB_EVENTS_CHANNEL, WORKFLOW_EVENTS_CHANNEL])
                 .await
             {
                 tracing::warn!(error = %e, "LISTEN failed; waiters fall back to bounded polling");
@@ -202,7 +242,10 @@ impl WorkHub {
                 // been lost — so that case wakes every waiter.
                 match listener.try_recv().await {
                     Ok(Some(n)) if n.channel() == JOB_EVENTS_CHANNEL => {
-                        self.notify_job(n.payload())
+                        self.job_waiters.notify(n.payload())
+                    }
+                    Ok(Some(n)) if n.channel() == WORKFLOW_EVENTS_CHANNEL => {
+                        self.workflow_waiters.notify(n.payload())
                     }
                     Ok(Some(n)) => self.notify_queue(n.payload()),
                     Ok(None) => self.notify_all(),

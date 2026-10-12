@@ -57,9 +57,10 @@ pub use adapters::clock::{SystemClock, TestClock};
 pub use adapters::memory::InMemoryJobStore;
 pub use api::JobApi;
 pub use domain::{
-    limits, BackoffStrategy, CreateCronRequest, CreateWorkflowRequest, CronSchedule, DeadLetter,
-    Job, JobConfig, JobStatus, Json, LeasedJob, Map, OnFailure, OnSuccess, StepStatus, Workflow,
-    WorkflowStatus, WorkflowStep, CONTEXT_KEY,
+    limits, BackoffStrategy, ConditionOp, CreateCronRequest, CreateWorkflowRequest, CronSchedule,
+    DeadLetter, FanOut, Job, JobConfig, JobStatus, Json, LeasedJob, Map, OnFailure, OnSuccess,
+    StepCondition, StepStatus, Workflow, WorkflowStatus, WorkflowStep, CONDITION_NOT_MET,
+    CONTEXT_KEY, FAN_OUT_INDEX_KEY, FAN_OUT_INDEX_META, FAN_OUT_TOTAL_META, PARENT_CONTEXT_KEY,
 };
 pub use engine::janitor::JanitorSweepReport;
 pub use engine::{
@@ -68,15 +69,17 @@ pub use engine::{
 };
 pub use error::{EngineError, HandlerError};
 pub use ports::{
-    Claimed, Clock, FinishedJob, JobStore, ListFilter, Page, PageCursor, RegisteredQueue,
-    StepRecord, StorageError,
+    Claimed, Clock, FanOutProgress, FinishedJob, JobStore, ListFilter, Page, PageCursor,
+    RegisteredQueue, StepJobOutcome, StepRecord, StorageError,
 };
 pub use stats::{
     EngineStats, Histogram, HistogramSnapshot, LatencySnapshot, QueueStats, StatsSnapshot,
     LATENCY_BUCKETS_SECS,
 };
 pub use task::{handler_fn, FnHandler, TaskHandler};
-pub use workflow::{CycleError, DependencyGraph, StepBuilder, WorkflowBuilder, WorkflowScheduler};
+pub use workflow::{
+    validate_request, CycleError, DependencyGraph, StepBuilder, WorkflowBuilder, WorkflowScheduler,
+};
 
 #[cfg(feature = "postgres")]
 pub use adapters::postgres::{connect, migrate, PostgresJobStore};

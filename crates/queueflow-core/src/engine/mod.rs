@@ -556,34 +556,35 @@ where
                 wf.status.as_str()
             )));
         }
-        for rec in self.store.workflow_step_statuses(id).await? {
-            if !rec.status.is_terminal() {
-                self.store
-                    .set_step_status(
-                        id,
-                        &rec.name,
-                        StepStatus::Cancelled,
-                        Some("cancelled by user"),
-                    )
-                    .await?;
-                // Cancel the step's live job too, or a worker would still
-                // execute work for a dead workflow: a pending job stays
-                // claimable, and a running one could land its completion.
-                // The status flip blocks both (claims filter on status;
-                // outcome writes are lease-guarded against non-running rows).
-                if let Some(job_id) = &rec.job_id {
-                    self.store
-                        .cancel_job_if_active(job_id, "workflow cancelled")
-                        .await?;
-                }
-            }
-        }
-        // The guarded transition is a no-op if a concurrent advance already
-        // finished the workflow; that race resolves in the workflow's favour.
-        self.store
-            .set_workflow_status(id, WorkflowStatus::Cancelled)
-            .await?;
-        Ok(())
+        // Every unfinished step, its live jobs and any child workflow are
+        // cancelled, then the workflow is recorded cancelled. The guarded
+        // transition is a no-op if a concurrent advance already finished
+        // the workflow; that race resolves in the workflow's favour.
+        self.scheduler
+            .abort(
+                &wf,
+                WorkflowStatus::Cancelled,
+                Some("cancelled by user"),
+                "cancelled by user",
+            )
+            .await
+    }
+
+    /// Re-run a failed, partially failed or cancelled workflow from its
+    /// unfinished steps. See [`WorkflowScheduler::retry`].
+    pub async fn retry_workflow(&self, id: &str) -> Result<(), EngineError> {
+        self.scheduler.retry(id).await
+    }
+
+    /// Park until the workflow or one of its steps may have changed, or
+    /// `max_wait` passes. May wake spuriously. Drives the workflow SSE
+    /// stream.
+    pub async fn await_workflow_change(
+        &self,
+        id: &str,
+        max_wait: StdDuration,
+    ) -> Result<(), EngineError> {
+        Ok(self.store.await_workflow_change(id, max_wait).await?)
     }
 
     pub async fn workflow_diagram(&self, id: &str) -> Result<String, EngineError> {

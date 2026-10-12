@@ -74,13 +74,40 @@ impl StepBuilder {
         self
     }
 
+    /// Queue for this step's job(s) (the server default when unset).
+    pub fn queue(mut self, queue: impl Into<String>) -> Self {
+        self.step.queue = Some(queue.into());
+        self
+    }
+
+    /// Run only when `condition` holds against the workflow context.
+    pub fn when(mut self, condition: StepCondition) -> Self {
+        self.step.when = Some(condition);
+        self
+    }
+
+    /// Run the task once per element of the array at `path` in the context.
+    pub fn fan_out(mut self, path: impl Into<String>) -> Self {
+        self.step.fan_out = Some(FanOut {
+            path: path.into(),
+            ..Default::default()
+        });
+        self
+    }
+
+    /// Run an inline child workflow instead of a task.
+    pub fn sub_workflow(mut self, workflow: CreateWorkflowRequest) -> Self {
+        self.step.workflow = Some(Box::new(workflow));
+        self
+    }
+
     pub fn metadata(mut self, key: impl Into<String>, value: Json) -> Self {
         self.step.metadata.insert(key.into(), value);
         self
     }
 
     fn finish(mut self) -> WorkflowStep {
-        if self.step.task_name.is_empty() {
+        if self.step.task_name.is_empty() && self.step.workflow.is_none() {
             self.step.task_name = self.step.name.clone();
         }
         self.step
@@ -94,6 +121,7 @@ pub struct WorkflowBuilder {
     steps: Vec<WorkflowStep>,
     context: Map,
     metadata: Map,
+    timeout_secs: Option<u64>,
 }
 
 impl WorkflowBuilder {
@@ -103,7 +131,14 @@ impl WorkflowBuilder {
             steps: Vec::new(),
             context: Map::new(),
             metadata: Map::new(),
+            timeout_secs: None,
         }
+    }
+
+    /// Whole-workflow time budget; past it the janitor fails the workflow.
+    pub fn timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout_secs = Some(secs);
+        self
     }
 
     pub fn step(mut self, step: StepBuilder) -> Self {
@@ -137,6 +172,7 @@ impl WorkflowBuilder {
             steps: self.steps,
             context: self.context,
             metadata: self.metadata,
+            timeout_secs: self.timeout_secs,
         })
     }
 }

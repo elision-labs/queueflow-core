@@ -2,9 +2,10 @@
 //! runtime scheduler that gates steps on their dependencies.
 
 pub mod builder;
+pub mod condition;
 pub mod dag;
 pub mod scheduler;
 
 pub use builder::{StepBuilder, WorkflowBuilder};
 pub use dag::{CycleError, DependencyGraph};
-pub use scheduler::WorkflowScheduler;
+pub use scheduler::{validate_request, WorkflowScheduler};

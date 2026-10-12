@@ -112,8 +112,17 @@ impl<'a> DependencyGraph<'a> {
     pub fn mermaid(&self) -> String {
         let mut out = String::from("graph TD\n");
         for s in self.steps {
+            // Shapes mark the step kind: a hexagon for a fan-out, a
+            // subroutine box for a sub-workflow, a plain box otherwise.
+            let (open, close) = if s.fan_out.is_some() {
+                ("{{", "}}")
+            } else if s.workflow.is_some() {
+                ("[[", "]]")
+            } else {
+                ("[", "]")
+            };
             out.push_str(&format!(
-                "    {}[\"{}\"]\n",
+                "    {}{open}\"{}\"{close}\n",
                 sanitize(&s.name),
                 escape(&s.name)
             ));

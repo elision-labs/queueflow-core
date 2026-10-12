@@ -959,6 +959,49 @@ impl JobStore for OrderProbe {
             .link_step_job(workflow_id, step_name, job_id)
             .await
     }
+    async fn create_step_jobs(&self, jobs: &[Job]) -> Result<bool, StorageError> {
+        self.inner.create_step_jobs(jobs).await
+    }
+    async fn create_child_workflow(&self, child: &Workflow) -> Result<bool, StorageError> {
+        self.inner.create_child_workflow(child).await
+    }
+    async fn step_job_outcomes(
+        &self,
+        workflow_id: &str,
+        step_name: &str,
+    ) -> Result<Vec<StepJobOutcome>, StorageError> {
+        self.inner.step_job_outcomes(workflow_id, step_name).await
+    }
+    async fn cancel_step_jobs(
+        &self,
+        workflow_id: &str,
+        step_name: &str,
+        reason: &str,
+    ) -> Result<u64, StorageError> {
+        self.inner
+            .cancel_step_jobs(workflow_id, step_name, reason)
+            .await
+    }
+    async fn reset_workflow_for_retry(
+        &self,
+        workflow_id: &str,
+        step_names: &[String],
+        deadline_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .reset_workflow_for_retry(workflow_id, step_names, deadline_at)
+            .await
+    }
+    async fn expired_workflows(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        self.inner.expired_workflows(now, limit).await
+    }
+    async fn stalled_child_workflows(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        self.inner.stalled_child_workflows(limit).await
+    }
     async fn create_step_job(&self, job: &Job) -> Result<bool, StorageError> {
         self.inner.create_step_job(job).await
     }
@@ -981,8 +1024,11 @@ impl JobStore for OrderProbe {
         &self,
         workflow_id: &str,
         status: WorkflowStatus,
+        error: Option<&str>,
     ) -> Result<bool, StorageError> {
-        self.inner.set_workflow_status(workflow_id, status).await
+        self.inner
+            .set_workflow_status(workflow_id, status, error)
+            .await
     }
     async fn merge_workflow_context(
         &self,

@@ -22,12 +22,14 @@ use crate::domain::*;
 use crate::ports::*;
 use crate::stats::{QueueStats, StatsSnapshot};
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct StepState {
     status: StepStatus,
     job_id: Option<String>,
-    #[allow(dead_code)]
     error: Option<String>,
+    started_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+    child_workflow_id: Option<String>,
 }
 
 // Dead letters are stored as the public domain type; ids come from a local
@@ -89,6 +91,8 @@ struct Inner {
     /// One broadcast for all job status changes: at in-memory (test) scale a
     /// spurious wakeup per watcher is cheaper than a per-job waiter map.
     job_events: Notify,
+    /// Same for workflow and step state changes.
+    workflow_events: Notify,
 }
 
 impl InMemoryJobStore {
@@ -107,6 +111,7 @@ impl InMemoryJobStore {
                 crons: Mutex::new(HashMap::new()),
                 waiters: Mutex::new(HashMap::new()),
                 job_events: Notify::new(),
+                workflow_events: Notify::new(),
             }),
         }
     }
@@ -138,6 +143,32 @@ impl InMemoryJobStore {
     fn notify_job_change(&self) {
         self.inner.job_events.notify_waiters();
     }
+
+    /// Wake every `await_workflow_change` watcher (mirrors the workflow
+    /// event triggers).
+    fn notify_workflow_change(&self) {
+        self.inner.workflow_events.notify_waiters();
+    }
+
+    /// Insert a workflow and its pending steps. Caller holds no locks.
+    fn insert_workflow_locked(
+        workflows: &mut HashMap<String, Workflow>,
+        steps: &mut HashMap<(String, String), StepState>,
+        wf: &Workflow,
+    ) {
+        workflows.insert(wf.id.clone(), wf.clone());
+        for step in &wf.steps {
+            steps.insert((wf.id.clone(), step.name.clone()), StepState::default());
+        }
+    }
+}
+
+/// Fan-out position of a job, from its metadata (0 when absent).
+fn fan_out_index(job: &Job) -> u64 {
+    job.metadata
+        .get(FAN_OUT_INDEX_META)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
 }
 
 /// Slice a sorted, fully-matched result set into a [`Page`] honouring the
@@ -952,16 +983,31 @@ impl JobStore for InMemoryJobStore {
     }
 
     async fn stalled_step_jobs(&self, limit: usize) -> Result<Vec<Job>, StorageError> {
+        // A step is stalled when it has linked jobs, every one of them is
+        // terminal, and the step itself is not: for a fan-out that means the
+        // last child settled without the step being advanced.
         let jobs = self.inner.jobs.lock().unwrap();
         let steps = self.inner.steps.lock().unwrap();
-        Ok(steps
-            .values()
-            .filter(|st| !st.status.is_terminal())
-            .filter_map(|st| st.job_id.as_ref().and_then(|id| jobs.get(id)))
-            .filter(|j| j.status.is_terminal())
-            .take(limit)
-            .cloned()
-            .collect())
+        let mut out = Vec::new();
+        for ((wf_id, name), st) in steps.iter() {
+            if st.status.is_terminal() || st.job_id.is_none() {
+                continue;
+            }
+            let linked: Vec<&Job> = jobs
+                .values()
+                .filter(|j| {
+                    j.workflow_id.as_deref() == Some(wf_id)
+                        && j.workflow_step_id.as_deref() == Some(name)
+                })
+                .collect();
+            if !linked.is_empty() && linked.iter().all(|j| j.status.is_terminal()) {
+                out.push((*linked[0]).clone());
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn stalled_workflow_ids(&self, limit: usize) -> Result<Vec<String>, StorageError> {
@@ -972,15 +1018,21 @@ impl JobStore for InMemoryJobStore {
             .values()
             .filter(|wf| !wf.status.is_terminal())
             .filter(|wf| {
-                // No live (non-terminal) linked job anywhere in the workflow.
-                !steps.iter().any(|((wf_id, _), st)| {
+                // No live (non-terminal) linked job anywhere in the workflow,
+                // and no step waiting on a live child workflow.
+                let live_job = jobs
+                    .values()
+                    .any(|j| j.workflow_id.as_deref() == Some(&wf.id) && !j.status.is_terminal());
+                let live_child = steps.iter().any(|((wf_id, _), st)| {
                     wf_id == &wf.id
+                        && !st.status.is_terminal()
                         && st
-                            .job_id
+                            .child_workflow_id
                             .as_ref()
-                            .and_then(|id| jobs.get(id))
-                            .is_some_and(|j| !j.status.is_terminal())
-                })
+                            .and_then(|c| workflows.get(c))
+                            .is_some_and(|c| !c.status.is_terminal())
+                });
+                !live_job && !live_child
             })
             .map(|wf| wf.id.clone())
             .take(limit)
@@ -1022,21 +1074,156 @@ impl JobStore for InMemoryJobStore {
     // ---- Workflows ----------------------------------------------------------
 
     async fn create_workflow(&self, wf: &Workflow) -> Result<(), StorageError> {
-        self.inner
+        let mut workflows = self.inner.workflows.lock().unwrap();
+        let mut steps = self.inner.steps.lock().unwrap();
+        Self::insert_workflow_locked(&mut workflows, &mut steps, wf);
+        Ok(())
+    }
+
+    async fn create_child_workflow(&self, child: &Workflow) -> Result<bool, StorageError> {
+        let parent = child.parent_workflow_id.clone().unwrap_or_default();
+        let step_name = child.parent_step_name.clone().unwrap_or_default();
+        {
+            let mut workflows = self.inner.workflows.lock().unwrap();
+            let mut steps = self.inner.steps.lock().unwrap();
+            let st = steps.get_mut(&(parent.clone(), step_name.clone())).ok_or(
+                StorageError::StepNotFound {
+                    workflow: parent,
+                    step: step_name,
+                },
+            )?;
+            if st.job_id.is_some() || st.child_workflow_id.is_some() {
+                return Ok(false);
+            }
+            st.child_workflow_id = Some(child.id.clone());
+            st.started_at = Some(self.now());
+            Self::insert_workflow_locked(&mut workflows, &mut steps, child);
+        }
+        self.notify_workflow_change();
+        Ok(true)
+    }
+
+    async fn step_job_outcomes(
+        &self,
+        workflow_id: &str,
+        step_name: &str,
+    ) -> Result<Vec<StepJobOutcome>, StorageError> {
+        let jobs = self.inner.jobs.lock().unwrap();
+        let mut out: Vec<StepJobOutcome> = jobs
+            .values()
+            .filter(|j| {
+                j.workflow_id.as_deref() == Some(workflow_id)
+                    && j.workflow_step_id.as_deref() == Some(step_name)
+            })
+            .map(|j| StepJobOutcome {
+                job_id: j.id.clone(),
+                index: fan_out_index(j),
+                status: j.status,
+                result: j.result.clone(),
+                error: j.error_message.clone(),
+            })
+            .collect();
+        out.sort_by_key(|o| o.index);
+        Ok(out)
+    }
+
+    async fn cancel_step_jobs(
+        &self,
+        workflow_id: &str,
+        step_name: &str,
+        reason: &str,
+    ) -> Result<u64, StorageError> {
+        let ids: Vec<String> = self
+            .inner
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|j| {
+                j.workflow_id.as_deref() == Some(workflow_id)
+                    && j.workflow_step_id.as_deref() == Some(step_name)
+                    && !j.status.is_terminal()
+            })
+            .map(|j| j.id.clone())
+            .collect();
+        let mut n = 0;
+        for id in ids {
+            if self.cancel_job_if_active(&id, reason).await? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    async fn reset_workflow_for_retry(
+        &self,
+        workflow_id: &str,
+        step_names: &[String],
+        deadline_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, StorageError> {
+        {
+            let mut workflows = self.inner.workflows.lock().unwrap();
+            let mut steps = self.inner.steps.lock().unwrap();
+            let Some(wf) = workflows.get_mut(workflow_id) else {
+                return Ok(false);
+            };
+            wf.status = WorkflowStatus::Running;
+            wf.completed_at = None;
+            wf.error_message = None;
+            wf.retry_count += 1;
+            wf.deadline_at = deadline_at;
+            for name in step_names {
+                if let Some(st) = steps.get_mut(&(workflow_id.to_string(), name.clone())) {
+                    *st = StepState::default();
+                }
+            }
+        }
+        self.notify_workflow_change();
+        Ok(true)
+    }
+
+    async fn expired_workflows(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .inner
             .workflows
             .lock()
             .unwrap()
-            .insert(wf.id.clone(), wf.clone());
-        let mut steps = self.inner.steps.lock().unwrap();
-        for step in &wf.steps {
-            steps.insert(
-                (wf.id.clone(), step.name.clone()),
-                StepState {
-                    status: StepStatus::Pending,
-                    job_id: None,
-                    error: None,
-                },
-            );
+            .values()
+            .filter(|w| !w.status.is_terminal() && w.deadline_at.is_some_and(|d| d < now))
+            .map(|w| w.id.clone())
+            .take(limit)
+            .collect())
+    }
+
+    async fn stalled_child_workflows(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        let workflows = self.inner.workflows.lock().unwrap();
+        let steps = self.inner.steps.lock().unwrap();
+        Ok(workflows
+            .values()
+            .filter(|w| w.status.is_terminal())
+            .filter(|w| match (&w.parent_workflow_id, &w.parent_step_name) {
+                (Some(p), Some(s)) => steps
+                    .get(&(p.clone(), s.clone()))
+                    .is_some_and(|st| !st.status.is_terminal()),
+                _ => false,
+            })
+            .map(|w| w.id.clone())
+            .take(limit)
+            .collect())
+    }
+
+    async fn await_workflow_change(
+        &self,
+        _workflow_id: &str,
+        max_wait: StdDuration,
+    ) -> Result<(), StorageError> {
+        tokio::select! {
+            _ = self.inner.workflow_events.notified() => {}
+            _ = tokio::time::sleep(max_wait) => {}
         }
         Ok(())
     }
@@ -1088,14 +1275,37 @@ impl JobStore for InMemoryJobStore {
     ) -> Result<Vec<StepRecord>, StorageError> {
         // Preserve the declared step order for stable, readable results.
         let wf = self.get_workflow(workflow_id).await?;
+        let jobs = self.inner.jobs.lock().unwrap();
         let steps = self.inner.steps.lock().unwrap();
         let mut out = Vec::with_capacity(wf.steps.len());
         for step in &wf.steps {
             if let Some(st) = steps.get(&(workflow_id.to_string(), step.name.clone())) {
+                let fan_out = if step.fan_out.is_some() && st.job_id.is_some() {
+                    let mut p = FanOutProgress::default();
+                    for j in jobs.values().filter(|j| {
+                        j.workflow_id.as_deref() == Some(workflow_id)
+                            && j.workflow_step_id.as_deref() == Some(step.name.as_str())
+                    }) {
+                        p.total += 1;
+                        match j.status {
+                            JobStatus::Completed => p.completed += 1,
+                            JobStatus::Failed | JobStatus::Cancelled => p.failed += 1,
+                            _ => {}
+                        }
+                    }
+                    Some(p)
+                } else {
+                    None
+                };
                 out.push(StepRecord {
                     name: step.name.clone(),
                     status: st.status,
                     job_id: st.job_id.clone(),
+                    error: st.error.clone(),
+                    started_at: st.started_at,
+                    completed_at: st.completed_at,
+                    child_workflow_id: st.child_workflow_id.clone(),
+                    fan_out,
                 });
             }
         }
@@ -1115,19 +1325,27 @@ impl JobStore for InMemoryJobStore {
                 workflow: workflow_id.to_string(),
                 step: step_name.to_string(),
             })?;
-        if st.job_id.is_some() {
+        if st.job_id.is_some() || st.child_workflow_id.is_some() {
             return Ok(false);
         }
         st.job_id = Some(job_id.to_string());
+        st.started_at = Some(self.now());
         Ok(true)
     }
 
     async fn create_step_job(&self, job: &Job) -> Result<bool, StorageError> {
-        let wf_id = job.workflow_id.clone().unwrap_or_default();
-        let step_name = job.workflow_step_id.clone().unwrap_or_default();
+        self.create_step_jobs(std::slice::from_ref(job)).await
+    }
+
+    async fn create_step_jobs(&self, batch: &[Job]) -> Result<bool, StorageError> {
+        let Some(first) = batch.first() else {
+            return Ok(false);
+        };
+        let wf_id = first.workflow_id.clone().unwrap_or_default();
+        let step_name = first.workflow_step_id.clone().unwrap_or_default();
         {
-            // One critical section covers the claim and the insert, so the
-            // job only ever exists linked to the step it won.
+            // One critical section covers the claim and the inserts, so the
+            // jobs only ever exist linked to the step they won.
             let mut jobs = self.inner.jobs.lock().unwrap();
             let mut steps = self.inner.steps.lock().unwrap();
             let st = steps.get_mut(&(wf_id.clone(), step_name.clone())).ok_or(
@@ -1136,15 +1354,26 @@ impl JobStore for InMemoryJobStore {
                     step: step_name,
                 },
             )?;
-            if st.job_id.is_some() {
+            if st.job_id.is_some() || st.child_workflow_id.is_some() {
                 return Ok(false);
             }
-            st.job_id = Some(job.id.clone());
-            jobs.insert(job.id.clone(), job.clone());
+            st.job_id = Some(first.id.clone());
+            st.started_at = Some(self.now());
+            for job in batch {
+                jobs.insert(job.id.clone(), job.clone());
+            }
         }
-        if job.status == JobStatus::Pending {
-            self.notify_work(&job.queue_name);
+        let mut queues: Vec<&str> = batch
+            .iter()
+            .filter(|j| j.status == JobStatus::Pending)
+            .map(|j| j.queue_name.as_str())
+            .collect();
+        queues.sort_unstable();
+        queues.dedup();
+        for q in queues {
+            self.notify_work(q);
         }
+        self.notify_workflow_change();
         Ok(true)
     }
 
@@ -1166,6 +1395,11 @@ impl JobStore for InMemoryJobStore {
         if let Some(e) = error {
             st.error = Some(e.to_string());
         }
+        if status.is_terminal() {
+            st.completed_at = Some(self.now());
+        }
+        drop(steps);
+        self.notify_workflow_change();
         Ok(())
     }
 
@@ -1173,23 +1407,30 @@ impl JobStore for InMemoryJobStore {
         &self,
         workflow_id: &str,
         status: WorkflowStatus,
+        error: Option<&str>,
     ) -> Result<bool, StorageError> {
-        let mut guard = self.inner.workflows.lock().unwrap();
-        let wf = guard
-            .get_mut(workflow_id)
-            .ok_or_else(|| StorageError::WorkflowNotFound(workflow_id.to_string()))?;
-        // A terminal workflow is never overwritten.
-        if wf.status.is_terminal() || wf.status == status {
-            return Ok(false);
+        {
+            let mut guard = self.inner.workflows.lock().unwrap();
+            let wf = guard
+                .get_mut(workflow_id)
+                .ok_or_else(|| StorageError::WorkflowNotFound(workflow_id.to_string()))?;
+            // A terminal workflow is never overwritten.
+            if wf.status.is_terminal() || wf.status == status {
+                return Ok(false);
+            }
+            wf.status = status;
+            let now = self.now();
+            if status == WorkflowStatus::Running && wf.started_at.is_none() {
+                wf.started_at = Some(now);
+            }
+            if status.is_terminal() {
+                wf.completed_at = Some(now);
+            }
+            if let Some(e) = error {
+                wf.error_message = Some(e.to_string());
+            }
         }
-        wf.status = status;
-        let now = self.now();
-        if status == WorkflowStatus::Running && wf.started_at.is_none() {
-            wf.started_at = Some(now);
-        }
-        if status.is_terminal() {
-            wf.completed_at = Some(now);
-        }
+        self.notify_workflow_change();
         Ok(true)
     }
 

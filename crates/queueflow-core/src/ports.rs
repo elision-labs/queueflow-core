@@ -500,8 +500,43 @@ pub trait JobStore: Send + Sync {
     /// already had a linked job. Without this atomicity, a losing duplicate
     /// from two concurrent `advance` calls would be briefly claimable
     /// (the insert is the publish) and a fan-in step could execute twice.
+    /// Also stamps the step's `started_at`.
     async fn create_step_job(&self, job: &Job) -> Result<bool, StorageError>;
 
+    /// The fan-out form of [`JobStore::create_step_job`]: claim the step once
+    /// and insert every child job (all carrying the same
+    /// `workflow_id` / `workflow_step_id`, each with its position in
+    /// metadata) in one atomic operation. The step's `job_id` records the
+    /// first child. `jobs` must not be empty.
+    async fn create_step_jobs(&self, jobs: &[Job]) -> Result<bool, StorageError>;
+
+    /// The sub-workflow form: claim the parent step named by
+    /// `child.parent_step_name` on `child.parent_workflow_id` and persist the
+    /// child workflow (status `created`, steps pending) together. Returns
+    /// `false` — persisting nothing — when the step was already claimed.
+    async fn create_child_workflow(&self, child: &Workflow) -> Result<bool, StorageError>;
+
+    /// Outcome of every job linked to a step, in fan-out position order
+    /// (a plain step has one). Read when a fan-out child settles to decide
+    /// whether the step is done.
+    async fn step_job_outcomes(
+        &self,
+        workflow_id: &str,
+        step_name: &str,
+    ) -> Result<Vec<StepJobOutcome>, StorageError>;
+
+    /// Cancel every non-terminal job linked to a step (a fan-out's
+    /// remaining children, or a plain step's job). Returns how many were
+    /// cancelled.
+    async fn cancel_step_jobs(
+        &self,
+        workflow_id: &str,
+        step_name: &str,
+        reason: &str,
+    ) -> Result<u64, StorageError>;
+
+    /// Set a step's status and, for a terminal status, its `completed_at`.
+    /// `error` replaces the recorded message when given.
     async fn set_step_status(
         &self,
         workflow_id: &str,
@@ -510,14 +545,54 @@ pub trait JobStore: Send + Sync {
         error: Option<&str>,
     ) -> Result<(), StorageError>;
 
-    /// Transition a workflow's status. A workflow already in a terminal state
-    /// is never overwritten; returns `true` only when the status actually
-    /// changed (used to keep stats exact under concurrent aggregation).
+    /// Transition a workflow's status, recording `error` (the reason for a
+    /// failure or cancellation) when given. A workflow already in a terminal
+    /// state is never overwritten; returns `true` only when the status
+    /// actually changed (used to keep stats exact under concurrent
+    /// aggregation).
     async fn set_workflow_status(
         &self,
         workflow_id: &str,
         status: WorkflowStatus,
+        error: Option<&str>,
     ) -> Result<bool, StorageError>;
+
+    /// Re-open a terminal workflow for a retry: the named steps go back to
+    /// `pending` with no job, child workflow, error or timestamps; the
+    /// workflow becomes `running` again with its error cleared, its retry
+    /// count incremented and `deadline_at` replaced. Returns `false` when
+    /// the workflow does not exist.
+    async fn reset_workflow_for_retry(
+        &self,
+        workflow_id: &str,
+        step_names: &[String],
+        deadline_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, StorageError>;
+
+    /// Non-terminal workflows whose `deadline_at` has passed.
+    async fn expired_workflows(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError>;
+
+    /// Terminal child workflows whose parent step is still not terminal: a
+    /// crash hit between the child's final status and the parent's
+    /// advancement. The janitor re-notifies the parent.
+    async fn stalled_child_workflows(&self, limit: usize) -> Result<Vec<String>, StorageError>;
+
+    /// Park until the workflow or one of its steps may have changed, or
+    /// `max_wait` passes. May wake spuriously. The default is a bounded
+    /// sleep (polling); Postgres is driven by the workflow-events trigger.
+    async fn await_workflow_change(
+        &self,
+        workflow_id: &str,
+        max_wait: Duration,
+    ) -> Result<(), StorageError> {
+        let _ = workflow_id;
+        tokio::time::sleep(max_wait).await;
+        Ok(())
+    }
 
     /// Merge a single key/value into a workflow's accumulated context.
     async fn merge_workflow_context(
@@ -538,9 +613,40 @@ pub struct RegisteredQueue {
 }
 
 /// The persisted state of one workflow step.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StepRecord {
     pub name: String,
     pub status: StepStatus,
+    /// The step's job (the first child, for a fan-out).
     pub job_id: Option<String>,
+    /// The recorded reason for a failed, skipped or cancelled step.
+    pub error: Option<String>,
+    /// When the step was scheduled (its job or child workflow created).
+    pub started_at: Option<DateTime<Utc>>,
+    /// When the step reached a terminal status.
+    pub completed_at: Option<DateTime<Utc>>,
+    /// The child workflow of a sub-workflow step, once spawned.
+    pub child_workflow_id: Option<String>,
+    /// Progress of a fan-out step's children, once spawned.
+    pub fan_out: Option<FanOutProgress>,
+}
+
+/// Counts over a fan-out step's child jobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FanOutProgress {
+    pub total: u64,
+    pub completed: u64,
+    /// Failed or cancelled children.
+    pub failed: u64,
+}
+
+/// The terminal (or not) outcome of one job linked to a step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepJobOutcome {
+    pub job_id: String,
+    /// Fan-out position (0 for a plain step).
+    pub index: u64,
+    pub status: JobStatus,
+    pub result: Option<Json>,
+    pub error: Option<String>,
 }

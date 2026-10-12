@@ -64,6 +64,10 @@ pub struct JanitorSweepReport {
     pub healed_steps: usize,
     /// Stalled workflows re-advanced.
     pub advanced_workflows: usize,
+    /// Workflows failed because their deadline passed.
+    pub timed_out_workflows: usize,
+    /// Finished child workflows whose parent step was re-settled.
+    pub settled_children: usize,
 }
 
 impl JanitorSweepReport {
@@ -108,6 +112,8 @@ where
                         expired = report.expired_leases,
                         healed_steps = report.healed_steps,
                         advanced_workflows = report.advanced_workflows,
+                        timed_out_workflows = report.timed_out_workflows,
+                        settled_children = report.settled_children,
                         "janitor sweep"
                     );
                 }
@@ -200,6 +206,46 @@ where
                 }
             }
             Err(e) => tracing::warn!(error = %e, "stalled-workflow sweep failed"),
+        }
+
+        // Child workflows that finished without their parent step settling
+        // (a crash between the two writes).
+        match self.store.stalled_child_workflows(self.janitor.batch).await {
+            Ok(ids) => {
+                for id in ids {
+                    report.settled_children += 1;
+                    match self.store.get_workflow(&id).await {
+                        Ok(child) => {
+                            if let Err(e) = self.scheduler.on_child_workflow_finished(&child).await
+                            {
+                                tracing::warn!(workflow_id = %id, error = %e, "child settlement failed");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(workflow_id = %id, error = %e, "child lookup failed")
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "stalled-child sweep failed"),
+        }
+
+        // Workflows past their deadline.
+        match self
+            .store
+            .expired_workflows(self.clock.now(), self.janitor.batch)
+            .await
+        {
+            Ok(ids) => {
+                for id in ids {
+                    report.timed_out_workflows += 1;
+                    tracing::warn!(workflow_id = %id, "workflow deadline passed; failing it");
+                    if let Err(e) = self.scheduler.timeout(&id).await {
+                        tracing::warn!(workflow_id = %id, error = %e, "workflow timeout failed");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "workflow deadline sweep failed"),
         }
 
         report
