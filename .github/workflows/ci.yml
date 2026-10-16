@@ -73,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.24"
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -264,7 +264,7 @@ jobs:
           python -m pip install -q . pytest
           pytest -q -m live test/test_live.py
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.24"
       - name: Go SDK
