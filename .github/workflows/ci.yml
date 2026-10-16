@@ -138,7 +138,7 @@ jobs:
           repository: ${{ github.repository_owner }}/queueflow-sdk-nodejs
           token: ${{ secrets.SDK_REPO_TOKEN || github.token }}
           path: .sdk-ts
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - name: Check generated core + facade against the spec
@@ -245,7 +245,7 @@ jobs:
             git clone --depth 1 "https://github.com/${{ github.repository_owner }}/queueflow-sdk-${r}.git" "${RUNNER_TEMP}/sdk-${r}"
           done
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: TypeScript SDK
