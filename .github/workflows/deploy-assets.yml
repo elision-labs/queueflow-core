@@ -30,7 +30,7 @@ jobs:
     env:
       CHART: deploy/helm/queueflow
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v4
       - name: Lint (mode=all)
         run: helm lint "$CHART" -f "$CHART/ci/lint-values.yaml" --strict
@@ -58,7 +58,7 @@ jobs:
       QUEUEFLOW_API_KEYS: ci-placeholder:acme
       QUEUEFLOW_WORKER_TOKEN: ci-placeholder-worker-token
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Resolve and validate
         run: docker compose -f docker-compose.yml config --quiet
       - name: Required variables are enforced
@@ -72,14 +72,14 @@ jobs:
     name: render.yaml is valid YAML
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: ruby -ryaml -e 'd = YAML.safe_load(File.read("render.yaml")); abort "missing services/databases" unless d["services"] && d["databases"]'
 
   homebrew:
     name: Homebrew formula syntax
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Grafana dashboard JSON parses
         run: jq -e '.panels | length > 0' deploy/grafana/queueflow-overview.json
       - name: ruby -c
