@@ -31,7 +31,7 @@ jobs:
       CHART: deploy/helm/queueflow
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - name: Lint (mode=all)
         run: helm lint "$CHART" -f "$CHART/ci/lint-values.yaml" --strict
       - name: Lint (mode=split, every optional resource)
